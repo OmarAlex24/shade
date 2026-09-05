@@ -40,7 +40,7 @@ The user's original V1 plan is the acceptance scope. Passing the APFS benchmark 
 
 ## Distribution and evidence
 
-- [x] Both SDKs, compact skill and simulated/real Zenith harnesses.
+- [x] Both SDKs, compact skill and simulated/real twenty-session harnesses.
 - [x] Recorded M4 Pro/APFS latency, response and storage gates; skill measured at 239 tokens with the recorded tokenizer.
 - [x] Test installation and LaunchAgent operation using an isolated service label without replacing an existing user installation. Verify actual npm readiness, KeepAlive after SIGKILL, the same SQLite inode/workspace and complete service unloading.
 - [x] Bind lifecycle, security, dependency, concurrency, crash, operational and measured performance artifacts to the current source and distribution digests in [the current evidence bundle](../artifacts/v1-release-validation.json).

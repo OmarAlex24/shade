@@ -8,7 +8,7 @@ import { ShadeClient, ShadeTimeoutError } from "@shade/sdk";
 
 const shade = new ShadeClient({
   socket: process.env.SHADE_SOCKET!,
-  actor: { kind: "zenith", id: "zenith" },
+  actor: { kind: "host", id: "<your-host-name>" },
 });
 
 const session = await shade.sessions.open(

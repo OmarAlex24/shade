@@ -26,7 +26,7 @@ export interface HarnessReport {
   cleanup: "clean";
 }
 
-export async function runZenithHarness(): Promise<HarnessReport> {
+export async function runSessionHarness(): Promise<HarnessReport> {
   const daemon = new FakeShadeDaemon(80);
   await daemon.start();
   const abortEvents = new AbortController();
@@ -37,7 +37,7 @@ export async function runZenithHarness(): Promise<HarnessReport> {
   try {
     const client = new ShadeClient({
       socket: daemon.socket,
-      actor: { kind: "zenith", id: "zenith-harness" },
+      actor: { kind: "host", id: "session-harness" },
       timeout_ms: 2_000,
       operation_poll_ms: 1,
       event_reconnect_ms: 2,

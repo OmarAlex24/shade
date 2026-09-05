@@ -21,7 +21,7 @@ describe("Rust v1 wire contract", () => {
       v: PROTOCOL_VERSION,
       request_id: "req-open",
       idempotency_key: "open:wire-contract",
-      actor: { kind: "zenith", id: "wire-contract" },
+      actor: { kind: "host", id: "wire-contract" },
       intent: {
         kind: "session_open",
         session_id: "session-opaque",
@@ -47,7 +47,7 @@ describe("Rust v1 wire contract", () => {
       v: PROTOCOL_VERSION,
       request_id: "req-checkpoint",
       idempotency_key: "checkpoint:wire-contract",
-      actor: { kind: "zenith", id: "wire-contract" },
+      actor: { kind: "host", id: "wire-contract" },
       intent: {
         kind: "workspace_checkpoint",
         selector: {

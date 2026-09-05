@@ -14,19 +14,19 @@
       "name": "@shade/sdk",
       "version": "0.1.0",
     },
-    "packages/zenith-harness": {
-      "name": "@shade/zenith-harness",
+    "packages/session-harness": {
+      "name": "@shade/session-harness",
       "version": "0.1.0",
       "bin": {
-        "shade-zenith-harness": "./src/cli.ts",
-        "shade-zenith-real-harness": "./src/real-cli.ts",
+        "shade-harness": "./src/cli.ts",
+        "shade-real-harness": "./src/real-cli.ts",
       },
     },
   },
   "packages": {
     "@shade/sdk": ["@shade/sdk@workspace:packages/sdk-typescript"],
 
-    "@shade/zenith-harness": ["@shade/zenith-harness@workspace:packages/zenith-harness"],
+    "@shade/session-harness": ["@shade/session-harness@workspace:packages/session-harness"],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

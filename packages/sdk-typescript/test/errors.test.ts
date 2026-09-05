@@ -46,7 +46,7 @@ describe("structured errors", () => {
   test("rejects an invalid explicit idempotency key before transport", async () => {
     const client = new ShadeClient({
       socket: "/not/used",
-      actor: { kind: "zenith", id: "test" },
+      actor: { kind: "host", id: "test" },
     });
     await expect(
       client.sessions.open(
@@ -67,7 +67,7 @@ describe("structured errors", () => {
     let lookupAttempts = 0;
     const client = new ShadeClient({
       socket: "/not/used",
-      actor: { kind: "zenith", id: "timeout-integration" },
+      actor: { kind: "host", id: "timeout-integration" },
       // The transport injects the execute timeout. Give recovery a real retry
       // window instead of relying on a 25 ms timer resuming within 30 ms.
       timeout_ms: 1_000,
@@ -82,7 +82,7 @@ describe("structured errors", () => {
         lookupAttempts += 1;
         expect(request.query).toEqual({
           kind: "operation_by_key",
-          actor_kind: "zenith",
+          actor_kind: "host",
           actor_id: "timeout-integration",
           idempotency_key: generatedKey,
         });
@@ -139,7 +139,7 @@ describe("structured errors", () => {
     let generatedKey: string | undefined;
     const client = new ShadeClient({
       socket: "/not/used",
-      actor: { kind: "zenith", id: "accepted-timeout" },
+      actor: { kind: "host", id: "accepted-timeout" },
       timeout_ms: 20,
       operation_poll_ms: 5,
     });

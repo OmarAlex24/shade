@@ -155,7 +155,7 @@ SQLite or waiting ten minutes. Daemons started normally retain the production
 The [operational installation test](INSTALLATION.md) installs the same release binary
 under a fresh reserved LaunchAgent label in an isolated temporary root, opens a
 real npm project, verifies KeepAlive after SIGKILL and unloads the service. It never
-replaces the normal `com.zenith.shade` job. Preserve its `SHADE_INSTALL_EVIDENCE`
+replaces the normal `com.shade.daemon` job. Preserve its `SHADE_INSTALL_EVIDENCE`
 record with the binary digest.
 
 `SHADE_PYTHON_FORK_BIN="$(pwd)/target/release/shade" cargo test -p shade --test python_fork -- --ignored --nocapture`
@@ -237,7 +237,7 @@ The automated gate is necessary but not sufficient. Attach one artifact per row;
 | Crash matrix | Kill after every filesystem, Git and SQLite phase; restart converges to zero resources or one complete resource. |
 | GC matrix | Live leases, active operations, unmerged indexes, failed checkpoints, pending reviews and unanchored detached commits all block deletion. |
 | Malicious dependency fixtures | JS scripts, `.pnpmfile`, PEP 517, `.pth`, `build.rs`, proc macros and Go project code never execute. Cold fill replays offline; corrupt layers rebuild. |
-| Zenith harness | The deterministic protocol suite passes, then the real TypeScript SDK opens twenty sessions against the release binary, survives a SIGKILL restart with the same SQLite file, resumes events, checkpoints/forks/syncs/publishes, and uses an explicit zero-grace harness daemon to finish with zero active leases, worktrees, private refs, dependency staging entries or mutable artifact layers. |
+| Session harness | The deterministic protocol suite passes, then the real TypeScript SDK opens twenty sessions against the release binary, survives a SIGKILL restart with the same SQLite file, resumes events, checkpoints/forks/syncs/publishes, and uses an explicit zero-grace harness daemon to finish with zero active leases, worktrees, private refs, dependency staging entries or mutable artifact layers. |
 | Operational installation | The distribution binary installs atomically, answers before installation succeeds, finds host npm/Node under launchd, recovers after SIGKILL with the same SQLite file/workspace, rejects acceptance-label collisions and unloads cleanly. |
 | Output budgets | Every deterministic common-response fixture and every real context/doctor response sampled by the gate is at most 512 minified JSON bytes; the official Skill is at most 350 production-model tokens. |
 | APFS benchmark | Warm source materialization at no more than 25k entries has p50 below 300 ms and p95 below 1 s; context p95 is below 200 ms; CLI/IPC p95 is below 10 ms. |

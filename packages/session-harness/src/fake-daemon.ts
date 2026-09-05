@@ -93,7 +93,7 @@ export class FakeShadeDaemon {
     daemonSequence += 1;
     this.root = join(
       "/tmp",
-      `shade-zenith-${process.pid}-${daemonSequence.toString(36)}`,
+      `shade-session-${process.pid}-${daemonSequence.toString(36)}`,
     );
     this.socket = join(this.root, "d.sock");
     this.lease_ttl_ms = leaseTtlMs;

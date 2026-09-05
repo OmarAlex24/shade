@@ -13,7 +13,7 @@ The CLI and both SDKs are projections of that seam. The engine owns sequencing; 
 The binary parses its command before creating Tokio. Ordinary CLI calls use a current-thread runtime for socket I/O and deadlines; the daemon uses a multithreaded runtime for concurrent sessions. Help and version responses require no runtime.
 
 ```text
-Zenith / agent
+Host orchestrator / agent
       │
 Rust SDK / TypeScript SDK / machine CLI
       │  versioned NDJSON over a 0600 Unix socket

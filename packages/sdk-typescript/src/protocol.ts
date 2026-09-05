@@ -15,7 +15,7 @@ export type HandoffId = string;
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
-export type ActorKind = "zenith" | "agent" | "cli" | "system";
+export type ActorKind = "host" | "agent" | "cli" | "system";
 
 export interface Actor {
   kind: ActorKind;

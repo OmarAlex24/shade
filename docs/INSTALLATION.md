@@ -32,7 +32,7 @@ repository. Creating or verifying a package does not run the installer.
 Build on Apple Silicon macOS, then run `shade install` from the resulting binary.
 Installation atomically copies that same executable to
 `~/Library/Application Support/Shade/bin/shade`, writes a private plist at
-`~/Library/LaunchAgents/com.zenith.shade.plist`, and bootstraps the user's GUI
+`~/Library/LaunchAgents/com.shade.daemon.plist`, and bootstraps the user's GUI
 launchd domain. The installed binary serves both CLI and daemon commands.
 Installation returns success after the private socket answers `doctor`.
 
@@ -59,7 +59,7 @@ CARGO_TARGET_DIR=/tmp/shade-target \
 
 This explicit test requires an active GUI launchd domain and installed npm/Node.
 It invokes the actual installer with hidden acceptance arguments, a fresh
-`com.zenith.shade.acceptance.<id>` label and a temporary root. The installer
+`com.shade.daemon.acceptance.<id>` label and a temporary root. The installer
 rejects a label collision before writing files and restricts acceptance state,
 socket, binary and plist locations to that root. The normal user service is
 never selected by these arguments.

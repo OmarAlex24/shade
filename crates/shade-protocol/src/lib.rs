@@ -38,7 +38,7 @@ id_type!(HandoffId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
-    Zenith,
+    Host,
     Agent,
     Cli,
     System,

@@ -1,6 +1,6 @@
 ---
 name: shade-workspaces
-description: Operate Shade COW workspaces for Zenith sessions. Use when coding work runs in Shade or needs an isolated agent workspace.
+description: Operate Shade COW workspaces for host sessions. Use when coding work runs in Shade or needs an isolated agent workspace.
 ---
 
 # Shade Workspaces

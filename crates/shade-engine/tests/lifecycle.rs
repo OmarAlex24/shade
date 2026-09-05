@@ -896,7 +896,7 @@ fn execute(session: &str, key: &str, intent: Intent) -> ExecuteRequest {
         request_id: format!("request-{key}"),
         idempotency_key: key.to_owned(),
         actor: Actor {
-            kind: ActorKind::Zenith,
+            kind: ActorKind::Host,
             id: format!("actor-{session}"),
         },
         intent,
@@ -1572,7 +1572,7 @@ async fn restore_reproduces_all_git_planes_in_a_successor() {
             .unwrap()
             .workspace_id,
         opened.workspace,
-        "predecessor lease must remain live until Zenith adopts"
+        "predecessor lease must remain live until the host adopts"
     );
     let pending_workspace = engine
         .database()
@@ -1583,7 +1583,7 @@ async fn restore_reproduces_all_git_planes_in_a_successor() {
     assert!(pending_workspace.session_id.is_none());
     let journaled = engine
         .database()
-        .operation_by_key("zenith\0actor-restore-chat", "restore")
+        .operation_by_key("host\0actor-restore-chat", "restore")
         .unwrap()
         .unwrap();
     assert_eq!(journaled.state, "completed");
@@ -1782,7 +1782,7 @@ async fn internal_maintenance_is_system_only_and_checkpoint_requires_live_lease(
     assert!(
         engine
             .database()
-            .operation_by_key("zenith\0actor-guard-chat", "reconcile")
+            .operation_by_key("host\0actor-guard-chat", "reconcile")
             .unwrap()
             .is_none(),
         "forbidden internal intents must not enter the durable journal"

@@ -170,7 +170,7 @@ fn execute(key: &str, intent: Intent) -> ExecuteRequest {
         request_id: format!("request-{key}"),
         idempotency_key: key.to_owned(),
         actor: Actor {
-            kind: ActorKind::Zenith,
+            kind: ActorKind::Host,
             id: "gc-test-actor".into(),
         },
         intent,

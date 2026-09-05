@@ -1,11 +1,11 @@
 {
-  "name": "@shade/zenith-harness",
+  "name": "@shade/session-harness",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "bin": {
-    "shade-zenith-harness": "./src/cli.ts",
-    "shade-zenith-real-harness": "./src/real-cli.ts"
+    "shade-harness": "./src/cli.ts",
+    "shade-real-harness": "./src/real-cli.ts"
   },
   "scripts": {
     "test": "bun test",

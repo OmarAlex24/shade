@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
-import { runRealZenithHarness } from "./real-harness.ts";
+import { runRealSessionHarness } from "./real-harness.ts";
 
 try {
-  const report = await runRealZenithHarness();
+  const report = await runRealSessionHarness();
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (error) {
   process.stdout.write(`${JSON.stringify({

@@ -75,7 +75,7 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_shade")));
     let binary_digest = hex::encode(Sha256::digest(fs::read(&binary).unwrap()));
-    let label = format!("com.zenith.shade.acceptance.{}", ulid::Ulid::new());
+    let label = format!("com.shade.daemon.acceptance.{}", ulid::Ulid::new());
     let service = Service(format!("gui/{}/{label}", unsafe { libc::geteuid() }));
     assert!(service_pid(&service.0).is_none());
     let install = || {

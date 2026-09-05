@@ -121,7 +121,7 @@ shasum -a 256 -c SHA256SUMS
 
 Installation copies this executable to
 `~/Library/Application Support/Shade/bin/shade` and starts the per-user
-`com.zenith.shade` LaunchAgent. Add the binary directory to your PATH, then run
+`com.shade.daemon` LaunchAgent. Add the binary directory to your PATH, then run
 `shade doctor`. The installer returns after the private socket answers.
 
 `MANIFEST.json` identifies the accepted binary, source inventory and evidence.

@@ -2898,7 +2898,7 @@ mod tests {
         };
         database.create_session_and_lease(&session, 120).unwrap();
         let prepare_operation = match database
-            .begin_operation("zenith", "prepare", "prepare-hash", "workspace_sync")
+            .begin_operation("host", "prepare", "prepare-hash", "workspace_sync")
             .unwrap()
         {
             BeginOperation::New(id) => id,
@@ -2907,7 +2907,7 @@ mod tests {
         let handoff = database
             .prepare_successor_handoff(
                 &prepare_operation,
-                "zenith",
+                "host",
                 &session.id,
                 &original.id,
                 &winner.id,
@@ -2930,7 +2930,7 @@ mod tests {
             Err(DbError::LeaseFenced)
         ));
         let adopt_operation = match database
-            .begin_operation("zenith", "adopt", "adopt-hash", "successor_adopt")
+            .begin_operation("host", "adopt", "adopt-hash", "successor_adopt")
             .unwrap()
         {
             BeginOperation::New(id) => id,
@@ -2939,7 +2939,7 @@ mod tests {
         let lease = database
             .adopt_successor_handoff(
                 &handoff.handoff_id,
-                "zenith",
+                "host",
                 &adopt_operation,
                 &LeaseId("lease-successor".into()),
                 120,
@@ -2948,7 +2948,7 @@ mod tests {
             .unwrap();
         assert_eq!(lease.workspace_id, winner.id);
         let stale_operation = match database
-            .begin_operation("zenith", "stale", "stale-hash", "workspace_sync")
+            .begin_operation("host", "stale", "stale-hash", "workspace_sync")
             .unwrap()
         {
             BeginOperation::New(id) => id,
@@ -2957,7 +2957,7 @@ mod tests {
         assert!(matches!(
             database.prepare_successor_handoff(
                 &stale_operation,
-                "zenith",
+                "host",
                 &session.id,
                 &original.id,
                 &stale.id,
@@ -3025,7 +3025,7 @@ mod tests {
             };
             database.create_session_and_lease(&session, 120).unwrap();
             let prepare = match database
-                .begin_operation("zenith", "prepare-delete", "prepare-hash", "workspace_sync")
+                .begin_operation("host", "prepare-delete", "prepare-hash", "workspace_sync")
                 .unwrap()
             {
                 BeginOperation::New(id) => id,
@@ -3034,14 +3034,14 @@ mod tests {
             let handoff = database
                 .prepare_successor_handoff(
                     &prepare,
-                    "zenith",
+                    "host",
                     &session.id,
                     &predecessor.id,
                     &successor.id,
                 )
                 .unwrap();
             let adopt = match database
-                .begin_operation("zenith", "adopt-delete", "adopt-hash", "successor_adopt")
+                .begin_operation("host", "adopt-delete", "adopt-hash", "successor_adopt")
                 .unwrap()
             {
                 BeginOperation::New(id) => id,
@@ -3050,7 +3050,7 @@ mod tests {
             database
                 .adopt_successor_handoff(
                     &handoff.handoff_id,
-                    "zenith",
+                    "host",
                     &adopt,
                     &LeaseId("lease-delete-successor".into()),
                     120,
@@ -3146,14 +3146,14 @@ mod tests {
         let left_database = Database::open(&database_path).unwrap();
         let right_database = Database::open(&database_path).unwrap();
         let left_operation = match left_database
-            .begin_operation("zenith", "race-left", "hash-left", "workspace_sync")
+            .begin_operation("host", "race-left", "hash-left", "workspace_sync")
             .unwrap()
         {
             BeginOperation::New(id) => id,
             BeginOperation::Existing(_) => unreachable!(),
         };
         let right_operation = match right_database
-            .begin_operation("zenith", "race-right", "hash-right", "workspace_sync")
+            .begin_operation("host", "race-right", "hash-right", "workspace_sync")
             .unwrap()
         {
             BeginOperation::New(id) => id,
@@ -3168,7 +3168,7 @@ mod tests {
             left_barrier.wait();
             left_database.prepare_successor_handoff(
                 &left_operation,
-                "zenith",
+                "host",
                 &left_session,
                 &left_parent,
                 &left_workspace,
@@ -3182,7 +3182,7 @@ mod tests {
             right_barrier.wait();
             right_database.prepare_successor_handoff(
                 &right_operation,
-                "zenith",
+                "host",
                 &right_session,
                 &right_parent,
                 &right_workspace,
@@ -3254,12 +3254,7 @@ mod tests {
         };
         database.create_session_and_lease(&session, 120).unwrap();
         let prepare_operation = match database
-            .begin_operation(
-                "zenith",
-                "prepare-recovery",
-                "prepare-hash",
-                "workspace_sync",
-            )
+            .begin_operation("host", "prepare-recovery", "prepare-hash", "workspace_sync")
             .unwrap()
         {
             BeginOperation::New(id) => id,
@@ -3268,7 +3263,7 @@ mod tests {
         let handoff = database
             .prepare_successor_handoff(
                 &prepare_operation,
-                "zenith",
+                "host",
                 &session.id,
                 &parent.id,
                 &successor.id,
@@ -3276,14 +3271,14 @@ mod tests {
             .unwrap();
 
         let crashed_adopt = match database
-            .begin_operation("zenith", "handoff:stable", "adopt-hash", "successor_adopt")
+            .begin_operation("host", "handoff:stable", "adopt-hash", "successor_adopt")
             .unwrap()
         {
             BeginOperation::New(id) => id,
             BeginOperation::Existing(_) => unreachable!(),
         };
         let ordinary_interrupted = match database
-            .begin_operation("zenith", "ordinary", "ordinary-hash", "session_open")
+            .begin_operation("host", "ordinary", "ordinary-hash", "session_open")
             .unwrap()
         {
             BeginOperation::New(id) => id,
@@ -3346,7 +3341,7 @@ mod tests {
         let retry_left = std::thread::spawn(move || {
             retry_left_barrier.wait();
             retry_left_database.begin_operation(
-                "zenith",
+                "host",
                 "handoff:stable",
                 "adopt-hash",
                 "successor_adopt",
@@ -3357,7 +3352,7 @@ mod tests {
         let retry_right = std::thread::spawn(move || {
             retry_right_barrier.wait();
             retry_right_database.begin_operation(
-                "zenith",
+                "host",
                 "handoff:stable",
                 "adopt-hash",
                 "successor_adopt",
@@ -3391,7 +3386,7 @@ mod tests {
         database
             .adopt_successor_handoff(
                 &handoff.handoff_id,
-                "zenith",
+                "host",
                 &resumed,
                 &LeaseId("lease-recovered-successor".into()),
                 120,
@@ -3405,7 +3400,7 @@ mod tests {
         assert!(matches!(
             database
                 .begin_operation(
-                    "zenith",
+                    "host",
                     "handoff:stable",
                     "adopt-hash",
                     "successor_adopt"
@@ -3458,14 +3453,14 @@ mod tests {
         };
         database.create_session_and_lease(&session, 120).unwrap();
         let operation = match database
-            .begin_operation("zenith", "prepare-expiry", "hash", "workspace_sync")
+            .begin_operation("host", "prepare-expiry", "hash", "workspace_sync")
             .unwrap()
         {
             BeginOperation::New(id) => id,
             BeginOperation::Existing(_) => unreachable!(),
         };
         let pending = database
-            .prepare_successor_handoff(&operation, "zenith", &session.id, &parent.id, &successor.id)
+            .prepare_successor_handoff(&operation, "host", &session.id, &parent.id, &successor.id)
             .unwrap();
         assert_eq!(database.mark_expired_leases(now_ms() + 121_000).unwrap(), 1);
         assert_eq!(

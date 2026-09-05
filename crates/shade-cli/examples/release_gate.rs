@@ -808,7 +808,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
 
     let context = CompactContext {
         workspace: WorkspaceId("ws_01J7W3N7Y9AZ8T6G5F4E3D2C1B".into()),
-        session: SessionId("zenith_01J7W3N7Y9AZ8T6G5F4E3D".into()),
+        session: SessionId("host_01J7W3N7Y9AZ8T6G5F4E3D".into()),
         base_ref: "origin/feature/shade-agent".into(),
         base_sha: sha256_a.clone(),
         head_sha: sha256_b.clone(),
@@ -860,7 +860,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
         (
             "release",
             completed(json!({
-                "session": "zenith_01J7W3N7Y9AZ8T6G5F4E3D",
+                "session": "host_01J7W3N7Y9AZ8T6G5F4E3D",
                 "workspace": "ws_01J7W3N7Y9AZ8T6G5F4E3D2C1B",
                 "checkpoint_id": "ckpt_01J7W3N7Y9AZ8T6G5F4E3D2C1B",
                 "released": true,

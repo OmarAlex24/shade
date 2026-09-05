@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { runZenithHarness } from "../src/harness.ts";
+import { runSessionHarness } from "../src/harness.ts";
 
-describe("Zenith lifecycle harness", () => {
+describe("session lifecycle harness", () => {
   test(
     "survives concurrent chats, reconnects, handoff, conflicts and cleanup",
     async () => {
-      const report = await runZenithHarness();
+      const report = await runSessionHarness();
       expect(report).toMatchObject({
         chats: 20,
         initial_leases: 20,

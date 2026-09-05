@@ -116,7 +116,7 @@ interface CommandResult {
   stderr: string;
 }
 
-export async function runRealZenithHarness(
+export async function runRealSessionHarness(
   options: RealHarnessOptions = {},
 ): Promise<RealHarnessReport> {
   const sourceBinary = await resolveShadeBinary(options.shade_bin);
@@ -133,7 +133,7 @@ export async function runRealZenithHarness(
   const shadeBin = join(harnessRoot, "shade");
   const gitTrace = join(harnessRoot, "git-trace.jsonl");
   const runId = randomUUID().replaceAll("-", "").slice(0, 12);
-  const actorId = `zenith-real-${runId}`;
+  const actorId = `host-real-${runId}`;
   const received: EventEnvelope[] = [];
   const abortEvents = new AbortController();
   let eventError: unknown;
@@ -153,7 +153,7 @@ export async function runRealZenithHarness(
 
     const client = new ShadeClient({
       socket,
-      actor: { kind: "zenith", id: actorId },
+      actor: { kind: "host", id: actorId },
       timeout_ms: COMMAND_TIMEOUT_MS,
       operation_poll_ms: 10,
       event_reconnect_ms: 25,

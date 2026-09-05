@@ -1346,7 +1346,7 @@ fn install_locations(
             .as_ref()
             .context("acceptance label is required")?;
         let suffix = label
-            .strip_prefix("com.zenith.shade.acceptance.")
+            .strip_prefix("com.shade.daemon.acceptance.")
             .context("acceptance requires a reserved service label")?;
         anyhow::ensure!(
             !suffix.is_empty()
@@ -1370,7 +1370,7 @@ fn install_locations(
     Ok((
         home.join("Library/Application Support/Shade"),
         home.join("Library/LaunchAgents"),
-        "com.zenith.shade".into(),
+        "com.shade.daemon".into(),
     ))
 }
 
@@ -1818,7 +1818,7 @@ trailing"#;
         let temp = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temp.path().join("data&root"));
         let plist =
-            launch_agent_plist("com.zenith.shade", &temp.path().join("shade<bin>"), &config)
+            launch_agent_plist("com.shade.daemon", &temp.path().join("shade<bin>"), &config)
                 .unwrap();
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<string>--socket</string>"));

@@ -3,9 +3,9 @@ import { createServer } from "node:net";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { ShadeClient, type WireRequest } from "../../sdk-typescript/src/index.ts";
 
-import { runGc, runRealZenithHarness } from "../src/real-harness.ts";
+import { runGc, runRealSessionHarness } from "../src/real-harness.ts";
 
-describe("real Zenith lifecycle harness", () => {
+describe("real session lifecycle harness", () => {
   test("continues the durable GC operation after CLI exit 75", async () => {
     const root = await mkdtemp("/private/tmp/shade-harness-gc-");
     const socket = `${root}/s.sock`;
@@ -39,7 +39,7 @@ describe("real Zenith lifecycle harness", () => {
 
   test("rejects a missing Shade binary before creating state", async () => {
     await expect(
-      runRealZenithHarness({ shade_bin: "/definitely/missing/shade" }),
+      runRealSessionHarness({ shade_bin: "/definitely/missing/shade" }),
     ).rejects.toBeDefined();
   });
 
@@ -47,7 +47,7 @@ describe("real Zenith lifecycle harness", () => {
   realTest(
     "drives twenty chats through the real binary and leaves no resources",
     async () => {
-      const report = await runRealZenithHarness();
+      const report = await runRealSessionHarness();
       expect(report).toMatchObject({
         mode: "real",
         package_manager: "host_npm",

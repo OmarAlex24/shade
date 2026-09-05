@@ -5,13 +5,13 @@
 
 ## Product outcome
 
-Shade gives each Zenith chat an isolated, durable and space-efficient coding workspace. It reuses immutable Git bases and dependency layers through APFS copy-on-write cloning while preserving every agent change across checkpoints, forks, synchronization, recovery and release.
+Shade gives each host session (a chat, a task, an agent run) an isolated, durable and space-efficient coding workspace. It reuses immutable Git bases and dependency layers through APFS copy-on-write cloning while preserving every agent change across checkpoints, forks, synchronization, recovery and release.
 
 V1 succeeds when 20 concurrent chats can work independently, recover durable operations after client or daemon failure, and finish without lost changes or leaked mutable resources. Common interactions remain compact enough for agent loops: machine JSON only, resumable events and common responses no larger than 512 bytes.
 
 ## Public product
 
-Shade ships one Rust binary. The same binary is the machine CLI and the per-user LaunchAgent daemon. A Rust SDK used by the CLI, a TypeScript SDK used by Zenith, the official operating Skill and the 20-chat harness are part of V1.
+Shade ships one Rust binary. The same binary is the machine CLI and the per-user LaunchAgent daemon. A Rust SDK used by the CLI, a TypeScript SDK for host orchestrators, the official operating Skill and the 20-chat harness are part of V1.
 
 The engine has exactly three public seams:
 
@@ -59,4 +59,4 @@ V1 supports no other operating system, processor, filesystem or distributed hand
 
 ## Acceptance
 
-[The V1 release gate](RELEASE.md) is the only definition of releasable. Automated checks, crash and GC matrices, malicious fixtures, the Zenith harness, output budgets and recorded APFS performance/space evidence must all pass; a missing artifact blocks release.
+[The V1 release gate](RELEASE.md) is the only definition of releasable. Automated checks, crash and GC matrices, malicious fixtures, the twenty-session harness, output budgets and recorded APFS performance/space evidence must all pass; a missing artifact blocks release.

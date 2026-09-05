@@ -106,7 +106,7 @@ fn secret_preview_changed(files: &[shade_protocol::SecretFilePreview]) -> bool {
 
 fn operation_principal(actor: &Actor) -> String {
     let kind = match actor.kind {
-        ActorKind::Zenith => "zenith",
+        ActorKind::Host => "host",
         ActorKind::Agent => "agent",
         ActorKind::Cli => "cli",
         ActorKind::System => "system",

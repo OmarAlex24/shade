@@ -1,4 +1,7 @@
-# Zenith harness
+# Session harness
+
+A deterministic and a real 20-session harness that exercises the SDK the way a
+host orchestrator would.
 
 The fast deterministic harness is backed by a fake Shade daemon over a real
 Unix-domain socket. It exercises protocol edge cases without requiring macOS:
