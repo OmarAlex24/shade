@@ -1,0 +1,37 @@
+[package]
+name = "shade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+fault-injection = ["shade-engine/fault-injection"]
+
+[[bin]]
+name = "shade"
+path = "src/main.rs"
+
+[[example]]
+name = "shade-release-gate"
+path = "examples/release_gate.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shade-client = { path = "../shade-client" }
+shade-engine = { path = "../shade-engine" }
+shade-protocol = { path = "../shade-protocol" }
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true

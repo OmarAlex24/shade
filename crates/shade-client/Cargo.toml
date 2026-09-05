@@ -1,0 +1,18 @@
+[package]
+name = "shade-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shade-protocol = { path = "../shade-protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile.workspace = true

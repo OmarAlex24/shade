@@ -1,0 +1,14 @@
+/target/
+/node_modules/
+/dist/
+__pycache__/
+/.shade/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+
+/artifacts/*
+!/artifacts/.gitkeep
+/.shade-release-gate-*/
+/tmp*/

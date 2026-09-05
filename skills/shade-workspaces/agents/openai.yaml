@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shade Workspaces"
+  short_description: "Operate safe COW workspaces with Shade"
+  default_prompt: "Use $shade-workspaces to open and manage this task in a safe Shade workspace."

@@ -1,0 +1,22 @@
+{
+  "name": "shade",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun run test:ts",
+    "test:ts": "bun test packages",
+    "test:harness": "bun run packages/zenith-harness/src/cli.ts",
+    "test:harness:real": "bun run packages/zenith-harness/src/real-cli.ts",
+    "typecheck": "tsc --noEmit",
+    "build:ts": "bun build packages/sdk-typescript/src/index.ts packages/zenith-harness/src/cli.ts packages/zenith-harness/src/real-cli.ts --target=node --outdir=/tmp/shade-ts-build-check"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/node": "26.4.1",
+    "typescript": "5.9.3"
+  }
+}
