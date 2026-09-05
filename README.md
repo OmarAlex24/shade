@@ -1,33 +1,125 @@
 # Shade
 
-Shade is an agent-first workspace runtime for Apple Silicon Macs. It turns a Git repository into isolated APFS copy-on-write workspaces with durable leases, checkpoints, successor workspaces, dependency readiness, squash publishing, recovery, and resumable events.
+Shade turns a Git repository into many isolated, instantly created coding workspaces for AI agents. Each workspace is an APFS copy-on-write clone of an immutable base plus a shared dependency layer, so 20 agents get 20 full working trees in milliseconds without 20 copies of `node_modules`. Everything an agent does is durable: leases, checkpoints, forks, sync, publish as a squash commit, crash recovery and resumable events all survive a client or daemon restart.
 
-V1 has one machine interface and one production target: Apple Silicon, macOS and APFS. Unsupported targets fail closed, and production never falls back to byte copies.
+## The problem
 
-See the [implementation status](docs/STATUS.md) for completed V1 acceptance and measured release evidence.
+`git worktree` gives you isolation, but every worktree reinstalls its dependencies, and nothing tracks which agent owns which tree, what it changed, or what happens when it crashes mid-operation. A container per agent solves isolation and reproducibility but is slow and heavy on a laptop. Shade sits in between: native filesystem speed through APFS cloning, plus an agent-aware lifecycle with leases, checkpoints and recoverable operations.
 
-## Package the accepted release
+## Who it is for
 
-Create a local distribution from the binary identified by the accepted evidence:
+Shade is for authors of agent orchestrators and IDE-like hosts that run many coding agents in parallel on a Mac. If you are building the thing that spawns agents, Shade gives each one a workspace and a durable record of what it did.
+
+Platform constraint, stated up front: **Apple Silicon, macOS and APFS only.** There is no Linux, CI, Intel Mac or non-APFS support yet. Unsupported targets fail closed. Production materialization requires a successful APFS clone syscall on the same filesystem; a failure returns `COW_UNAVAILABLE` and there is no byte-copy fallback.
+
+## How it works
+
+- One immutable base per resolved Git commit. Bases are prepared once and reused.
+- Workspaces are APFS clones of that base, created with `clonefileat` / `fclonefileat` against pinned directory descriptors, staged beside the destination and atomically published only after they verify.
+- Dependency layers are shared across workspaces by fingerprint. Fingerprints cover lock contents, the workspace graph, host tool identity, OS/ABI and the isolation policy; they exclude credentials and absolute paths.
+- Dependency installs run in a sandbox. Offline replay runs under macOS `sandbox-exec` with network operations denied for the process tree, and JavaScript lifecycle scripts run only after an explicit per package/version/integrity approval.
+- Sessions hold a lease. Holders heartbeat every 30 seconds; a lease expires after 120 seconds and stays out of GC for a further 10 minute grace period.
+- Checkpoints capture HEAD, the real index tree and the complete working tree, including deletions, untracked files, symlinks and executable modes.
+- Sync, restore, dependency refresh and reviewed secret merge produce a **successor** workspace through a two-phase handoff. The predecessor stays live until the caller adopts the new cwd and env. No integration path rewrites or deletes a predecessor.
+- Publish is squash-only, with compare-and-swap on the branch and opt-in, lease-protected push. A conflict is a first-class outcome that returns a resolution workspace.
+- Secrets are scanned before any tree is imported, checkpointed or published. Detected changes produce a review containing only paths, key names and a classification, never values.
+- Operations are journaled in SQLite (WAL, `synchronous=FULL`) before side effects, are idempotent per `(actor, key)`, and are reconciled at daemon startup. Transport is NDJSON over a per-user Unix socket with mode `0600`.
+
+## Quick start
+
+Requirements: Apple Silicon, macOS, APFS, Rust 1.93+, Git, plus whichever package managers the target repository declares. Python repositories need uv >= 0.11.16.
 
 ```sh
-python3 scripts/package_release.py --binary /tmp/shade-target/release/shade
+cargo build --release
+./target/release/shade install
 ```
 
-The command requires Python 3.9+ and writes a reproducible archive and SHA-256
-sidecar under `dist/`. It verifies the accepted source, binary, skill and evidence
-before packaging the CLI/daemon, license, installation instructions and complete
-acceptance artifacts. See [installation](docs/INSTALLATION.md) for verification
-and installation, and [release packaging](docs/RELEASE.md#package-an-accepted-distribution)
-for reproduction and checks.
+`shade install` copies the same binary to `~/Library/Application Support/Shade/bin/shade`, writes a private LaunchAgent plist for the `com.shade.daemon` label, and bootstraps it in your GUI launchd domain. The one binary serves both the CLI and the daemon.
 
-## Build and test
+Every command prints exactly one minified JSON value on stdout. `shade --help` and `shade --version` print JSON too. `events --follow` prints JSONL. There is no prompt, color, table or human presentation mode.
 
-Requirements: Apple Silicon, macOS, APFS, Rust 1.93+, Git, and whichever host package managers a repository declares.
+```zsh
+open_key='open:task-42'
+opened="$(shade --idempotency-key "$open_key" open /absolute/repo --session task-42)"
+test "$(jq -r '.status' <<<"$opened")" = ok
+test "$(jq -r '.outcome.state' <<<"$opened")" = completed
+export SHADE_SESSION="$(jq -r '.outcome.result.env.SHADE_SESSION' <<<"$opened")"
+export SHADE_WORKSPACE="$(jq -r '.outcome.result.env.SHADE_WORKSPACE' <<<"$opened")"
+export SHADE_LEASE="$(jq -r '.outcome.result.env.SHADE_LEASE' <<<"$opened")"
+export SHADE_SOCKET="$(jq -r '.outcome.result.env.SHADE_SOCKET' <<<"$opened")"
+cd "$(jq -r '.outcome.result.cwd' <<<"$opened")"
+# Both SDK session handles heartbeat on their own. A standalone CLI owner
+# must run this at least every 30 seconds while the session is alive:
+shade heartbeat
+shade context
+shade checkpoint --reason before-refactor
+shade publish --branch agent/result --message 'Result'
+shade release
+```
 
-Python repositories require stable uv >=0.11.16 for system-configuration isolation.
-See the [dependency configuration boundary](docs/DEPENDENCY-CONFIGURATION.md) for
-accepted project settings and external configuration handling.
+The full command set is `open`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`, plus the administrative `warm`, `review resolve`, `doctor`, `gc` and `install`.
+
+Mutation commands wait for their terminal domain outcome. A client deadline does not cancel daemon work: the structured timeout carries `operation` when known, and its `next` field preserves the exact idempotency key for a safe retry.
+
+## Using it from a host
+
+Install the TypeScript SDK from `packages/sdk-typescript`. It is typed and has no runtime dependencies.
+
+```ts
+import { ShadeClient } from "@shade/sdk";
+
+const shade = new ShadeClient({
+  socket: process.env.SHADE_SOCKET!,
+  actor: { kind: "host", id: "my-orchestrator" },
+});
+
+const session = await shade.sessions.open(
+  { session_id: task.id, repository: { kind: "local", path: "/absolute/repo" }, intent: task.title },
+  { idempotency_key: `open:${task.id}` },
+);
+
+await spawnAgent({ cwd: session.cwd, env: session.env });
+await session.checkpoint("turn-complete");
+await session.publish({ branch: "agent/change", message: "agent change" });
+await session.release();
+```
+
+The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish` and `release`. Review decisions live on `client.reviews()`.
+
+## Outcomes
+
+Every mutation settles into one of four states.
+
+| State | Meaning | What the caller does |
+| --- | --- | --- |
+| `completed` | The result is durable. | Read `outcome.result` and continue. |
+| `accepted` | Execution continues on the daemon. | Retain `operation_id`, then poll it or resume events by cursor. |
+| `review_required` | A secret change needs a decision. No values are present. | Show the key-only preview, then resolve with merge, keep or discard. |
+| `conflict` | Integration could not complete. | Work only in the returned resolution workspace, then run `shade resolve`. |
+
+## Status
+
+Version 0.1.0, release candidate. Honest limitations:
+
+- The distribution is not signed or notarized. Integrity is verified with SHA-256 checksums only.
+- The daemon is single-user and runs as your login user. It is **not** a same-UID process sandbox. A linked worktree exposes a writable Git object database, so the secret clean filter is an accidental-commit guardrail, not a boundary against a malicious local process. See [docs/SECURITY.md](docs/SECURITY.md) for the precise threat model.
+- The SQLite schema is version 1 and there are no migrations. A database written by a different schema version is rejected rather than upgraded.
+- V1 rejects submodules, Git LFS, custom Git filters, tracked `.env*` files, missing dependency locks, source builds and executable package-manager configuration. Shade never installs a runtime or toolchain.
+
+See [docs/STATUS.md](docs/STATUS.md) for the current acceptance evidence.
+
+## Repository layout
+
+- `crates/shade-engine`: lifecycle, invariants, Git, APFS, SQLite, dependencies, secrets, GC and recovery.
+- `crates/shade-protocol`: the versioned wire and domain model, with opaque Git object IDs.
+- `crates/shade-client`: Rust SDK, also used by the CLI.
+- `crates/shade-cli`: the single `shade` binary, serving both CLI and daemon.
+- `crates/shade-cli/examples/release_gate.rs`: development-only evidence runner for APFS COW, space, context and CLI/IPC measurements.
+- `packages/sdk-typescript`: the `@shade/sdk` TypeScript client.
+- `packages/session-harness`: deterministic 20-session integration harness.
+- `skills/shade-workspaces`: compact agent operating skill.
+
+## Development
 
 ```sh
 cargo build --release
@@ -39,50 +131,27 @@ bun test packages
 bun run test:harness
 ```
 
-Install the same binary as the CLI and per-user LaunchAgent:
+`bun run test:harness` runs the harness with controlled tooling. `bun run test:harness:real` runs it against real host package managers. Several acceptance suites are `--ignored` by default because they need a live launchd domain or installed managers. [docs/RELEASE.md](docs/RELEASE.md) defines the full release gate: crash and GC matrices, malicious fixtures, the session harness, output budgets and recorded APFS performance and space evidence.
+
+To package an accepted build:
 
 ```sh
-./target/release/shade install
+python3 scripts/package_release.py --binary /tmp/shade-target/release/shade
 ```
 
-Every command emits one minified JSON value; `events --follow` emits JSONL. There is no prompt, color, table, or alternate presentation mode.
+## Docs
 
-```zsh
-open_key='open:zenith-chat-id'
-opened="$(shade --idempotency-key "$open_key" open /absolute/repo --session zenith-chat-id)"
-test "$(jq -r '.status' <<<"$opened")" = ok
-test "$(jq -r '.outcome.state' <<<"$opened")" = completed
-export SHADE_SESSION="$(jq -r '.outcome.result.env.SHADE_SESSION' <<<"$opened")"
-export SHADE_WORKSPACE="$(jq -r '.outcome.result.env.SHADE_WORKSPACE' <<<"$opened")"
-export SHADE_LEASE="$(jq -r '.outcome.result.env.SHADE_LEASE' <<<"$opened")"
-export SHADE_SOCKET="$(jq -r '.outcome.result.env.SHADE_SOCKET' <<<"$opened")"
-cd "$(jq -r '.outcome.result.cwd' <<<"$opened")"
-# Zenith and both SDK session handles heartbeat automatically. A standalone
-# CLI owner must run this at least every 30 seconds while it is alive:
-shade heartbeat
-shade context
-shade checkpoint --reason before-refactor
-shade publish --branch agent/result --message 'Result'
-shade release
-```
+- [Product requirements](docs/PRD.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Protocol v1](docs/PROTOCOL.md)
+- [Security model](docs/SECURITY.md)
+- [Installation](docs/INSTALLATION.md)
+- [Dependency configuration boundary](docs/DEPENDENCY-CONFIGURATION.md)
+- [Script approvals](docs/SCRIPT-APPROVALS.md)
+- [Diagnostics](docs/DIAGNOSTICS.md)
+- [Release gate](docs/RELEASE.md)
+- [Implementation status](docs/STATUS.md)
 
-Mutation commands wait for their terminal domain outcome. A client deadline does
-not cancel daemon work: the structured timeout includes `operation` when known
-and its `next` field preserves the exact idempotency key for a safe retry.
+## License
 
-Callers must retain the returned `cwd` and `SHADE_*` environment. Successors use a durable two-phase handoff: the predecessor remains live until the SDK/CLI confirms adoption, then cwd and environment change together. See the [product requirements](docs/PRD.md), [protocol](docs/PROTOCOL.md), [architecture](docs/ARCHITECTURE.md), [security model](docs/SECURITY.md), and [release gates](docs/RELEASE.md).
-
-## Workspace
-
-- `crates/shade-engine`: lifecycle, invariants, Git, APFS, SQLite, dependencies, secrets, GC and recovery.
-- `crates/shade-protocol`: versioned wire/domain model with opaque Git OIDs.
-- `crates/shade-client`: Rust SDK used by the CLI.
-- `crates/shade-cli`: one `shade` binary and daemon.
-- `crates/shade-cli/examples/release_gate.rs`: development-only APFS COW, space, context and CLI/IPC evidence runner; Shade still ships one binary.
-- `packages/sdk-typescript`: Zenith-facing TypeScript SDK.
-- `packages/zenith-harness`: deterministic 20-chat integration harness.
-- `skills/shade-workspaces`: compact agent operating skill.
-
-## Non-goals
-
-V1 intentionally rejects non-APFS filesystems, custom Git filters, LFS, submodules, tracked `.env*`, missing dependency locks, source builds, and unsafe executable package-manager configuration. Shade never installs a runtime or toolchain.
+MIT. See [LICENSE](LICENSE).
