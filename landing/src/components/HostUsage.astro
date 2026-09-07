@@ -1,0 +1,264 @@
+---
+// HostUsage.astro — the same session lifecycle in the three surfaces a host can
+// drive it from. All three snippets are taken from README.md and the SDK sources.
+import { repoTree } from '../consts';
+
+const tabs = [
+  {
+    id: 'cli',
+    label: 'zsh',
+    caption: 'The machine CLI. Every command prints exactly one minified JSON value on stdout.',
+    lines: [
+      "open_key='open:task-42'",
+      'opened="$(shade --idempotency-key "$open_key" open /absolute/repo --session task-42)"',
+      'export SHADE_SESSION="$(jq -r \'.outcome.result.env.SHADE_SESSION\' <<<"$opened")"',
+      'export SHADE_SOCKET="$(jq -r \'.outcome.result.env.SHADE_SOCKET\' <<<"$opened")"',
+      'cd "$(jq -r \'.outcome.result.cwd\' <<<"$opened")"',
+      '',
+      '# A standalone CLI owner heartbeats at least every 30 seconds.',
+      'shade heartbeat',
+      'shade context',
+      'shade checkpoint --reason before-refactor',
+      "shade publish --branch agent/result --message 'Result'",
+      'shade release',
+    ],
+  },
+  {
+    id: 'typescript',
+    label: 'TypeScript',
+    caption: 'The @shade/sdk client. Typed, with no runtime dependencies.',
+    lines: [
+      'import { ShadeClient } from "@shade/sdk";',
+      '',
+      'const shade = new ShadeClient({',
+      '  socket: process.env.SHADE_SOCKET!,',
+      '  actor: { kind: "host", id: "my-orchestrator" },',
+      '});',
+      '',
+      'const session = await shade.sessions.open(',
+      '  {',
+      '    session_id: task.id,',
+      '    repository: { kind: "local", path: "/absolute/repo" },',
+      '    intent: task.title,',
+      '  },',
+      '  { idempotency_key: `open:${task.id}` },',
+      ');',
+      '',
+      'await spawnAgent({ cwd: session.cwd, env: session.env });',
+      'await session.checkpoint("turn-complete");',
+      'await session.publish({ branch: "agent/change", message: "agent change" });',
+      'await session.release();',
+    ],
+  },
+  {
+    id: 'rust',
+    label: 'Rust',
+    caption: 'The shade-client crate. The same facade the CLI is built on.',
+    lines: [
+      'use shade_client::ShadeClient;',
+      'use shade_protocol::{Actor, ActorKind, OpenSession, RepositoryLocator, SessionId};',
+      '',
+      'let client = ShadeClient::new(',
+      '    std::env::var("SHADE_SOCKET")?,',
+      '    Actor { kind: ActorKind::Host, id: "my-orchestrator".into() },',
+      ');',
+      '',
+      'let session = client',
+      '    .sessions()',
+      '    .open(OpenSession {',
+      '        session_id: SessionId("task-42".into()),',
+      '        repository: RepositoryLocator::Local { path: "/absolute/repo".into() },',
+      '        base: None,',
+      '        intent: Some("Refactor the parser".into()),',
+      '    })',
+      '    .await?;',
+      '',
+      'session.checkpoint("turn-complete").await?;',
+      'session.publish("agent/change", "agent change", false).await?;',
+      'session.release().await?;',
+    ],
+  },
+];
+
+const isComment = (line: string): boolean => line.trimStart().startsWith('#') || line.trimStart().startsWith('//');
+const payloads = Object.fromEntries(tabs.map((tab) => [tab.id, tab.lines.join('\n')]));
+---
+
+<section class="host section-pad" id="host" aria-labelledby="host-title">
+  <div class="container">
+    <div class="lbl-row" data-reveal>
+      <span class="lbl">[ Use it from a host ]</span>
+      <span class="lbl">[ 3 surfaces ]</span>
+    </div>
+
+    <div class="host-intro" data-reveal>
+      <h2 class="t-section" id="host-title">
+        One seam, <span class="blue">three projections.</span>
+      </h2>
+      <p class="t-body-lg host-lede">
+        Shade is for the thing that spawns agents. The CLI and both SDKs are projections of the same
+        seam, so a host picks the surface that fits its runtime and gets the identical lifecycle.
+      </p>
+    </div>
+
+    <div class="panel code-panel" data-reveal data-tabs>
+      <div class="tabbar">
+        <div class="tablist" role="tablist" aria-label="Host surface">
+          {tabs.map((tab, i) => (
+            <button
+              class:list={['tab', { active: i === 0 }]}
+              type="button"
+              role="tab"
+              id={`tab-${tab.id}`}
+              aria-controls={`panel-${tab.id}`}
+              aria-selected={i === 0 ? 'true' : 'false'}
+              tabindex={i === 0 ? 0 : -1}
+              data-tab={tab.id}
+              data-payload={payloads[tab.id]}
+            >{tab.label}</button>
+          ))}
+        </div>
+        <button
+          class="cmd-copy mono tab-copy"
+          type="button"
+          data-copy={payloads[tabs[0].id]}
+          aria-label="Copy the visible snippet"
+        >copy</button>
+      </div>
+
+      {tabs.map((tab, i) => (
+        <div
+          class="tabpanel"
+          role="tabpanel"
+          id={`panel-${tab.id}`}
+          aria-labelledby={`tab-${tab.id}`}
+          hidden={i !== 0}
+        >
+          <pre class="code-block"><code>{tab.lines.map((line) => (
+            <span class:list={['c-line', { 'c-com': isComment(line) }]}>{line}</span>
+          ))}</code></pre>
+          <p class="code-caption">{tab.caption}</p>
+        </div>
+      ))}
+    </div>
+
+    <p class="host-note" data-reveal>
+      Both SDK session handles heartbeat on their own and adopt successor handoffs for you, so host
+      code normally observes only the final <code class="mono">cwd</code> and
+      <code class="mono">env</code>.
+      <a href={repoTree('packages/sdk-typescript')} rel="noreferrer">Read the SDK reference</a>.
+    </p>
+  </div>
+</section>
+
+<style>
+  .host { border-top: 1px solid var(--border); background: var(--bg-soft); }
+
+  .host-intro { max-width: 62ch; margin-bottom: 38px; }
+  .host-lede { margin-top: 18px; color: var(--body); max-width: 60ch; }
+
+  .code-panel { overflow: hidden; }
+
+  .tabbar {
+    display: flex;
+    align-items: stretch;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+
+  .tablist { display: flex; }
+
+  .tab {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    border-right: 1px solid var(--border);
+    padding: 0 22px;
+    height: 46px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.02em;
+    color: var(--faint);
+    cursor: pointer;
+    transition: color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+  }
+  .tab:hover { color: var(--ink); background: var(--bg-soft); }
+  .tab.active {
+    color: var(--accent-strong);
+    background: var(--chip);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .tab-copy { border-left: 1px solid var(--border); height: 46px; }
+
+  .tabpanel[hidden] { display: none; }
+
+  .code-panel .code-block { border: 0; }
+
+  .code-caption {
+    padding: 14px 24px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 13px;
+    color: var(--faint);
+  }
+
+  .host-note {
+    margin-top: 24px;
+    max-width: 74ch;
+    font-size: 13.5px;
+    line-height: 1.65;
+    color: var(--faint);
+  }
+  .host-note code { font-size: 0.9em; color: var(--body); }
+  .host-note a { color: var(--body); text-decoration: underline; text-underline-offset: 2px; }
+  .host-note a:hover { color: var(--accent); }
+  .host-note a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media (max-width: 560px) {
+    .tab { padding: 0 14px; font-size: 11.5px; }
+    .code-panel .code-block { padding: 18px 16px; font-size: 11px; }
+  }
+</style>
+
+<script>
+  // Tabs: roving tabindex, arrow/Home/End navigation, and a copy button that
+  // always carries the payload of the visible snippet.
+  const root = document.querySelector<HTMLElement>('[data-tabs]');
+  if (root) {
+    const tabs = Array.from(root.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+    const panels = Array.from(root.querySelectorAll<HTMLElement>('[role="tabpanel"]'));
+    const copyButton = root.querySelector<HTMLButtonElement>('.tab-copy');
+
+    const select = (index: number): void => {
+      tabs.forEach((tab, i) => {
+        const isActive = i === index;
+        tab.classList.toggle('active', isActive);
+        tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        tab.tabIndex = isActive ? 0 : -1;
+        const panel = panels[i];
+        if (panel) panel.hidden = !isActive;
+      });
+      const payload = tabs[index]?.dataset.payload;
+      if (copyButton && payload) copyButton.dataset.copy = payload;
+    };
+
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(i));
+      tab.addEventListener('keydown', (event: KeyboardEvent) => {
+        const last = tabs.length - 1;
+        let next: number | null = null;
+        if (event.key === 'ArrowRight') next = i === last ? 0 : i + 1;
+        else if (event.key === 'ArrowLeft') next = i === 0 ? last : i - 1;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = last;
+        if (next === null) return;
+        event.preventDefault();
+        select(next);
+        tabs[next]?.focus();
+      });
+    });
+  }
+</script>

@@ -1,0 +1,157 @@
+---
+// Footer.astro — light footer, hairline top, mono column labels.
+import { REPO_URL, repoPath, repoTree, VERSION, LICENSE } from '../consts';
+
+const columns = [
+  {
+    label: 'Docs',
+    links: [
+      { label: 'Architecture', href: repoPath('docs/ARCHITECTURE.md') },
+      { label: 'Protocol v1', href: repoPath('docs/PROTOCOL.md') },
+      { label: 'Security model', href: repoPath('docs/SECURITY.md') },
+      { label: 'Implementation status', href: repoPath('docs/STATUS.md') },
+    ],
+  },
+  {
+    label: 'Repo',
+    links: [
+      { label: 'Source', href: REPO_URL },
+      { label: 'Engine crate', href: repoTree('crates/shade-engine') },
+      { label: 'TypeScript SDK', href: repoTree('packages/sdk-typescript') },
+      { label: 'Release gate', href: repoPath('docs/RELEASE.md') },
+    ],
+  },
+  {
+    label: 'Community',
+    links: [
+      { label: 'Contributing', href: repoPath('CONTRIBUTING.md') },
+      { label: 'Code of conduct', href: repoPath('CODE_OF_CONDUCT.md') },
+      { label: 'Report a vulnerability', href: repoPath('SECURITY.md') },
+      { label: 'Issues', href: `${REPO_URL}/issues` },
+    ],
+  },
+];
+---
+
+<footer class="footer" role="contentinfo">
+  <div class="container">
+    <div class="footer-cols">
+      <div>
+        <a href="#top" class="footer-wordmark" aria-label="Shade, back to top">
+          <span class="wm-mark" aria-hidden="true"></span>
+          <span class="wm-text">Shade</span>
+        </a>
+        <p class="footer-tagline">
+          Isolated, instantly created coding workspaces for AI agents on macOS.
+        </p>
+      </div>
+
+      {columns.map((column) => (
+        <div>
+          <span class="lbl footer-col-label">{column.label}</span>
+          <ul class="footer-links" role="list">
+            {column.links.map((link) => (
+              <li><a href={link.href} rel="noreferrer">{link.label}</a></li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+
+    <div class="footer-bottom">
+      <span class="lbl">{LICENSE} licensed</span>
+      <span class="lbl">v{VERSION} release candidate</span>
+    </div>
+  </div>
+</footer>
+
+<style>
+  .footer {
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    padding-block: clamp(3rem, 6vw, 3.5rem);
+    color: var(--faint);
+  }
+
+  .footer-cols {
+    display: grid;
+    grid-template-columns: 1.6fr 1fr 1fr 1fr;
+    gap: 40px;
+  }
+
+  .footer-wordmark {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    text-decoration: none;
+    transition: opacity 0.2s;
+  }
+  .footer-wordmark:hover { opacity: 0.75; }
+  .footer-wordmark:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  .wm-mark {
+    position: relative;
+    width: 13px;
+    height: 13px;
+    background: var(--accent);
+    flex: none;
+  }
+  .wm-mark::after {
+    content: '';
+    position: absolute;
+    left: 5px;
+    top: 5px;
+    width: 13px;
+    height: 13px;
+    border: 1.5px solid var(--ink);
+  }
+  .wm-text {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+    padding-left: 6px;
+  }
+
+  .footer-tagline {
+    margin-top: 16px;
+    font-size: 13.5px;
+    color: var(--faint);
+    line-height: 1.5;
+    max-width: 32ch;
+  }
+
+  .footer-col-label { display: block; margin-bottom: 14px; }
+
+  .footer-links {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .footer-links a {
+    font-size: 0.9rem;
+    color: var(--body);
+    text-decoration: none;
+    transition: color 0.18s;
+  }
+  .footer-links a:hover { color: var(--ink); }
+  .footer-links a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .footer-bottom {
+    margin-top: 44px;
+    border-top: 1px solid var(--border);
+    padding-top: 22px;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  @media (max-width: 768px) {
+    .footer-cols { grid-template-columns: 1fr 1fr; gap: 28px; }
+  }
+  @media (max-width: 480px) {
+    .footer-bottom { flex-direction: column; align-items: flex-start; }
+  }
+</style>

@@ -1,0 +1,111 @@
+---
+// Problem.astro — the three ways to give an agent its own tree, side by side.
+// Copy tracks README, "The problem". The Shade cell carries the pixel-canvas
+// hover so the comparison points at the answer without a badge or a colour swap.
+const options = [
+  {
+    name: 'git worktree',
+    mono: true,
+    verdict: 'Isolation without a lifecycle',
+    body:
+      'Every worktree reinstalls its dependencies, and nothing tracks which agent owns which tree, what it changed, or what happens when it crashes mid-operation.',
+  },
+  {
+    name: 'A container per agent',
+    mono: false,
+    verdict: 'Reproducible, but heavy',
+    body:
+      'Containers solve isolation and reproducibility, and pay for it in start-up time and disk. On a laptop running twenty agents at once, that cost lands on the developer.',
+  },
+  {
+    name: 'Shade',
+    mono: false,
+    verdict: 'Filesystem speed with an agent-aware lifecycle',
+    body:
+      'Native filesystem speed through APFS cloning, plus leases, checkpoints and recoverable operations that survive a client or daemon restart.',
+  },
+];
+---
+
+<section class="problem section-pad" id="problem" aria-labelledby="problem-title">
+  <div class="container">
+    <div class="lbl-row" data-reveal>
+      <span class="lbl">[ The problem ]</span>
+      <span class="lbl">[ 3 ways ]</span>
+    </div>
+
+    <div class="problem-intro" data-reveal>
+      <h2 class="t-section" id="problem-title">
+        Twenty agents need twenty trees. <span class="blue">Something has to pay for them.</span>
+      </h2>
+      <p class="t-body-lg problem-lede">
+        Git already isolates working trees and containers already isolate machines. Neither one knows
+        that an agent is holding the tree, or what to do when it stops halfway through.
+      </p>
+    </div>
+
+    <div class="divide-grid problem-grid" role="list">
+      {options.map((option, i) => (
+        <div class="cell problem-cell" role="listitem" data-reveal data-reveal-delay={i * 90}>
+          {option.name === 'Shade' && (
+            <pixel-canvas data-colors="#cfe0ff,#9bc0f9,#4f8ff0" data-gap="6" data-speed="35" aria-hidden="true"></pixel-canvas>
+          )}
+          <h3 class:list={['pc-name', { mono: option.mono }]}>{option.name}</h3>
+          <p class="pc-verdict">{option.verdict}</p>
+          <p class="pc-body">{option.body}</p>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .problem { border-top: 1px solid var(--border); }
+
+  .problem-intro { max-width: 66ch; margin-bottom: 40px; }
+  .problem-lede { margin-top: 18px; color: var(--body); max-width: 62ch; }
+
+  .problem-grid { grid-template-columns: repeat(3, 1fr); }
+
+  .problem-cell {
+    display: flex;
+    flex-direction: column;
+    padding: 30px 26px 32px;
+  }
+
+  .pc-name {
+    font-size: 1.15rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+  .pc-name.mono { font-family: var(--font-mono); font-size: 1rem; letter-spacing: 0; }
+
+  .pc-verdict {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--accent);
+    line-height: 1.5;
+  }
+  /* Two lines reserved so the body copy starts on the same baseline in all
+     three cells, whether the verdict wraps or not. */
+  @media (min-width: 861px) {
+    /* border-box: two lines of copy plus the 12px rule padding and 1px rule. */
+    .pc-verdict { min-height: calc(2 * 11.5px * 1.5 + 13px); }
+  }
+
+  .pc-body {
+    margin-top: 14px;
+    color: var(--body);
+    font-size: 14.5px;
+    line-height: 1.6;
+  }
+
+  @media (max-width: 900px) {
+    .problem-grid { grid-template-columns: 1fr; }
+  }
+</style>

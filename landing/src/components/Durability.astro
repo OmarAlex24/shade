@@ -1,0 +1,191 @@
+---
+// Durability.astro — what survives a crash, and what a caller has to handle.
+// Timings, capture list and outcome table all track README and docs/ARCHITECTURE.md.
+import HandoffGraph from './svg/HandoffGraph.astro';
+import OutcomeFan from './svg/OutcomeFan.astro';
+
+const guarantees = [
+  {
+    title: 'Leases',
+    body:
+      'A session holds a lease while an agent works in it. Holders heartbeat every 30 seconds, a lease expires after 120 seconds, and an expired workspace stays out of garbage collection for a further 10 minute grace period.',
+    figures: ['30 s heartbeat', '120 s expiry', '10 min GC grace'],
+  },
+  {
+    title: 'Checkpoints',
+    body:
+      'A checkpoint captures HEAD, the real index tree and the complete working tree. Deletions, untracked files, symlinks and executable modes are all part of the capture, not an approximation of it.',
+    figures: ['HEAD', 'real index tree', 'full working tree'],
+  },
+  {
+    title: 'Successor handoff',
+    body:
+      'Sync, restore, dependency refresh and reviewed secret merge all produce a successor workspace. No integration path rewrites or deletes a predecessor, so a half-finished handoff cannot destroy the tree an agent is standing in.',
+    figures: ['two phase', 'predecessor stays live'],
+  },
+  {
+    title: 'Secret review',
+    body:
+      'Secrets are scanned before a tree is imported, checkpointed or published. A detected change produces a review containing paths, key names and a classification, and never the values themselves.',
+    figures: ['paths', 'key names', 'classification'],
+  },
+];
+
+const outcomes = [
+  {
+    state: 'completed',
+    meaning: 'The result is durable.',
+    action: 'Read outcome.result and continue.',
+  },
+  {
+    state: 'accepted',
+    meaning: 'Execution continues on the daemon.',
+    action: 'Retain operation_id, then poll it or resume events by cursor.',
+  },
+  {
+    state: 'review_required',
+    meaning: 'A secret change needs a decision. No values are present.',
+    action: 'Show the key-only preview, then resolve with merge, keep or discard.',
+  },
+  {
+    state: 'conflict',
+    meaning: 'Integration could not complete.',
+    action: 'Work in the returned resolution workspace, then resolve it.',
+  },
+];
+---
+
+<section class="durable section-pad" id="durable" aria-labelledby="durable-title">
+  <div class="container">
+    <div class="lbl-row" data-reveal>
+      <span class="lbl">[ Durable by construction ]</span>
+      <span class="lbl">[ 4 outcomes ]</span>
+    </div>
+
+    <div class="durable-intro" data-reveal>
+      <h2 class="t-section" id="durable-title">
+        A crash mid-operation is a state, <span class="blue">not an accident.</span>
+      </h2>
+      <p class="t-body-lg durable-lede">
+        Everything an agent does is journaled before it happens and reconciled at daemon startup, so
+        leases, checkpoints, forks, publishes and resumable events all survive a client or daemon
+        restart.
+      </p>
+    </div>
+
+    <div class="durable-fig" data-reveal>
+      <HandoffGraph />
+    </div>
+
+    <div class="divide-grid guarantee-grid" role="list">
+      {guarantees.map((guarantee, i) => (
+        <div class="cell guarantee" role="listitem" data-reveal data-reveal-delay={i * 70}>
+          <h3 class="g-title">{guarantee.title}</h3>
+          <p class="g-body">{guarantee.body}</p>
+          <ul class="g-figures" role="list">
+            {guarantee.figures.map((figure) => <li class="mono">{figure}</li>)}
+          </ul>
+        </div>
+      ))}
+    </div>
+
+    <div class="outcomes">
+      <div class="outcomes-fig" data-reveal>
+        <OutcomeFan />
+      </div>
+
+      <div class="outcomes-list" data-reveal data-reveal-delay="120">
+        <h3 class="outcomes-title">Every mutation settles into one of four states.</h3>
+        <ul role="list">
+          {outcomes.map((outcome) => (
+            <li class="outcome">
+              <span class="o-state mono">{outcome.state}</span>
+              <span class="o-meaning">{outcome.meaning}</span>
+              <span class="o-action">{outcome.action}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .durable { border-top: 1px solid var(--border); }
+
+  .durable-intro { max-width: 64ch; margin-bottom: 38px; }
+  .durable-lede { margin-top: 18px; color: var(--body); max-width: 62ch; }
+
+  .durable-fig { margin-bottom: 46px; }
+
+  .guarantee-grid { grid-template-columns: repeat(2, 1fr); }
+
+  .guarantee { display: flex; flex-direction: column; padding: 30px 28px 32px; }
+
+  .g-title { font-size: 1.15rem; font-weight: 600; letter-spacing: -0.02em; }
+  .g-body {
+    margin-top: 12px;
+    color: var(--body);
+    font-size: 14.5px;
+    line-height: 1.62;
+    max-width: 52ch;
+  }
+  .g-figures {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 20px;
+    list-style: none;
+  }
+  .g-figures li {
+    border: 1px solid var(--chip-border);
+    background: var(--chip);
+    color: var(--accent-strong);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    padding: 7px 9px;
+  }
+
+  .outcomes {
+    margin-top: 56px;
+    display: grid;
+    grid-template-columns: 0.9fr 1.1fr;
+    gap: clamp(28px, 4vw, 56px);
+    align-items: center;
+  }
+
+  .outcomes-title {
+    font-size: clamp(1.2rem, 2vw, 1.5rem);
+    letter-spacing: -0.025em;
+    max-width: 24ch;
+    margin-bottom: 8px;
+  }
+
+  .outcomes-list ul { list-style: none; }
+
+  .outcome {
+    display: grid;
+    grid-template-columns: 150px 1fr;
+    gap: 4px 18px;
+    padding: 18px 0;
+    border-top: 1px solid var(--border);
+  }
+  .o-state {
+    grid-row: span 2;
+    font-size: 12.5px;
+    color: var(--accent);
+    padding-top: 2px;
+  }
+  .o-meaning { font-size: 14.5px; color: var(--ink); line-height: 1.5; }
+  .o-action { font-size: 13.5px; color: var(--faint); line-height: 1.55; }
+
+  @media (max-width: 900px) {
+    .guarantee-grid { grid-template-columns: 1fr; }
+    .outcomes { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .outcome { grid-template-columns: 1fr; }
+    .o-state { grid-row: auto; margin-bottom: 4px; }
+  }
+</style>

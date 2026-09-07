@@ -1,0 +1,65 @@
+---
+// OutcomeFan — one mutation, four terminal states. Drawn as a fan so the four
+// outcomes read as peers: none of them is the error path.
+const outcomes = ['completed', 'accepted', 'review_required', 'conflict'];
+const NODE_X = 286;
+const NODE_W = 214;
+const NODE_H = 42;
+const tops = [22, 90, 158, 226];
+const CORE_OUT: [number, number] = [156, 145];
+---
+
+<div class="fig outcome-fan js-graph">
+  <span class="cm tl"></span><span class="cm tr"></span><span class="cm bl"></span><span class="cm br"></span>
+  <div class="lbl fig-label">[ Terminal states ]</div>
+
+  <svg
+    viewBox="0 0 520 300"
+    width="100%"
+    role="img"
+    aria-label="Diagram: one mutation fans out into four terminal states, completed, accepted, review required and conflict."
+  >
+    {tops.map((top) => {
+      const y = top + NODE_H / 2;
+      const d = `M ${CORE_OUT[0]} ${CORE_OUT[1]} C 216 ${CORE_OUT[1]}, 236 ${y}, ${NODE_X} ${y}`;
+      return <path class="g-line" d={d} />;
+    })}
+    {tops.map((top, i) => {
+      const y = top + NODE_H / 2;
+      const d = `M ${CORE_OUT[0]} ${CORE_OUT[1]} C 216 ${CORE_OUT[1]}, 236 ${y}, ${NODE_X} ${y}`;
+      return <path class="g-flow" d={d} style={`animation-delay:${i * 0.55}s`} />;
+    })}
+
+    <circle class="g-pulse" cx="90" cy="145" r="86" />
+    <rect class="g-core" x="24" y="113" width="132" height="64" />
+    <text class="ill-tc g-label" x="90" y="141" text-anchor="middle">mutation</text>
+    <text class="ill-tc g-label cap" x="90" y="159" text-anchor="middle">journaled</text>
+
+    {outcomes.map((outcome, i) => (
+      <>
+        <rect class="g-node" x={NODE_X} y={tops[i]} width={NODE_W} height={NODE_H} />
+        <text class="ill-tm state g-label" x={NODE_X + 16} y={tops[i] + NODE_H / 2 + 4}>{outcome}</text>
+      </>
+    ))}
+  </svg>
+</div>
+
+<style>
+  .outcome-fan {
+    padding: 26px 22px 22px;
+    display: flex;
+    align-items: center;
+  }
+  .outcome-fan svg { margin-top: 14px; }
+  .state { font-size: 12px; fill: var(--ink); letter-spacing: 0.02em; }
+  .outcome-fan :global(.cap) { font-size: 10.5px; fill: rgba(255, 255, 255, 0.82); }
+
+  /* The drawing scales with its viewBox, so labels grow in user units when the
+     figure is only a phone wide. */
+  @media (max-width: 760px) {
+    .outcome-fan { padding: 22px 14px 16px; }
+    .state { font-size: 16px; }
+    .outcome-fan :global(.ill-tc) { font-size: 17px; }
+    .outcome-fan :global(.cap) { font-size: 14px; }
+  }
+</style>

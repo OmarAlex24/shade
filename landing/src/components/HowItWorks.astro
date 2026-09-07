@@ -1,0 +1,351 @@
+---
+// HowItWorks.astro — the three authorities. Selecting one expands its detail in
+// place and lights the matching element of the isometric diagram beside it.
+import CloneStack from './svg/CloneStack.astro';
+
+const authorities = [
+  {
+    tag: 'SQLite',
+    title: 'The control plane',
+    eyebrow: 'Control plane',
+    heading: 'The journal is written before the side effect',
+    body:
+      'An operation is inserted before anything happens on disk, so an interrupted run is recoverable by id or by cursor instead of guessed at. Startup reconciles whatever was still in flight.',
+    points: ['Journal before side effects', 'WAL + synchronous=FULL', 'Idempotent per (actor, key)'],
+  },
+  {
+    tag: 'Git',
+    title: 'The content',
+    eyebrow: 'Content',
+    heading: 'One immutable base per resolved commit',
+    body:
+      'Bases are prepared once and reused by every workspace that resolves to the same commit. Publishing is squash-only and updates the branch through a compare-and-swap, so a concurrent write is a conflict rather than a lost commit.',
+    points: ['One base per resolved commit', 'Squash-only publish', 'Compare-and-swap on the branch'],
+  },
+  {
+    tag: 'APFS',
+    title: 'The materialized views',
+    eyebrow: 'Materialized views',
+    heading: 'Clones are staged, verified, then published',
+    body:
+      'Workspaces are cloned with clonefileat against pinned directory descriptors, staged beside their destination and published atomically only once they verify. A clone that cannot happen returns COW_UNAVAILABLE.',
+    points: ['clonefileat on pinned descriptors', 'Staged, then atomically published', 'COW_UNAVAILABLE, no byte-copy fallback'],
+  },
+];
+
+const details = authorities.map(({ eyebrow, heading, body, points }) => ({ eyebrow, heading, body, points }));
+// Serialized into the page so the behaviour script stays a processed module.
+const detailsJson = JSON.stringify(details).replace(/</g, '\\u003c');
+const first = authorities[0];
+---
+
+<section class="how section-pad" id="how-it-works" aria-labelledby="how-title">
+  <div class="container">
+    <div class="lbl-row" data-reveal>
+      <span class="lbl">[ How it works ]</span>
+      <span class="lbl">[ 3 authorities ]</span>
+    </div>
+
+    <div class="how-intro" data-reveal>
+      <h2 class="t-section" id="how-title">
+        Three authorities, never collapsed into <span class="blue">one state field.</span>
+      </h2>
+      <p class="t-body how-lede">
+        SQLite owns the control plane, Git owns content, and the filesystem owns materialized views.
+        The engine owns sequencing, so callers cannot compose filesystem and Git primitives in an
+        unsafe order.
+      </p>
+    </div>
+
+    <div class="cat" data-reveal>
+      <div class="cat-list">
+        <div class="cat-items">
+          {authorities.map((authority, i) => (
+            <>
+              <div class="cat-phase">
+                <button
+                  class:list={['cat-item', { active: i === 0 }]}
+                  type="button"
+                  data-phase-index={i}
+                  aria-pressed={i === 0 ? 'true' : 'false'}
+                >
+                  <span class="n mono">{authority.tag}</span>
+                  <span class="cat-item-title">{authority.title}</span>
+                </button>
+              </div>
+              {i === 0 && (
+                <aside class="cat-detail t-stagger" data-phase-detail aria-live="polite" aria-atomic="true">
+                  <span class="cat-detail-eyebrow t-stagger-line t-stagger-line--1" data-detail-eyebrow>{first.eyebrow}</span>
+                  <h3 class="cat-detail-title t-stagger-line t-stagger-line--2" data-detail-heading>{first.heading}</h3>
+                  <p class="cat-detail-copy t-stagger-line t-stagger-line--3" data-detail-body>{first.body}</p>
+                  <ul class="cat-detail-points t-stagger-line t-stagger-line--4" data-detail-points role="list">
+                    {first.points.map((point) => <li>{point}</li>)}
+                  </ul>
+                </aside>
+              )}
+            </>
+          ))}
+        </div>
+      </div>
+
+      <CloneStack />
+    </div>
+
+    <script type="application/json" data-authority-details is:inline set:html={detailsJson}></script>
+  </div>
+</section>
+
+<style>
+  .how { border-top: 1px solid var(--border); }
+
+  .how-intro { max-width: 62ch; margin-bottom: 34px; }
+  .how-lede { margin-top: 16px; color: var(--body); max-width: 60ch; }
+
+  .cat {
+    display: grid;
+    grid-template-columns: 1.05fr 0.95fr;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+  }
+
+  :global(:root) {
+    --stagger-dur: 520ms;
+    --stagger-distance: 10px;
+    --stagger-stagger: 45ms;
+    --stagger-blur: 3px;
+    --stagger-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .cat-list {
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    min-height: 420px;
+  }
+  .cat-items { padding: 8px 0; }
+  .cat-phase { background: var(--panel); }
+
+  .cat-item {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    width: 100%;
+    min-height: 64px;
+    padding: 18px 32px;
+    appearance: none;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    color: var(--body);
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+    transition: color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+  }
+  .cat-phase:last-of-type .cat-item { border-bottom: 0; }
+  .cat-item .n {
+    flex: none;
+    width: 58px;
+    font-size: 12.5px;
+    color: var(--faint-2);
+    transition: color 0.2s ease;
+  }
+  .cat-item-title { font-size: 1rem; }
+  .cat-item.active {
+    color: var(--ink);
+    font-weight: 500;
+    background: var(--bg-soft);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .cat-item.active .n { color: var(--accent); }
+  .cat-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .cat-detail {
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 28px 32px 30px;
+    min-height: 250px;
+    background:
+      linear-gradient(180deg, rgba(238, 243, 255, 0.7), rgba(255, 255, 255, 0) 72%),
+      var(--panel);
+  }
+  .cat-detail-eyebrow {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .cat-detail-title {
+    margin-top: 12px;
+    font-size: clamp(1.15rem, 2vw, 1.35rem);
+    line-height: 1.16;
+    letter-spacing: -0.02em;
+  }
+  .cat-detail-copy {
+    margin-top: 12px;
+    color: var(--body);
+    font-size: 14.5px;
+    line-height: 1.62;
+    max-width: 48ch;
+  }
+  .cat-detail-points {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 18px;
+    list-style: none;
+  }
+  .cat-detail-points :global(li) {
+    border: 1px solid var(--chip-border);
+    background: var(--chip);
+    color: var(--accent-strong);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    line-height: 1.25;
+    padding: 7px 9px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* Legible is the resting state. The entrance animates position and focus
+     only -- never opacity -- so any static render (no JS, reduced motion, or a
+     screenshot caught mid-swap) shows the copy instead of an empty panel. */
+  .t-stagger-line {
+    display: block;
+    transform: translateY(0);
+    filter: blur(0);
+    transition:
+      transform var(--stagger-dur) var(--stagger-ease),
+      filter    var(--stagger-dur) var(--stagger-ease);
+  }
+  .t-stagger-line--2 { transition-delay: var(--stagger-stagger); }
+  .t-stagger-line--3 { transition-delay: calc(var(--stagger-stagger) * 2); }
+  .t-stagger-line--4 { transition-delay: calc(var(--stagger-stagger) * 3); }
+
+  /* Applied for one frame to prime the offset, then removed so the lines
+     settle. Transitionless so priming itself is never animated. */
+  .t-stagger.is-entering .t-stagger-line {
+    transform: translateY(var(--stagger-distance));
+    filter: blur(var(--stagger-blur));
+    transition: none;
+  }
+
+  @media (max-width: 900px) {
+    .cat { grid-template-columns: 1fr; }
+    .cat-list { min-height: 0; }
+    .cat-detail { min-height: 0; }
+  }
+  @media (max-width: 560px) {
+    .cat-item { padding-inline: 22px; gap: 10px; }
+    .cat-item .n { width: 50px; }
+    .cat-detail { padding: 24px 22px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .t-stagger-line { transition: none !important; }
+  }
+</style>
+
+<script>
+  // Selecting an authority moves the detail panel under its row and lights the
+  // matching element of the diagram. Auto-advance pauses while a row is hovered
+  // or focused, and never runs under reduced motion.
+  type AuthorityDetail = {
+    eyebrow: string;
+    heading: string;
+    body: string;
+    points: string[];
+  };
+
+  const section = document.querySelector<HTMLElement>('.how');
+  if (section) {
+    const detailsNode = section.querySelector<HTMLScriptElement>('[data-authority-details]');
+    const details: AuthorityDetail[] = detailsNode
+      ? (JSON.parse(detailsNode.textContent || '[]') as AuthorityDetail[])
+      : [];
+    const items = Array.from(section.querySelectorAll<HTMLButtonElement>('.cat-item'));
+    const phases = Array.from(section.querySelectorAll<HTMLElement>('.cat-phase'));
+    const stack = section.querySelector<HTMLElement>('.clone-stack');
+    const detail = section.querySelector<HTMLElement>('[data-phase-detail]');
+    const detailEyebrow = section.querySelector<HTMLElement>('[data-detail-eyebrow]');
+    const detailHeading = section.querySelector<HTMLElement>('[data-detail-heading]');
+    const detailBody = section.querySelector<HTMLElement>('[data-detail-body]');
+    const detailPoints = section.querySelector<HTMLElement>('[data-detail-points]');
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let activeIdx = -1;
+
+    const updateDetail = (i: number): void => {
+      const next = details[i];
+      if (!next || !detailEyebrow || !detailHeading || !detailBody || !detailPoints) return;
+
+      detailEyebrow.textContent = next.eyebrow;
+      detailHeading.textContent = next.heading;
+      detailBody.textContent = next.body;
+      detailPoints.replaceChildren(
+        ...next.points.map((point) => {
+          const item = document.createElement('li');
+          item.textContent = point;
+          return item;
+        }),
+      );
+    };
+
+    const showDetail = (i: number): void => {
+      if (!detail) return;
+
+      phases[i]?.after(detail);
+      updateDetail(i);
+      if (reduce) return;
+
+      // Prime the offset, flush the style, release: the new lines rise and
+      // sharpen into place. The text is on screen for every frame of it.
+      detail.classList.add('is-entering');
+      void detail.offsetHeight;
+      detail.classList.remove('is-entering');
+    };
+
+    const setActive = (i: number): void => {
+      if (i === activeIdx) return;
+      activeIdx = i;
+      items.forEach((it, j) => {
+        const isActive = j === i;
+        it.classList.toggle('active', isActive);
+        it.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      });
+      showDetail(i);
+      if (stack) {
+        const prev = Array.from(stack.classList).find((c) => c.startsWith('cs-active-'));
+        if (prev) stack.classList.remove(prev);
+        stack.classList.add(`cs-active-${i}`);
+      }
+    };
+
+    if (!reduce && items.length > 0) {
+      let idx = 0;
+      let hovering = false;
+
+      items.forEach((it, i) => {
+        it.addEventListener('mouseenter', () => { hovering = true; idx = i; setActive(i); });
+        it.addEventListener('mouseleave', () => { hovering = false; });
+        it.addEventListener('focus', () => { hovering = true; idx = i; setActive(i); });
+        it.addEventListener('blur', () => { hovering = false; });
+        it.addEventListener('click', () => { idx = i; setActive(i); });
+      });
+
+      window.setInterval(() => {
+        if (!hovering) {
+          idx = (idx + 1) % items.length;
+          setActive(idx);
+        }
+      }, 6500);
+
+      setActive(0);
+    } else if (items.length > 0) {
+      setActive(0);
+    }
+  }
+</script>

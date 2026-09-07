@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://omaralex24.github.io/shade/sitemap-index.xml

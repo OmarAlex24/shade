@@ -1,0 +1,469 @@
+/* ════════════════════════════════════════════════════════════════
+   Shade — global styles
+   Light engineering surface: white ground, hairline modules, royal-blue
+   accent, mono micro-labels and crop marks.
+   Type: DM Sans + DM Mono · square corners (radius 0).
+   ════════════════════════════════════════════════════════════════ */
+
+/* ── LENIS SMOOTH SCROLL ───────────────────────────────────── */
+html.lenis,
+html.lenis body {
+  height: auto;
+}
+.lenis:not(.lenis-autoToggle).lenis-stopped {
+  overflow: clip;
+}
+.lenis.lenis-smooth iframe {
+  pointer-events: none;
+}
+
+/* ── RESET & BASE ─────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html {
+  background: #ffffff;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  scroll-padding-top: 64px;
+  overflow-x: hidden;
+}
+
+/* ── TOKENS ───────────────────────────────────────────────── */
+:root {
+  --bg:            #ffffff;
+  --bg-soft:       #f7f8fa;
+  --panel:         #ffffff;
+
+  --ink:           #0a0c12;
+  --body:          #565e6c;
+  --faint:         #6b7280;
+  --faint-2:       #9aa1ad;
+
+  --border:        #e7e9ee;
+  --border-strong: #d9dce3;
+
+  --accent:        #2563eb;
+  --accent-strong: #1d4ed8;
+  --accent-ink:    #ffffff;
+
+  --blue-1:        #eef3ff;
+  --blue-2:        #dbe7ff;
+  --blue-line:     #bdd0fb;
+  --chip:          #f1f5fd;
+  --chip-border:   #dbe7fb;
+
+  --ink-panel:     #0a0f1a;
+
+  --font-display: 'DM Sans Variable', 'DM Sans', system-ui, -apple-system, sans-serif;
+  --font-body:    'DM Sans Variable', 'DM Sans', system-ui, -apple-system, sans-serif;
+  --font-mono:    'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Square corners across the system */
+  --r-xs: 0; --r-sm: 0; --r-md: 0; --r-lg: 0; --r-xl: 0; --r-pill: 0;
+
+  --container: min(1180px, 100% - 3rem);
+}
+
+/* ── BODY BASE ────────────────────────────────────────────── */
+body {
+  font-family: var(--font-body);
+  font-size: 16px;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  color: var(--ink);
+  background: var(--bg);
+  overflow-x: hidden;
+}
+
+a { color: inherit; text-decoration: none; }
+.mono { font-family: var(--font-mono); }
+.blue { color: var(--accent); }
+.num { font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; }
+
+h1, h2, h3 {
+  letter-spacing: -0.03em;
+  line-height: 1.04;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* ── TYPOGRAPHY UTILITIES ─────────────────────────────────── */
+.t-hero    { font-size: clamp(2.6rem, 6vw, 4.6rem); }
+.t-section { font-size: clamp(2rem, 3.8vw, 3rem); }
+.t-card-heading { font-size: 1.5rem; font-weight: 600; line-height: 1.2; }
+.t-feature { font-size: 1.05rem; font-weight: 600; line-height: 1.3; }
+.t-body-lg { font-size: 1.05rem; line-height: 1.55; }
+.t-body    { font-size: 1rem; line-height: 1.55; }
+.t-micro   { font-size: 0.75rem; line-height: 1.4; }
+
+/* Mono micro-label */
+.lbl {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.lbl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+  margin-bottom: 34px;
+}
+
+/* ── LAYOUT UTILITIES ─────────────────────────────────────── */
+.container { width: var(--container); margin-inline: auto; }
+.section-pad { padding-block: clamp(5rem, 10vw, 8rem); }
+.section-pad-sm { padding-block: clamp(3rem, 6vw, 5rem); }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 200;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  padding: 10px 16px;
+}
+.skip-link:focus-visible { left: 12px; top: 12px; outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* ── BUTTONS (square) ─────────────────────────────────────── */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 20px;
+  background: var(--accent);
+  color: #fff;
+  font-family: var(--font-body);
+  font-size: 14.5px;
+  font-weight: 500;
+  line-height: 1;
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background .16s ease, border-color .16s ease, transform .12s ease;
+}
+.btn-primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+.btn-primary:active { transform: translateY(1px); }
+.btn-primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.btn-primary:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+
+/* Ghost / outline button */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 20px;
+  background: #fff;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 14.5px;
+  font-weight: 500;
+  line-height: 1;
+  border: 1px solid var(--border-strong);
+  border-radius: 0;
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background .16s ease, border-color .16s ease;
+}
+.btn-ghost:hover { background: var(--bg-soft); border-color: #c3c8d1; }
+.btn-ghost:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.btn-ghost:active { transform: translateY(1px); }
+
+.arrow { margin-left: 2px; }
+
+/* ── PILL / EYEBROW (mono, square) ────────────────────────── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  background: var(--chip);
+  border: 1px solid var(--chip-border);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.pill .dot {
+  width: 6px; height: 6px;
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(37, 99, 235, .55);
+}
+
+/* ── MODULES / BENTO HAIRLINE ─────────────────────────────── */
+.panel { background: var(--panel); border: 1px solid var(--border); }
+.divide-grid { display: grid; gap: 1px; background: var(--border); border: 1px solid var(--border); }
+.divide-grid > * { background: var(--panel); }
+.cell { position: relative; overflow: hidden; padding: 26px 24px; transition: background .16s ease; }
+.cell:hover { background: var(--bg-soft); }
+
+/* Pixel-canvas hover layer: canvas (z0) → legibility scrim (z1) → content (z2).
+   The scrim is a soft white radial that clears pixels behind the copy so text
+   stays readable, while pixels keep shimmering toward the card edges. */
+.cell > pixel-canvas { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+.cell:has(> pixel-canvas)::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: radial-gradient(ellipse 92% 76% at 27% 47%, rgba(255, 255, 255, 0.95) 0%, rgba(255, 255, 255, 0.72) 32%, rgba(255, 255, 255, 0) 60%);
+}
+.cell > *:not(pixel-canvas) { position: relative; z-index: 2; }
+.cell:has(> pixel-canvas) > *:not(pixel-canvas) { text-shadow: 0 0 4px #fff, 0 0 6px #fff; }
+
+/* ── FIG: light-blue illustration panel + crop-marks ──────── */
+.fig {
+  position: relative;
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(155deg, var(--blue-1), var(--blue-2));
+  overflow: visible;
+}
+.fig svg, .fig img { display: block; }
+.cm { position: absolute; width: 7px; height: 7px; background: var(--accent); z-index: 2; }
+.cm.tl { top: -4px; left: -4px; }
+.cm.tr { top: -4px; right: -4px; }
+.cm.bl { bottom: -4px; left: -4px; }
+.cm.br { bottom: -4px; right: -4px; }
+.fig-label { position: absolute; top: 14px; left: 16px; }
+
+/* ── DOT GRID + GLOW (hero backdrop) ──────────────────────── */
+.dot-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(rgba(10, 12, 18, .10) 1px, transparent 1px);
+  background-size: 22px 22px;
+  -webkit-mask-image: radial-gradient(ellipse 75% 70% at 50% 32%, #000 0%, transparent 72%);
+  mask-image: radial-gradient(ellipse 75% 70% at 50% 32%, #000 0%, transparent 72%);
+  opacity: .7;
+}
+.glow {
+  position: absolute;
+  left: 50%;
+  top: -160px;
+  transform: translateX(-50%);
+  width: 1000px;
+  height: 560px;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, rgba(37, 99, 235, .12), rgba(37, 99, 235, 0) 62%);
+  filter: blur(6px);
+}
+
+/* ── COMMAND / CODE SURFACES ──────────────────────────────── */
+.cmd {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-soft);
+  font-family: var(--font-mono);
+  text-align: left;
+}
+.cmd code {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  padding: 13px 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.cmd .cmd-sigil { color: var(--accent); user-select: none; }
+/* A phone cannot hold a full install command on one line, and a silently
+   clipped one reads as a bug. Wrap at the shell's own word boundaries instead,
+   so every character stays readable and the copy button stays in reach.
+   `anywhere` is the backstop for a single token longer than the line. */
+@media (max-width: 640px) {
+  .cmd code {
+    overflow-x: visible;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+.cmd-copy {
+  flex: none;
+  width: 46px;
+  border: 0;
+  border-left: 1px solid var(--border-strong);
+  background: #fff;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .16s ease, color .16s ease;
+}
+.cmd-copy:hover { background: var(--chip); color: var(--accent-strong); }
+.cmd-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.cmd-copy[data-copied='true'] { color: var(--accent); }
+
+.code-block {
+  margin: 0;
+  padding: 22px 24px;
+  background: var(--ink-panel);
+  color: #dbe4f4;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.72;
+  overflow-x: auto;
+  tab-size: 2;
+}
+.code-block .c-line { display: block; }
+.code-block .c-line:empty::after { content: '\00a0'; }
+.code-block .c-key { color: #93b8ff; }
+.code-block .c-str { color: #9fd0a7; }
+.code-block .c-com { color: #6d7c95; }
+.code-block .c-fn  { color: #f0f4fb; }
+
+/* ════════════════════════════════════════════════════════════
+   ANIMATED SVG GRAPH SYSTEM
+     .js-graph  → container (script adds .is-drawn on scroll-in)
+     .g-line    → connection lines (draw-in via stroke-dashoffset, JS-measured)
+     .g-flow    → bright pulse travelling along a connection (pure CSS)
+     .g-node    → node shapes (pop-in on draw)
+     .g-core    → central blue core (pop-in, slightly delayed)
+     .g-pulse   → expanding ring around the core (continuous)
+     .g-label   → text labels (fade-in with nodes)
+   ════════════════════════════════════════════════════════════ */
+.g-line {
+  stroke: var(--blue-line);
+  stroke-width: 1.5;
+  fill: none;
+  transition: stroke-dashoffset 1.2s cubic-bezier(.16, 1, .3, 1);
+}
+
+.g-node {
+  fill: #fff;
+  stroke: var(--blue-line);
+  stroke-width: 1.5;
+  opacity: 0;
+  transform: scale(0.82);
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: opacity .5s ease, transform .5s cubic-bezier(.16, 1, .3, 1);
+}
+.is-drawn .g-node { opacity: 1; transform: scale(1); }
+
+.g-core {
+  fill: var(--accent);
+  opacity: 0;
+  transform: scale(0.7);
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: opacity .5s ease .25s, transform .55s cubic-bezier(.16, 1, .3, 1) .25s;
+}
+.is-drawn .g-core { opacity: 1; transform: scale(1); }
+
+.g-label {
+  opacity: 0;
+  transition: opacity .6s ease .35s;
+}
+.is-drawn .g-label { opacity: 1; }
+
+.g-flow {
+  stroke: var(--accent);
+  stroke-width: 2.4;
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 14 999;
+  stroke-dashoffset: 1013;
+  opacity: 0;
+  filter: drop-shadow(0 0 3px rgba(37, 99, 235, .55));
+}
+.is-drawn .g-flow {
+  opacity: 0.95;
+  animation: g-flow-move 2.6s linear infinite;
+}
+@keyframes g-flow-move {
+  from { stroke-dashoffset: 1013; }
+  to   { stroke-dashoffset: 0; }
+}
+
+.g-pulse {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.is-drawn .g-pulse { animation: g-pulse-ring 2.8s ease-out infinite; }
+@keyframes g-pulse-ring {
+  0%   { opacity: 0.5; transform: scale(0.55); }
+  70%  { opacity: 0;   transform: scale(1.9); }
+  100% { opacity: 0;   transform: scale(1.9); }
+}
+
+/* SVG illustration text tokens */
+.ill-t  { font-family: var(--font-body); font-size: 13px; fill: var(--ink); }
+.ill-tc { font-family: var(--font-mono); font-size: 13px; fill: #fff; font-weight: 500; }
+.ill-tm { font-family: var(--font-mono); font-size: 10.5px; fill: var(--faint); letter-spacing: .06em; }
+
+/* ── SCROLL-REVEAL ────────────────────────────────────────── */
+/* Hidden only when JS is confirmed (html.js from Base.astro inline script).
+   Without JS, [data-reveal] stays visible — safe for SEO and a11y. */
+html.js [data-reveal] {
+  opacity: 0;
+  transform: translateY(16px);
+  transition:
+    opacity   0.7s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.7s cubic-bezier(0.16, 1, 0.3, 1),
+    filter    0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+html.js [data-reveal~="rise"]  { transform: translateY(40px); }
+html.js [data-reveal~="left"]  { transform: translateX(-28px); }
+html.js [data-reveal~="right"] { transform: translateX(28px); }
+html.js [data-reveal~="scale"] { transform: scale(0.96); }
+html.js [data-reveal~="blur"]  { filter: blur(8px); }
+
+html.js [data-reveal].is-revealed {
+  opacity: 1;
+  transform: none;
+  filter: none;
+}
+
+/* ── REDUCED MOTION ───────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+
+  html.js [data-reveal] {
+    opacity: 1;
+    transform: none;
+    filter: none;
+    transition: none;
+  }
+
+  /* Graphs: show final state, kill continuous motion */
+  .g-flow { display: none; }
+  .is-drawn .g-pulse { animation: none; }
+  .g-node, .g-core, .g-label {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+  .g-line { transition: none; }
+}

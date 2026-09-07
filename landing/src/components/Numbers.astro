@@ -1,0 +1,174 @@
+---
+// Numbers.astro — the recorded release gate, nothing rounded and nothing invented.
+// Every figure below is quoted from docs/STATUS.md, "The ordinary release gate".
+import { repoPath } from '../consts';
+
+const stats = [
+  {
+    value: '0',
+    unit: 'B',
+    lead: true,
+    label: 'Private growth for twenty COW workspaces',
+    note: 'The same twenty trees copied byte for byte grow by 2,048,000,000 B.',
+  },
+  {
+    value: '270.121',
+    unit: 'ms',
+    label: 'Materialization p50',
+    note: 'p95 280.917 ms.',
+  },
+  {
+    value: '512',
+    unit: 'B',
+    prefix: '≤',
+    label: 'Largest common response',
+    note: 'Failure detail is fetched separately by diagnostics id.',
+  },
+  {
+    value: '47.430',
+    unit: 'ms',
+    label: 'Context p95',
+    note: 'The compact context a host reads back for a live workspace.',
+  },
+  {
+    value: '4.220',
+    unit: 'ms',
+    label: 'CLI and IPC p95',
+    note: 'One command, one round trip over the Unix socket.',
+  },
+];
+---
+
+<section class="numbers section-pad" id="numbers" aria-labelledby="numbers-title">
+  <div class="container">
+    <div class="lbl-row" data-reveal>
+      <span class="lbl">[ Measured ]</span>
+      <span class="lbl">[ v0.1.0 release gate ]</span>
+    </div>
+
+    <div class="numbers-intro" data-reveal>
+      <h2 class="t-section" id="numbers-title">
+        Twenty workspaces cost <span class="blue">zero private bytes.</span>
+      </h2>
+      <p class="t-body-lg numbers-lede">
+        These are the recorded thresholds the accepted build had to clear, not a marketing round-up.
+        The storage figure is measured with <code class="mono">ATTR_CMNEXT_PRIVATESIZE</code>, not
+        estimated from global shared bytes.
+      </p>
+    </div>
+
+    <ul class="divide-grid stat-grid" role="list">
+      {stats.map((stat, i) => (
+        <li class:list={['cell', 'stat', { 'stat--lead': stat.lead }]} data-reveal data-reveal-delay={i * 70}>
+          <p class="stat-value num mono">
+            {stat.prefix && <span class="stat-prefix">{stat.prefix}</span>}{stat.value}<span class="stat-unit">{stat.unit}</span>
+          </p>
+          <h3 class="stat-label">{stat.label}</h3>
+          <p class="stat-note">{stat.note}</p>
+        </li>
+      ))}
+    </ul>
+
+    <p class="stat-footnote" data-reveal>
+      <span class="fn-mark mono">Conditions</span>
+      Recorded by the ordinary release gate documented in
+      <a href={repoPath('docs/STATUS.md')} rel="noreferrer"><code class="mono">docs/STATUS.md</code></a>
+      and bound to the evidence artifact <code class="mono">artifacts/v1-release/apfs.json</code>:
+      the unchanged accepted binaries, 25,000 entries, twenty retained workspaces and 100 context and
+      IPC samples. Performance acceptance applies to that recorded workload and environment, and the
+      artifact retains the raw samples, environment and binary digests.
+    </p>
+  </div>
+</section>
+
+<style>
+  .numbers {
+    border-top: 1px solid var(--border);
+    background: var(--bg-soft);
+  }
+
+  .numbers-intro { max-width: 66ch; margin-bottom: 40px; }
+  .numbers-lede { margin-top: 18px; color: var(--body); max-width: 64ch; }
+  .numbers-lede code { font-size: 0.87em; color: var(--ink); }
+
+  .stat-grid { grid-template-columns: repeat(6, 1fr); }
+
+  .stat {
+    display: flex;
+    flex-direction: column;
+    padding: 28px 24px 30px;
+  }
+  .stat--lead { grid-column: span 2; }
+
+  .stat-value {
+    /* One shared height so every cell's hairline lands on the same line, with
+       the lead figure set larger inside it. */
+    display: flex;
+    align-items: flex-end;
+    min-height: clamp(2.4rem, 4vw, 3.25rem);
+    font-size: clamp(1.3rem, 2.05vw, 1.72rem);
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    white-space: nowrap;
+    color: var(--ink);
+  }
+  .stat--lead .stat-value {
+    font-size: clamp(2.4rem, 4vw, 3.25rem);
+    color: var(--accent);
+  }
+  .stat-prefix { color: var(--faint-2); margin-right: 2px; }
+  .stat-unit {
+    margin-left: 4px;
+    font-size: 0.44em;
+    letter-spacing: 0;
+    color: var(--faint);
+  }
+
+  .stat-label {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1.4;
+    color: var(--ink);
+  }
+
+  .stat-note {
+    margin-top: 8px;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--faint);
+  }
+
+  .stat-footnote {
+    margin-top: 28px;
+    max-width: 86ch;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--faint);
+  }
+  .stat-footnote a { color: var(--body); text-decoration: underline; text-underline-offset: 2px; }
+  .stat-footnote a:hover { color: var(--accent); }
+  .stat-footnote a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .fn-mark {
+    display: inline-block;
+    margin-right: 8px;
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  @media (max-width: 1000px) {
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+    .stat--lead { grid-column: span 2; }
+    .stat-value { font-size: clamp(1.7rem, 4.4vw, 2.3rem); }
+    .stat--lead .stat-value { font-size: clamp(2.4rem, 6vw, 3.25rem); }
+  }
+  @media (max-width: 560px) {
+    .stat-grid { grid-template-columns: 1fr; }
+    .stat--lead { grid-column: span 1; }
+  }
+</style>

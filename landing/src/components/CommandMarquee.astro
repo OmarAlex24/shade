@@ -1,0 +1,165 @@
+---
+// CommandMarquee.astro — the public command set, scrolling as one continuous
+// mono strip. Every command below is a real Shade CLI verb (README, Quick start).
+const commands = [
+  'open',
+  'context',
+  'heartbeat',
+  'checkpoint',
+  'fork',
+  'sync',
+  'restore',
+  'deps refresh',
+  'publish',
+  'resolve',
+  'release',
+  'events',
+];
+---
+
+<section class="strip" aria-label="The Shade command set">
+  <div class="container">
+    <p class="lbl strip-label" data-reveal>[ Command set ]</p>
+
+    <ul class="sr-only">
+      {commands.map((command) => <li>{command}</li>)}
+    </ul>
+
+    <div class="marquee" aria-hidden="true" data-marquee data-reveal data-reveal-delay="100">
+      <div class="marquee-track" data-marquee-track>
+        {
+          Array.from({ length: 2 }).map(() => (
+            <div class="marquee-group" data-marquee-group>
+              {commands.map((command) => (
+                <span class="marquee-mark mono">
+                  <span class="mk-sigil">shade</span>{command}
+                </span>
+              ))}
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  const marquees = document.querySelectorAll<HTMLElement>('[data-marquee]');
+
+  marquees.forEach((marquee) => {
+    const track = marquee.querySelector<HTMLElement>('[data-marquee-track]');
+    const sourceGroup = track?.querySelector<HTMLElement>('[data-marquee-group]');
+    if (!track || !sourceGroup) return;
+
+    const syncMarquee = (): void => {
+      // Under reduced motion the track wraps into a static block and every
+      // group after the first is display:none, so scrollWidth would never grow
+      // and the fill loop would never terminate. Nothing to fill there.
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+      const groupWidth = sourceGroup.getBoundingClientRect().width;
+      if (!groupWidth) return;
+
+      // The guard is a second stop condition: a group that measures wide but
+      // lays out at zero would otherwise clone forever.
+      let added = 0;
+      while (track.scrollWidth < marquee.clientWidth + groupWidth * 2 && added < 12) {
+        track.append(sourceGroup.cloneNode(true));
+        added += 1;
+      }
+
+      track.style.setProperty('--marquee-distance', `${groupWidth}px`);
+      track.style.setProperty('--marquee-duration', `${Math.max(54, groupWidth / 34).toFixed(2)}s`);
+    };
+
+    syncMarquee();
+    window.addEventListener('resize', syncMarquee, { passive: true });
+  });
+</script>
+
+<style>
+  .strip {
+    padding-block: clamp(2rem, 4vw, 2.75rem);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-soft);
+  }
+
+  .strip-label {
+    display: block;
+    text-align: center;
+    margin-bottom: 22px;
+  }
+
+  .marquee {
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+    mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+  }
+
+  .marquee-track {
+    display: flex;
+    align-items: center;
+    width: max-content;
+    will-change: transform;
+    --marquee-distance: 50%;
+    --marquee-duration: 72s;
+    animation: marquee-scroll var(--marquee-duration) linear infinite;
+  }
+  .marquee:hover .marquee-track { animation-play-state: paused; }
+
+  .marquee-group {
+    display: flex;
+    align-items: center;
+    gap: clamp(26px, 2.6vw, 46px);
+    flex: none;
+    padding-inline: clamp(13px, 1.3vw, 23px);
+  }
+
+  .marquee-mark {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 7px;
+    flex: none;
+    height: 34px;
+    font-size: 14px;
+    line-height: 34px;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  .mk-sigil {
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    color: var(--faint-2);
+  }
+
+  @keyframes marquee-scroll {
+    from { transform: translate3d(0, 0, 0); }
+    to   { transform: translate3d(calc(-1 * var(--marquee-distance)), 0, 0); }
+  }
+
+  @media (max-width: 640px) {
+    .marquee-group { gap: 22px; padding-inline: 11px; }
+    .marquee-mark { font-size: 13px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .marquee-track {
+      animation: none;
+      flex-wrap: wrap;
+      justify-content: center;
+      width: auto;
+      gap: 20px 32px;
+    }
+
+    .marquee-track .marquee-group:nth-child(n + 2) { display: none; }
+
+    .marquee-group {
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 16px 28px;
+      padding-inline: 0;
+    }
+  }
+</style>

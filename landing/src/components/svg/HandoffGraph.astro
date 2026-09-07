@@ -1,0 +1,90 @@
+---
+// HandoffGraph — the two-phase successor handoff. The point of the drawing is
+// the bracket around the row: the predecessor stays live and writable until the
+// caller has adopted the new cwd and env.
+//
+// The same diagram is drawn twice, wide and tall, because a 900 unit wide row
+// of boxes is unreadable once the figure is only a phone wide. CSS shows one.
+const LABEL =
+  'Diagram: a predecessor workspace prepares a successor in one committed phase, a separate adoption compare-and-swap hands the host the new cwd and env, and the predecessor stays live until that adoption lands.';
+---
+
+<div class="fig handoff js-graph">
+  <span class="cm tl"></span><span class="cm tr"></span><span class="cm bl"></span><span class="cm br"></span>
+  <div class="lbl fig-label">[ Successor handoff ]</div>
+
+  <svg class="handoff-wide" viewBox="0 0 900 188" width="100%" role="img" aria-label={LABEL}>
+    <path class="g-line" d="M 216 62 L 372 62" />
+    <path class="g-flow" d="M 216 62 L 372 62" />
+    <path class="g-line" d="M 522 62 L 678 62" />
+    <path class="g-flow" d="M 522 62 L 678 62" style="animation-delay:.9s" />
+
+    <path class="g-line" d="M 118 90 L 118 150 L 779 150 L 779 90" />
+    <path class="g-flow" d="M 118 90 L 118 150 L 779 150 L 779 90" style="animation-delay:.45s" />
+
+    <rect class="g-node" x="20" y="34" width="196" height="56" />
+    <text class="ill-t g-label" x="118" y="59" text-anchor="middle">Predecessor workspace</text>
+    <text class="ill-tm g-label" x="118" y="77" text-anchor="middle">lease held</text>
+
+    <rect class="g-core" x="372" y="28" width="150" height="68" />
+    <text class="ill-tc g-label" x="447" y="57" text-anchor="middle">successor</text>
+    <text class="ill-tc g-label cap" x="447" y="77" text-anchor="middle">prepared</text>
+
+    <rect class="g-node" x="678" y="34" width="202" height="56" />
+    <text class="ill-t g-label" x="779" y="59" text-anchor="middle">Host adopts cwd and env</text>
+    <text class="ill-tm g-label" x="779" y="77" text-anchor="middle">new lease</text>
+
+    <text class="ill-tm g-label" x="294" y="44" text-anchor="middle">phase 1</text>
+    <text class="ill-tm g-label" x="294" y="84" text-anchor="middle">prepare and commit</text>
+    <text class="ill-tm g-label" x="600" y="44" text-anchor="middle">phase 2</text>
+    <text class="ill-tm g-label" x="600" y="84" text-anchor="middle">adoption CAS</text>
+
+    <text class="ill-tm g-label note" x="449" y="172" text-anchor="middle">predecessor stays live until the caller adopts</text>
+  </svg>
+
+  <svg class="handoff-tall" viewBox="0 0 340 386" width="100%" role="img" aria-label={LABEL}>
+    <path class="g-line" d="M 170 84 L 170 140" />
+    <path class="g-flow" d="M 170 84 L 170 140" />
+    <path class="g-line" d="M 170 216 L 170 272" />
+    <path class="g-flow" d="M 170 216 L 170 272" style="animation-delay:.9s" />
+
+    <path class="g-line" d="M 62 52 L 26 52 L 26 302 L 62 302" />
+    <path class="g-flow" d="M 62 52 L 26 52 L 26 302 L 62 302" style="animation-delay:.45s" />
+
+    <rect class="g-node" x="62" y="22" width="218" height="62" />
+    <text class="ill-t g-label" x="171" y="49" text-anchor="middle">Predecessor workspace</text>
+    <text class="ill-tm g-label" x="171" y="68" text-anchor="middle">lease held</text>
+
+    <rect class="g-core" x="86" y="140" width="170" height="76" />
+    <text class="ill-tc g-label" x="171" y="172" text-anchor="middle">successor</text>
+    <text class="ill-tc g-label cap" x="171" y="193" text-anchor="middle">prepared</text>
+
+    <rect class="g-node" x="62" y="272" width="218" height="62" />
+    <text class="ill-t g-label" x="171" y="299" text-anchor="middle">Host adopts cwd and env</text>
+    <text class="ill-tm g-label" x="171" y="318" text-anchor="middle">new lease</text>
+
+    <text class="ill-tm g-label" x="182" y="104">phase 1</text>
+    <text class="ill-tm g-label" x="182" y="122">prepare and commit</text>
+    <text class="ill-tm g-label" x="182" y="236">phase 2</text>
+    <text class="ill-tm g-label" x="182" y="254">adoption CAS</text>
+
+    <text class="ill-tm g-label note" x="170" y="366" text-anchor="middle">predecessor stays live until the caller adopts</text>
+  </svg>
+</div>
+
+<style>
+  .handoff { padding: 26px 22px 22px; }
+  .handoff svg { margin-top: 12px; }
+  .handoff :global(.ill-tm) { font-size: 9.6px; }
+  .handoff :global(.cap) { font-size: 10.5px; fill: rgba(255, 255, 255, 0.82); }
+  .handoff :global(.note) { fill: var(--accent); }
+
+  .handoff-tall { display: none; }
+
+  @media (max-width: 760px) {
+    .handoff { padding: 22px 14px 16px; }
+    .handoff-wide { display: none; }
+    .handoff-tall { display: block; }
+    .handoff :global(.ill-tm) { font-size: 10.5px; }
+  }
+</style>
