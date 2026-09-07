@@ -28,10 +28,9 @@ zsh scripts/worktree-inventory.sh /tmp/wt-inventory
 - **Scope.** The scan covered the worktree roots created by Codex, Cursor,
   Conductor and Zenith Studio under `$HOME`, plus scratch trees under
   `/private/tmp`. Repositories without a linked worktree are not counted.
-- **Caveat.** `du -sk` reports allocated blocks per tree. A hardlinked or
-  cloned package store is counted in every tree that references it, so
-  per-tree figures are apparent sizes. The per-row TSV is authoritative over
-  any figure quoted in prose here.
+- **Caveat.** `du -sk` reports allocated blocks, so every figure here is an
+  apparent size. The per-row TSV is authoritative over any figure quoted in
+  prose here.
 
 Raw rows: `artifacts/worktree-baseline-2026-09-06.tsv` (gitignored, not
 included in this repository; regenerate it with the command above).
@@ -49,8 +48,10 @@ Concentration, not spread, is the story:
 
 - One Rust `target/` directory alone held 66.7 GB — 95% of all build output and
   47% of everything measured.
-- One repository accounted for 58 of the 186 worktrees, each carrying a
-  `node_modules` of roughly 2.2 GB.
+- One repository, `horizon-stack`, accounted for 60 of the 186 worktrees and
+  52.5 GB, of which 45.2 GB was dependencies — 76% of all the dependency bytes
+  on the machine. Only 36 of those 60 worktrees had dependencies installed at
+  all, averaging 1.26 GB each and peaking at 3.9 GB; the other 24 had none.
 
 ## What Shade should reclaim
 

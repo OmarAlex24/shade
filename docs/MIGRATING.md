@@ -107,8 +107,10 @@ repository instead of the whole afternoon.
 
 - **Checkouts and dependencies: immediately.** The checkout becomes a
   copy-on-write clone of a shared base, and the dependency tree becomes a
-  shared layer keyed by lock fingerprint. Fifty worktrees of one repository
-  stop meaning fifty `node_modules`.
+  shared layer keyed by lock fingerprint. In the
+  [case study](CASE-STUDY.md), one repository held 60 worktrees and 45.2 GB of
+  dependencies across the 36 of them that had any installed; as Shade sessions
+  that is one layer per lock fingerprint.
 - **Build output: only when you sleep.** A checkpoint is taken with
   `git add -A`, so gitignored build output — `target`, `dist`, `.next`,
   `node_modules` — is not preserved and is not restored. That is the point:
