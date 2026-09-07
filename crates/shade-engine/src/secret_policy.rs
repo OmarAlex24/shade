@@ -1,15 +1,23 @@
 //! Local secret detection shared by Git ingress, private state and the clean
 //! filter. It returns only a decision, never matching values or fragments.
 use regex::bytes::{Regex, RegexSet};
+use sha2::Digest;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 const WINDOW: usize = 8192;
 const OVERLAP: usize = 1024;
+/// Requests larger than this keep their bytes in an anonymous private file
+/// rather than in the filter's memory.
+const SPILL_ABOVE: usize = 1024 * 1024;
+/// The largest payload one Git packet line can carry.
+const PACKET: usize = 65516;
 
 /// Final dot-suffixes that mark a `.env`-style basename as committed template
 /// content. `.env.example` and its siblings hold placeholders and are tracked
@@ -201,6 +209,220 @@ pub(crate) fn file_contains_secret(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Which hash names the repository's objects. A blob identity has to be
+/// computed exactly the way Git computes it, or every comparison below fails
+/// closed and the filter simply behaves as it did before.
+#[derive(Clone, Copy)]
+enum ObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+/// Ask the repository the filter is running inside what it already holds.
+///
+/// Git starts a process filter in the top of the working tree with `GIT_DIR`
+/// -- and, when the running command uses a private one, `GIT_INDEX_FILE` --
+/// already in the environment, so ordinary plumbing answers about exactly the
+/// index that command is reading. Its stdin is closed on purpose: this
+/// process's own stdin carries the request being judged.
+fn ask_git(arguments: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Split one `-z` record into the fields before the tab and the path after it.
+fn split_record(record: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
+    let tab = record.iter().position(|byte| *byte == b'\t')?;
+    Some((
+        record[..tab].split(|byte| *byte == b' ').collect(),
+        &record[tab + 1..],
+    ))
+}
+
+fn records(output: &[u8]) -> impl Iterator<Item = &[u8]> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+}
+
+/// `git ls-files --stage` prints `<mode> SP <object> SP <stage> TAB <path>`.
+/// Unmerged stages are skipped: a path mid-merge records no single blob.
+fn index_blobs() -> HashMap<Vec<u8>, Vec<u8>> {
+    let Some(output) = ask_git(&["ls-files", "--stage", "-z", "--full-name", "--", ":/"]) else {
+        return HashMap::new();
+    };
+    records(&output)
+        .filter_map(|record| {
+            let (fields, path) = split_record(record)?;
+            let [_mode, object, b"0"] = fields[..] else {
+                return None;
+            };
+            Some((path.to_vec(), object.to_vec()))
+        })
+        .collect()
+}
+
+/// `git ls-tree -r` prints `<mode> SP <type> SP <object> TAB <path>`.
+fn head_blobs() -> HashMap<Vec<u8>, Vec<u8>> {
+    let Some(output) = ask_git(&["ls-tree", "-r", "-z", "--full-tree", "HEAD"]) else {
+        return HashMap::new();
+    };
+    records(&output)
+        .filter_map(|record| {
+            let (fields, path) = split_record(record)?;
+            let [_mode, b"blob", object] = fields[..] else {
+                return None;
+            };
+            Some((path.to_vec(), object.to_vec()))
+        })
+        .collect()
+}
+
+fn object_format() -> Option<ObjectFormat> {
+    match ask_git(&["rev-parse", "--show-object-format"])?
+        .strip_suffix(b"\n")
+        .unwrap_or_default()
+    {
+        b"sha1" => Some(ObjectFormat::Sha1),
+        b"sha256" => Some(ObjectFormat::Sha256),
+        _ => None,
+    }
+}
+
+/// What Git already records for a path.
+///
+/// The clean direction decides what may *newly* enter Git, and content the
+/// repository already holds under the same path is not new. It has to be
+/// asked, because Git re-cleans tracked paths constantly: staging through a
+/// private index read out of a tree, verifying a materialized base, and
+/// rewriting an index whose files Git has just written all hand the filter
+/// bytes it stored long ago. Judging those as arrivals refused a repository
+/// for a credential its owner committed, at the moments its work depends on
+/// most -- a woken session could not come back at all.
+///
+/// Each listing is read at most once per filter process, and only after the
+/// scanner has actually matched, so a repository carrying nothing detectable
+/// never runs one extra command.
+#[derive(Default)]
+struct RecordedBlobs {
+    index: Option<HashMap<Vec<u8>, Vec<u8>>>,
+    head: Option<HashMap<Vec<u8>, Vec<u8>>>,
+    format: Option<Option<ObjectFormat>>,
+}
+
+impl RecordedBlobs {
+    /// The object Git holds for `path`: the index the running command reads
+    /// first, then the commit that command has checked out.
+    fn blob(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+        if let Some(object) = self.index.get_or_insert_with(index_blobs).get(path) {
+            return Some(object.clone());
+        }
+        self.head.get_or_insert_with(head_blobs).get(path).cloned()
+    }
+
+    fn format(&mut self) -> Option<ObjectFormat> {
+        *self.format.get_or_insert_with(object_format)
+    }
+}
+
+/// The bytes of one request, withheld until the whole request has passed
+/// policy. Inputs above [`SPILL_ABOVE`] are held in an anonymous private file
+/// instead of memory, so a large blob cannot be read out of the spool.
+struct Retained<'a> {
+    spool_root: &'a Path,
+    memory: Vec<u8>,
+    spill: Option<std::fs::File>,
+    length: u64,
+    kept: bool,
+}
+
+impl<'a> Retained<'a> {
+    fn new(spool_root: &'a Path) -> Self {
+        Self {
+            spool_root,
+            memory: Vec::new(),
+            spill: None,
+            length: 0,
+            kept: true,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.length += bytes.len() as u64;
+        if !self.kept {
+            return Ok(());
+        }
+        if self.spill.is_none() && self.memory.len() + bytes.len() > SPILL_ABOVE {
+            let mut file = tempfile::tempfile_in(self.spool_root)?;
+            file.write_all(&self.memory)?;
+            self.memory = Vec::new();
+            self.spill = Some(file);
+        }
+        match &mut self.spill {
+            Some(file) => file.write_all(bytes),
+            None => {
+                self.memory.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+    }
+
+    /// Stop paying for bytes that can no longer be returned to Git.
+    fn forget(&mut self) {
+        self.kept = false;
+        self.memory = Vec::new();
+        self.spill = None;
+    }
+
+    /// The object ID Git would give these bytes.
+    fn blob_id(&mut self, format: ObjectFormat) -> io::Result<Vec<u8>> {
+        match format {
+            ObjectFormat::Sha1 => self.digest::<sha1::Sha1>(),
+            ObjectFormat::Sha256 => self.digest::<sha2::Sha256>(),
+        }
+    }
+
+    fn digest<D: Digest>(&mut self) -> io::Result<Vec<u8>> {
+        let mut hasher = D::new();
+        hasher.update(format!("blob {}\0", self.length).as_bytes());
+        self.read_back(|chunk| hasher.update(chunk))?;
+        Ok(hex::encode(hasher.finalize()).into_bytes())
+    }
+
+    fn write_to(&mut self, output: &mut impl io::Write) -> io::Result<()> {
+        let mut written = Ok(());
+        self.read_back(|chunk| {
+            if written.is_ok() {
+                written = write_packet(output, chunk);
+            }
+        })?;
+        written
+    }
+
+    fn read_back(&mut self, mut visit: impl FnMut(&[u8])) -> io::Result<()> {
+        let Some(file) = &mut self.spill else {
+            for chunk in self.memory.chunks(PACKET) {
+                visit(chunk);
+            }
+            return Ok(());
+        };
+        file.seek(SeekFrom::Start(0))?;
+        let mut buffer = [0; PACKET];
+        loop {
+            let size = file.read(&mut buffer)?;
+            if size == 0 {
+                return Ok(());
+            }
+            visit(&buffer[..size]);
+        }
+    }
+}
+
 /// Private Git v2 process-filter entry point used by the shade executable.
 /// Content is withheld until the complete request has passed policy.
 pub fn run_git_filter(
@@ -208,7 +430,6 @@ pub fn run_git_filter(
     input: impl Read,
     mut output: impl io::Write,
 ) -> io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
     let mut input = io::BufReader::new(input);
     let hello = read_list(&mut input)?.ok_or_else(protocol_error)?;
     if hello != [b"git-filter-client\n".to_vec(), b"version=2\n".to_vec()] {
@@ -232,6 +453,7 @@ pub fn run_git_filter(
         write_packet(&mut output, b"capability=smudge\n")?;
     }
     flush_packet(&mut output)?;
+    let mut recorded = RecordedBlobs::default();
     while let Some(headers) = read_list(&mut input)? {
         let clean = headers.iter().any(|line| line == b"command=clean\n");
         if !clean && !headers.iter().any(|line| line == b"command=smudge\n") {
@@ -246,14 +468,20 @@ pub fn run_git_filter(
         // returns bytes the object database already holds, so refusing them
         // keeps nothing out of Git and would leave a repository that already
         // carries a credential impossible to check out at all.
-        let mut blocked = clean
+        let private_name = clean
             && path
                 .rsplit(|byte| *byte == b'/')
                 .next()
                 .is_some_and(is_private_env_name);
         let mut scanner = SecretScanner::default();
-        let mut memory = Vec::new();
-        let mut spill = None::<std::fs::File>;
+        let mut retained = Retained::new(spool_root);
+        // Set once the scanner matches: the object Git records for this path,
+        // if it records one. A private name is never rescued by it.
+        let mut identical_to = None;
+        let mut judged = false;
+        if private_name {
+            retained.forget();
+        }
         loop {
             let Some(packet) = read_packet(&mut input)? else {
                 return Err(protocol_error());
@@ -261,46 +489,38 @@ pub fn run_git_filter(
             let Some(bytes) = packet else {
                 break;
             };
-            if clean {
+            if clean && !judged {
                 scanner.feed(&bytes);
-                blocked |= scanner.detected();
-            }
-            if !blocked {
-                if spill.is_none() && memory.len() + bytes.len() > 1024 * 1024 {
-                    let mut file = tempfile::tempfile_in(spool_root)?;
-                    file.write_all(&memory)?;
-                    memory.clear();
-                    spill = Some(file);
-                }
-                if let Some(file) = &mut spill {
-                    file.write_all(&bytes)?;
-                } else {
-                    memory.extend_from_slice(&bytes);
+                if scanner.detected() {
+                    judged = true;
+                    if !private_name {
+                        identical_to = recorded.blob(path);
+                    }
+                    if identical_to.is_none() {
+                        // Nothing this request can still turn out to be.
+                        retained.forget();
+                    }
                 }
             }
+            retained.push(&bytes)?;
         }
-        if blocked {
+        let admitted = match identical_to {
+            // Detected content Git already holds under this path: the same
+            // bytes, arriving back through the same path, are not an arrival.
+            Some(object) => match recorded.format() {
+                Some(format) => retained.blob_id(format)? == object,
+                None => false,
+            },
+            None => !judged && !private_name,
+        };
+        if !admitted {
             write_packet(&mut output, b"status=error\n")?;
             flush_packet(&mut output)?;
             continue;
         }
         write_packet(&mut output, b"status=success\n")?;
         flush_packet(&mut output)?;
-        if let Some(mut file) = spill {
-            file.seek(SeekFrom::Start(0))?;
-            let mut buffer = [0; 65516];
-            loop {
-                let size = file.read(&mut buffer)?;
-                if size == 0 {
-                    break;
-                }
-                write_packet(&mut output, &buffer[..size])?;
-            }
-        } else {
-            for chunk in memory.chunks(65516) {
-                write_packet(&mut output, chunk)?;
-            }
-        }
+        retained.write_to(&mut output)?;
         flush_packet(&mut output)?;
         flush_packet(&mut output)?;
     }
@@ -469,6 +689,70 @@ mod tests {
         ] {
             assert!(!contains_secret(bytes));
         }
+    }
+
+    /// The identity comparison is only worth anything if it agrees with Git
+    /// byte for byte, in both object formats and across the spill boundary.
+    #[test]
+    fn computes_the_object_ids_git_computes() {
+        let directory = tempfile::tempdir().unwrap();
+        for (format, content, expected) in [
+            (
+                ObjectFormat::Sha1,
+                b"shade\n".to_vec(),
+                "52c5fb22a209591d8753431443dd97c09f2170db",
+            ),
+            (
+                ObjectFormat::Sha256,
+                b"shade\n".to_vec(),
+                "acd798c5fd4e7b9de9f7cee2d4a8724f77294f3137358fb9869979fbcb12a310",
+            ),
+            (
+                ObjectFormat::Sha1,
+                vec![b'x'; 2_000_000],
+                "33d3ac990a0bfff103ca216f232e6fb87ea5e85a",
+            ),
+        ] {
+            let mut retained = Retained::new(directory.path());
+            for chunk in content.chunks(PACKET) {
+                retained.push(chunk).unwrap();
+            }
+            assert_eq!(
+                retained.blob_id(format).unwrap(),
+                expected.as_bytes(),
+                "object ID for {} bytes",
+                content.len()
+            );
+            // Reading the bytes back to hash them must not consume them: the
+            // same request is still owed to Git.
+            let mut returned = Vec::new();
+            retained
+                .read_back(|chunk| returned.extend_from_slice(chunk))
+                .unwrap();
+            assert_eq!(returned, content);
+        }
+    }
+
+    #[test]
+    fn reads_the_object_git_records_for_a_path() {
+        let listing = b"100644 aaaa 0\tsrc/main.rs\x00100644 bbbb 2\tconflicted.rs\x00100644 cccc 0\ta path/with space.txt\x00";
+        let entries = records(listing)
+            .filter_map(split_record)
+            .filter_map(|(fields, path)| {
+                let [_mode, object, b"0"] = fields[..] else {
+                    return None;
+                };
+                Some((path.to_vec(), object.to_vec()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                (b"src/main.rs".to_vec(), b"aaaa".to_vec()),
+                (b"a path/with space.txt".to_vec(), b"cccc".to_vec()),
+            ],
+            "unmerged stages record no single blob and are skipped"
+        );
     }
 
     #[test]
