@@ -943,19 +943,6 @@ export class FakeShadeDaemon {
   }
 
   /**
-   * A reattach keeps the workspace and its cwd and hands back a fresh lease,
-   * exactly as the engine's `reattach_session` transaction does.
-   */
-  /**
-   * Take a lease for a session that is not suspended.
-   *
-   * Reattaching an Active session is idempotent in the daemon: the caller gets
-   * back the lease it already holds, with a full TTL, at the same fence. Only a
-   * session whose lease has actually lapsed is issued a new one. Minting a new
-   * lease every time made the harness assert the opposite of what a real host
-   * observes -- and hid the case where a host caches the lease it was handed.
-   */
-  /**
    * Refuse a workspace with work of its own still in flight.
    *
    * A pending resolution or an unadopted handoff means a second owner is still
@@ -981,6 +968,16 @@ export class FakeShadeDaemon {
     }
   }
 
+  /**
+   * Take a lease for a session that is not suspended, keeping its workspace
+   * and its cwd exactly as the engine's `reattach_session` transaction does.
+   *
+   * Reattaching an Active session is idempotent in the daemon: the caller gets
+   * back the lease it already holds, with a full TTL, at the same fence. Only a
+   * session whose lease has actually lapsed is issued a new one. Minting a new
+   * lease every time made the harness assert the opposite of what a real host
+   * observes -- and hid the case where a host caches the lease it was handed.
+   */
   private renewLease(session: FakeSession): OpenedSessionPayload {
     const live = session.expires_at_ms >= Date.now();
     const lease = live
@@ -1030,12 +1027,20 @@ export class FakeShadeDaemon {
       session: session.opened.session,
       lifecycle,
       workspace: session.opened.workspace,
-      ...(live
-        ? {
+      // The lease row, not its deadline, is what decides whether the daemon
+      // reports one: `active_lease_for_session` returns any lease that has not
+      // been released, and an expired-but-unswept lease is still such a row.
+      // The deadline in `lease_expires_at_ms` is what says it is over, and a
+      // host that reads dormancy from the absence of the key rather than from
+      // `lifecycle` needs to meet that here rather than against a real daemon.
+      // Sleep and release both release the lease, so those two answer with no
+      // lease at all.
+      ...(session.released || session.suspended
+        ? {}
+        : {
             lease: session.opened.lease,
             lease_expires_at_ms: session.expires_at_ms,
-          }
-        : {}),
+          }),
       ...(materialized ? { cwd: session.opened.cwd } : {}),
       materialized,
     };

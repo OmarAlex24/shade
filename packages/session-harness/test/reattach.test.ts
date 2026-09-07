@@ -37,7 +37,11 @@ test("session_reattach renews the lease of a dormant session over the wire", asy
   daemon.expire("session-dormant");
   const dormant = await sessionQuery(daemon.socket, "session-dormant");
   expect(dormant.lifecycle).toBe("dormant");
-  expect(dormant.lease).toBeUndefined();
+  // The lease row survives the deadline that killed it: the daemon reports
+  // any lease it has not released, and `lifecycle` is what says the session
+  // is dormant.
+  expect(dormant.lease).toBe(opened.outcome.result.lease);
+  expect(dormant.lease_expires_at_ms).toBeLessThan(Date.now());
   expect(dormant.materialized).toBe(true);
 
   const reattached = await request(daemon.socket, {

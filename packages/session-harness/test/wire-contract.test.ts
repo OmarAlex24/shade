@@ -82,6 +82,69 @@ describe("Rust v1 wire contract", () => {
     expect("context" in record.outcome.result).toBe(false);
   });
 
+  test("reports an expired lease row the daemon has not swept yet", async () => {
+    daemon = new FakeShadeDaemon(1_000);
+    await daemon.start();
+
+    const opened = await request(daemon.socket, {
+      type: "execute",
+      v: PROTOCOL_VERSION,
+      request_id: "req-open-dormant",
+      idempotency_key: "open:wire-dormant",
+      actor: { kind: "host", id: "wire-contract" },
+      intent: {
+        kind: "session_open",
+        session_id: "session-dormant",
+        repository: { kind: "local", path: "/repo" },
+      },
+    });
+    daemon.expire("session-dormant");
+
+    const status = await request(daemon.socket, {
+      type: "query",
+      v: PROTOCOL_VERSION,
+      request_id: "req-session-dormant",
+      query: { kind: "session", session_id: "session-dormant" },
+    });
+
+    expect(status.outcome.state).toBe("completed");
+    // The daemon reports any lease row it has not released, expired or not:
+    // dormancy is a deadline in the past, not a missing key. A host that read
+    // the absence of `lease` as dormancy would have agreed with the harness
+    // and disagreed with the daemon.
+    expect(status.outcome.result.lifecycle).toBe("dormant");
+    expect(status.outcome.result.lease).toBe(opened.outcome.result.lease);
+    expect(status.outcome.result.lease_expires_at_ms).toBeLessThan(Date.now());
+    expect(status.outcome.result.materialized).toBe(true);
+
+    const slept = await request(daemon.socket, {
+      type: "execute",
+      v: PROTOCOL_VERSION,
+      request_id: "req-sleep-dormant",
+      idempotency_key: "sleep:wire-dormant",
+      actor: { kind: "host", id: "wire-contract" },
+      intent: {
+        kind: "workspace_sleep",
+        selector: {
+          workspace_id: opened.outcome.result.workspace,
+          cwd: opened.outcome.result.cwd,
+        },
+      },
+    });
+    expect(slept.outcome.state).toBe("completed");
+
+    const suspended = await request(daemon.socket, {
+      type: "query",
+      v: PROTOCOL_VERSION,
+      request_id: "req-session-suspended",
+      query: { kind: "session", session_id: "session-dormant" },
+    });
+    // Sleep releases the lease, so there is no row left to report.
+    expect(suspended.outcome.result.lifecycle).toBe("suspended");
+    expect("lease" in suspended.outcome.result).toBe(false);
+    expect("lease_expires_at_ms" in suspended.outcome.result).toBe(false);
+  });
+
   test("carries workspace_sleep and session_wake as bare wire intents", async () => {
     daemon = new FakeShadeDaemon(1_000);
     await daemon.start();
