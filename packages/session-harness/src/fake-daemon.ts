@@ -877,11 +877,14 @@ export class FakeShadeDaemon {
    */
   private renewLease(session: FakeSession): OpenedSessionPayload {
     const lease = this.next("lease", ++this.lease_sequence);
+    // The daemon omits `lifecycle` when it is `active`, so a reattached
+    // session drops the key instead of carrying the word.
+    const { lifecycle: _revived, ...context } = session.opened.compact_context;
     const opened: OpenedSessionPayload = {
       ...session.opened,
       lease,
       env: { ...session.opened.env, SHADE_LEASE: lease },
-      compact_context: { ...session.opened.compact_context, lifecycle: "active" },
+      compact_context: context,
     };
     session.opened = opened;
     session.expires_at_ms = Date.now() + this.lease_ttl_ms;
