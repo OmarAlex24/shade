@@ -818,7 +818,10 @@ async fn serve(socket_override: Option<PathBuf>, daemon_args: &DaemonArgs) -> an
     remove_stale_socket(&config.socket).await?;
     let (listener, socket_guard) = bind_private_socket(&config.socket)?;
     let startup_nonce = ulid::Ulid::new().to_string();
-    let _ = engine
+    // Reconciliation is best effort -- the daemon serves either way -- but a
+    // silent failure here is a daemon that starts with unreconciled state and
+    // no record of why, so it is reported rather than discarded.
+    let reconciled = engine
         .execute(shade_protocol::ExecuteRequest {
             v: PROTOCOL_VERSION,
             request_id: startup_nonce.clone(),
@@ -830,6 +833,13 @@ async fn serve(socket_override: Option<PathBuf>, daemon_args: &DaemonArgs) -> an
             intent: Intent::Reconcile,
         })
         .await;
+    if let shade_protocol::ResponseBody::Error { error } = &reconciled.body {
+        tracing::warn!(
+            code = %error.code,
+            diagnostics_id = error.diagnostics_id.as_deref().unwrap_or("none"),
+            "startup reconciliation failed"
+        );
+    }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut maintenance = tokio::time::interval_at(

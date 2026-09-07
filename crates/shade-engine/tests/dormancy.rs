@@ -805,6 +805,48 @@ async fn the_session_query_reports_an_expired_lease_row_it_has_not_swept_yet() {
     );
 }
 
+/// The normalization used to live only inside `Reconcile`, which the daemon
+/// sends at startup but an embedded host need not send at all. A host that
+/// opens the engine and collects would have handed a pre-dormancy `orphaned`
+/// workspace -- tree, checkpoints and all -- straight to the collector.
+#[tokio::test]
+async fn opening_the_database_normalizes_orphaned_rows_without_a_reconcile() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened) = dormant_session(directory.path()).await;
+    let tree = PathBuf::from(&opened.cwd);
+    drop(engine);
+
+    {
+        let connection = rusqlite::Connection::open(
+            EngineConfig::at(directory.path().join("state")).database_path(),
+        )
+        .unwrap();
+        connection
+            .execute("UPDATE sessions SET state='orphaned'", [])
+            .unwrap();
+        connection
+            .execute("UPDATE workspaces SET state='orphaned'", [])
+            .unwrap();
+    }
+
+    // No `Reconcile`: the very first thing this host does is collect.
+    let engine = engine_at(directory.path());
+    assert_eq!(session_state(&engine, &opened.session), "dormant");
+    assert_eq!(workspace_state(&engine, &opened), "dormant");
+    let collected = collect(&engine, "gc-without-reconcile").await;
+    assert_eq!(collected["eligible"], 0);
+    assert_eq!(collected["deleted"], 0);
+    assert!(tree.join("tracked.txt").is_file());
+
+    // And the reconcile pass is still harmless once there is nothing left.
+    let reconciled: serde_json::Value = completed(
+        engine
+            .execute(system("reconcile-after-open", Intent::Reconcile))
+            .await,
+    );
+    assert_eq!(reconciled["legacy_states_normalized"], 0);
+}
+
 #[tokio::test]
 async fn startup_normalizes_legacy_orphaned_rows_to_dormant() {
     let directory = tempfile::tempdir().unwrap();

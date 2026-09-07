@@ -210,6 +210,11 @@ impl Database {
                 expected: SCHEMA_VERSION,
             });
         }
+        // Before anything reads a state column. An embedded host that never
+        // sends `Reconcile` -- or sends `GarbageCollect` first -- would
+        // otherwise still see the rows an older binary wrote as `orphaned`,
+        // which is the one state the collector treats as collectible.
+        normalize_dormant_state_rows(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -2589,20 +2594,14 @@ impl Database {
     /// data change rather than DDL: `user_version` stays 1 and an older binary
     /// can still open the same database. It simply never collects a `dormant`
     /// row, which is the fail-safe direction.
+    /// Also run by `Database::open`, so this is the idempotent second pass a
+    /// `Reconcile` performs rather than the only chance the rows ever get.
     pub fn normalize_legacy_dormant_states(&self) -> Result<usize, DbError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let now = now_ms();
-        let sessions = transaction.execute(
-            "UPDATE sessions SET state='dormant', updated_at_ms=?1 WHERE state='orphaned'",
-            params![now],
-        )?;
-        let workspaces = transaction.execute(
-            "UPDATE workspaces SET state='dormant', updated_at_ms=?1 WHERE state='orphaned'",
-            params![now],
-        )?;
+        let changed = normalize_dormant_state_rows(&transaction)?;
         transaction.commit()?;
-        Ok(sessions + workspaces)
+        Ok(changed)
     }
 
     pub fn recover_interrupted_operations(
@@ -2836,6 +2835,23 @@ fn read_diagnostic(connection: &Connection, id: &str) -> Result<Option<Diagnosti
         .map(|record| serde_json::from_str(&record))
         .transpose()
         .map_err(Into::into)
+}
+
+/// Rewrite rows left by a binary that still wrote `orphaned`.
+///
+/// Runs inside the caller's transaction so `Database::open` can do it before
+/// the first read, and so a `Reconcile` can repeat it harmlessly.
+fn normalize_dormant_state_rows(transaction: &Transaction<'_>) -> Result<usize, DbError> {
+    let now = now_ms();
+    let sessions = transaction.execute(
+        "UPDATE sessions SET state='dormant', updated_at_ms=?1 WHERE state='orphaned'",
+        params![now],
+    )?;
+    let workspaces = transaction.execute(
+        "UPDATE workspaces SET state='dormant', updated_at_ms=?1 WHERE state='orphaned'",
+        params![now],
+    )?;
+    Ok(sessions + workspaces)
 }
 
 fn create_schema(connection: &Transaction<'_>) -> Result<(), rusqlite::Error> {
