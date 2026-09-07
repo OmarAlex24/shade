@@ -42,6 +42,15 @@ enum Command {
         #[command(flatten)]
         keepalive: KeepaliveArgs,
     },
+    /// Free a workspace's disk while keeping everything it contains.
+    Sleep(SelectorArgs),
+    /// Rebuild a suspended session's workspace and take a fresh lease.
+    Wake {
+        #[arg(long, env = "SHADE_SESSION")]
+        session: String,
+        #[command(flatten)]
+        keepalive: KeepaliveArgs,
+    },
     /// The lifecycle of one session, answerable without a live lease.
     Status {
         #[arg(long, env = "SHADE_SESSION")]
@@ -446,6 +455,40 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let response = client
                 .execute_wait_idempotent(
                     Intent::SessionReattach {
+                        session_id: SessionId(session),
+                    },
+                    idempotency_key,
+                )
+                .await?;
+            emit(&keepalive::annotate(
+                &config,
+                &socket,
+                &options.options(),
+                response,
+            ));
+        }
+        Command::Sleep(selector) => {
+            let response = client
+                .execute_wait_idempotent(
+                    Intent::WorkspaceSleep {
+                        selector: selector.selector()?,
+                    },
+                    idempotency_key,
+                )
+                .await?;
+            // A suspended session has no lease to keep alive, and the
+            // keepalive would exit on its own the next time it asked. Stopping
+            // it here makes `sleep` reclaim the process too, not just the disk.
+            keepalive::stop_for_sleep(&config, &response);
+            emit(&response);
+        }
+        Command::Wake {
+            session,
+            keepalive: options,
+        } => {
+            let response = client
+                .execute_wait_idempotent(
+                    Intent::SessionWake {
                         session_id: SessionId(session),
                     },
                     idempotency_key,
@@ -1242,9 +1285,10 @@ fn help_contract() -> serde_json::Value {
         "name": "shade",
         "version": env!("CARGO_PKG_VERSION"),
         "commands": [
-            "open", "attach", "status", "context", "heartbeat", "checkpoint", "fork",
-            "sync", "restore", "deps refresh", "publish", "resolve", "release", "events",
-            "warm", "review resolve", "doctor", "doctor --diagnostics <id>", "gc", "install"
+            "open", "attach", "sleep", "wake", "status", "context", "heartbeat",
+            "checkpoint", "fork", "sync", "restore", "deps refresh", "publish", "resolve",
+            "release", "events", "warm", "review resolve", "doctor",
+            "doctor --diagnostics <id>", "gc", "install"
         ]
     })
 }
@@ -1736,6 +1780,17 @@ mod tests {
                 "--no-keepalive",
             ],
             vec!["shade", "attach", "--session", "chat-1"],
+            vec!["shade", "sleep", "--workspace", "ws-1"],
+            vec!["shade", "wake", "--session", "chat-1"],
+            vec![
+                "shade",
+                "wake",
+                "--session",
+                "chat-1",
+                "--owner-pid",
+                "4242",
+                "--no-keepalive",
+            ],
             vec!["shade", "status", "--session", "chat-1"],
             vec!["shade", "context", "--workspace", "ws-1"],
             vec![
@@ -1791,7 +1846,7 @@ mod tests {
             .iter()
             .map(|value| value.as_str().unwrap())
             .collect::<Vec<_>>();
-        for verb in ["open", "attach", "status", "release"] {
+        for verb in ["open", "attach", "sleep", "wake", "status", "release"] {
             assert!(commands.contains(&verb), "{verb} belongs to the contract");
         }
         assert!(

@@ -161,13 +161,24 @@ pub fn annotate(
 /// Stop the keepalive belonging to a completed `release` outcome. A
 /// `review_required` release has not released anything, so it keeps its lease.
 pub fn stop_for_release(config: &EngineConfig, response: &WireResponse) {
+    stop_for_completed(config, response, "released");
+}
+
+/// Stop the keepalive belonging to a completed `sleep`. The child would exit
+/// by itself the next time it asked after the session, but leaving it running
+/// would make `sleep` reclaim only the disk and not the process.
+pub fn stop_for_sleep(config: &EngineConfig, response: &WireResponse) {
+    stop_for_completed(config, response, "suspended");
+}
+
+fn stop_for_completed(config: &EngineConfig, response: &WireResponse, flag: &str) {
     let ResponseBody::Ok {
         outcome: Outcome::Completed(ref value),
     } = response.body
     else {
         return;
     };
-    if value.get("released").and_then(Value::as_bool) != Some(true) {
+    if value.get(flag).and_then(Value::as_bool) != Some(true) {
         return;
     }
     if let Some(session) = value.get("session").and_then(Value::as_str) {
