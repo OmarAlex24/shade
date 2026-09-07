@@ -1822,6 +1822,85 @@ fn reattach_behind_the_sweeps_back(root: &Path, opened: &OpenedSession) {
     }
 }
 
+/// The sweep is one operation and `bind_operation_resource` sets a column, so
+/// every candidate overwrote the last: the journal showed a single operation
+/// phasing through unrelated workspaces, the quiescence guard that reads
+/// `operations.resource_id` protected only whichever one was touched last, and
+/// a failure on the third candidate would have been recorded against the whole
+/// sweep. Each automatic sleep is its own durable operation now.
+#[tokio::test]
+async fn every_automatic_sleep_is_its_own_operation() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = Engine::with_components(
+        EngineConfig::at(directory.path().join("state"))
+            .with_harness_lifecycle_timing(1, 0)
+            .unwrap()
+            .with_auto_sleep_after_secs(3600)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap();
+    let mut opened = Vec::new();
+    for session in ["sweep-first", "sweep-second"] {
+        opened.push(completed::<OpenedSession>(
+            engine
+                .execute(execute(session, open_request(&repository, session, None)))
+                .await,
+        ));
+    }
+    engine
+        .database()
+        .mark_expired_leases(shade_engine::db::now_ms() + 10_000)
+        .unwrap();
+    for workspace in &opened {
+        backdate(directory.path(), &workspace.workspace, 7_200_000);
+    }
+
+    let swept: serde_json::Value = completed(
+        engine
+            .execute(system("sweep-auto-sleep", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["auto_slept"], 2);
+
+    let connection = rusqlite::Connection::open(
+        EngineConfig::at(directory.path().join("state")).database_path(),
+    )
+    .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT resource_id, state FROM operations              WHERE intent_kind='workspace_sleep' ORDER BY created_at_ms",
+        )
+        .unwrap();
+    let sleeps: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        sleeps,
+        vec![
+            (opened[0].workspace.0.clone(), "completed".to_owned()),
+            (opened[1].workspace.0.clone(), "completed".to_owned()),
+        ],
+        "one operation per candidate, each naming the workspace it slept"
+    );
+
+    let sweep_resource: Option<String> = connection
+        .query_row(
+            "SELECT resource_id FROM operations WHERE intent_kind='maintenance_sweep'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sweep_resource, None,
+        "and the sweep itself names no workspace, because it slept none of them itself"
+    );
+}
+
 /// The idle sweep named no workspace: it took a list of dormant records and
 /// then worked through it, one full sleep at a time. A caller that reattached
 /// while that list was being drained would have had its tree deleted and its

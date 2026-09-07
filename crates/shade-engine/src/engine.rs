@@ -919,7 +919,7 @@ impl Engine {
                 self.reconcile_suspending_workspaces(&mut suspensions)
                     .await?;
                 // Both sweeps are no-ops unless an operator configured them.
-                let auto_slept = self.auto_sleep_dormant(operation).await?;
+                let auto_slept = self.auto_sleep_dormant().await?;
                 let retention_released = self.expire_suspended_retention().await?;
                 Ok(Outcome::Completed(json!({
                     // `expired_sessions` is load-bearing for existing hosts;
@@ -2797,7 +2797,7 @@ impl Engine {
     /// Off unless an operator sets `SHADE_AUTO_SLEEP_DAYS`. Candidates go
     /// through `sleep_workspace`, so every gate a manual sleep keeps applies
     /// here too, and one workspace refusing to sleep never stops the sweep.
-    async fn auto_sleep_dormant(&self, operation: &OperationId) -> Result<u64, EngineError> {
+    async fn auto_sleep_dormant(&self) -> Result<u64, EngineError> {
         let Some(after_secs) = self.config.auto_sleep_after_secs else {
             return Ok(0);
         };
@@ -2811,13 +2811,44 @@ impl Engine {
                 workspace_id: Some(workspace.id.clone()),
                 cwd: None,
             };
-            match self.sleep_workspace(selector, operation, true).await {
-                Ok(_) => slept += 1,
-                Err(error) => tracing::warn!(
-                    workspace = %workspace.id,
-                    code = %error.code,
-                    "automatic sleep skipped this workspace"
-                ),
+            // One operation per candidate. `bind_operation_resource` sets a
+            // column, so passing the sweep's own operation down meant the
+            // sweep named whichever workspace it had touched last: the
+            // quiescence guard that reads `operations.resource_id` protected
+            // only that one, the journal recorded a single operation phasing
+            // through unrelated workspaces, and a failure on the third
+            // candidate would have been attributed to the whole sweep. Each
+            // sleep is its own durable record now, and the sweep counts them.
+            let key = format!("auto-sleep:{}:{}", workspace.id.0, ulid::Ulid::new());
+            let request_hash = hex::encode(Sha256::digest(key.as_bytes()));
+            let BeginOperation::New(candidate) = self.database.begin_operation(
+                &operation_principal(&Actor {
+                    kind: ActorKind::System,
+                    id: "auto-sleep".into(),
+                }),
+                &key,
+                &request_hash,
+                "workspace_sleep",
+            )?
+            else {
+                continue;
+            };
+            match self.sleep_workspace(selector, &candidate, true).await {
+                Ok(outcome) => {
+                    self.database.finish_operation(&candidate, &outcome)?;
+                    slept += 1;
+                }
+                Err(error) => {
+                    let _ = self
+                        .database
+                        .fail_operation(&candidate, &error.as_wire(), None);
+                    tracing::warn!(
+                        workspace = %workspace.id,
+                        operation = %candidate,
+                        code = %error.code,
+                        "automatic sleep skipped this workspace"
+                    );
+                }
             }
         }
         Ok(slept)
