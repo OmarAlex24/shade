@@ -631,7 +631,7 @@ pub(crate) fn discover_secret_paths(root: &Path) -> Result<Vec<String>, SecretEr
 }
 
 fn is_secret_path(path: &Path) -> bool {
-    crate::secret_policy::dotenv_path(path)
+    crate::secret_policy::private_env_path(path)
 }
 
 fn relative(root: &Path, path: &Path) -> Result<String, SecretError> {

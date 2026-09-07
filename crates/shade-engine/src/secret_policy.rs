@@ -3,6 +3,7 @@
 use regex::bytes::{Regex, RegexSet};
 use std::fs::OpenOptions;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -10,10 +11,56 @@ use std::sync::OnceLock;
 const WINDOW: usize = 8192;
 const OVERLAP: usize = 1024;
 
-pub(crate) fn dotenv_path(path: &Path) -> bool {
+/// Final dot-suffixes that mark a `.env`-style basename as committed template
+/// content. `.env.example` and its siblings hold placeholders and are tracked
+/// on purpose in most repositories, so treating them as private files rejected
+/// Shade from ordinary projects.
+pub(crate) const ENV_TEMPLATE_SUFFIXES: [&str; 5] =
+    ["example", "sample", "template", "dist", "defaults"];
+
+/// Glob patterns matching exactly the basenames `is_private_env_name` calls
+/// templates, for the pathspec and gitattributes machinery that has to restate
+/// the exception rather than call the predicate.
+pub(crate) const ENV_TEMPLATE_PATTERNS: [&str; 5] = [
+    ".env*.example",
+    ".env*.sample",
+    ".env*.template",
+    ".env*.dist",
+    ".env*.defaults",
+];
+
+/// Whether a basename names a private environment file, which may never enter
+/// a Git object.
+///
+/// The name has to begin with `.env` byte for byte. `.ENV` is therefore an
+/// ordinary name here and only the content scanner speaks for it, which is
+/// what keeps this predicate in step with the case-sensitive `.env*` globs
+/// built from it: a name this returns `true` for must also be one those globs
+/// catch, or a checkpoint could stage a file the predicate called private.
+/// `.envrc` and `.environment` stay private, as they have always been.
+///
+/// The exception is a final suffix from [`ENV_TEMPLATE_SUFFIXES`], so
+/// `.env.example` and `.env.local.example` are ordinary tracked content while
+/// `.env`, `.env.local`, `.env.development.local` and `.env.example.local`
+/// remain private.
+pub(crate) fn is_private_env_name(name: &[u8]) -> bool {
+    if !name.starts_with(b".env") {
+        return false;
+    }
+    // The leading dot is not a suffix separator: `.env` and `.envrc` have no
+    // suffix of their own and are private.
+    let suffix = match name.iter().rposition(|byte| *byte == b'.') {
+        Some(dot) if dot > 0 => &name[dot + 1..],
+        _ => return true,
+    };
+    !ENV_TEMPLATE_SUFFIXES
+        .iter()
+        .any(|template| suffix == template.as_bytes())
+}
+
+pub(crate) fn private_env_path(path: &Path) -> bool {
     path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(".env"))
+        .is_some_and(|name| is_private_env_name(name.as_bytes()))
 }
 
 fn signatures() -> &'static RegexSet {
@@ -200,7 +247,7 @@ pub fn run_git_filter(
         let mut blocked = path
             .rsplit(|byte| *byte == b'/')
             .next()
-            .is_some_and(|name| name.starts_with(b".env"));
+            .is_some_and(is_private_env_name);
         let mut scanner = SecretScanner::default();
         let mut memory = Vec::new();
         let mut spill = None::<std::fs::File>;

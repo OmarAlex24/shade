@@ -625,6 +625,23 @@ impl GitStore {
             attributes.extend_from_slice(b"* filter=shade-content\n");
         }
         attributes.extend_from_slice(b".env* filter=shade-secret\n**/.env* filter=shade-secret\n");
+        // A glob cannot say "every `.env*` except the templates", so the
+        // exception is restated as later, higher-precedence lines. They hand
+        // `.env.example` to the content filter rather than to nothing: a
+        // template that actually carries a credential is still refused, only
+        // the blanket refusal by name is lifted.
+        let template_filter: &[u8] = if self.content_filter.is_some() {
+            b" filter=shade-content\n"
+        } else {
+            b" !filter\n"
+        };
+        for pattern in crate::secret_policy::ENV_TEMPLATE_PATTERNS {
+            for prefix in ["", "**/"] {
+                attributes.extend_from_slice(prefix.as_bytes());
+                attributes.extend_from_slice(pattern.as_bytes());
+                attributes.extend_from_slice(template_filter);
+            }
+        }
         let path = repository.git_dir.join("info/attributes");
         fs::write(&path, attributes)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -1031,7 +1048,7 @@ fn validate_entry_path(entry: &TreeEntry) -> anyhow::Result<()> {
         "UNSUPPORTED_SUBMODULE: .gitmodules is present"
     );
     ensure!(
-        !basename.starts_with(b".env"),
+        !crate::secret_policy::is_private_env_name(basename),
         "TRACKED_SECRET_FILE: {}",
         entry.path.display()
     );
@@ -1892,6 +1909,7 @@ impl GitStore {
             .run_raw(Some(worktree), &args, &environment, None)
             .await?;
         self.require_success(&output)?;
+        self.stage_env_templates(worktree, &environment).await?;
         let working_tree = self
             .write_worktree_index(repository, worktree, &environment)
             .await?;
@@ -1902,6 +1920,63 @@ impl GitStore {
             index_tree,
             working_tree,
         })
+    }
+
+    /// Stage the `.env`-named files that are ordinary content after all --
+    /// `.env.example` and its siblings -- in a second pass.
+    ///
+    /// An exclusion pathspec has no negation, so the blanket `.env*` exclusion
+    /// above cannot re-admit them and the templates have to be named. Listing
+    /// them with `--exclude-standard` is what keeps this safe: a gitignored
+    /// candidate never appears, so `git add` is never handed an ignored
+    /// literal path, and `-A` still records a template the agent deleted.
+    async fn stage_env_templates(
+        &self,
+        worktree: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> anyhow::Result<()> {
+        let list_args = vec![
+            OsString::from("ls-files"),
+            OsString::from("--cached"),
+            OsString::from("--others"),
+            OsString::from("--exclude-standard"),
+            OsString::from("-z"),
+        ];
+        let output = self
+            .run_raw(Some(worktree), &list_args, environment, None)
+            .await?;
+        self.require_success(&output)?;
+        let mut templates = BTreeSet::new();
+        for raw_path in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let basename = raw_path
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or_default();
+            if !basename.starts_with(b".env") || crate::secret_policy::is_private_env_name(basename)
+            {
+                continue;
+            }
+            templates.insert(OsString::from_vec(
+                [b":(literal)".as_slice(), raw_path].concat(),
+            ));
+        }
+        if templates.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            OsString::from("add"),
+            OsString::from("-A"),
+            OsString::from("--"),
+        ];
+        args.extend(templates);
+        let output = self
+            .run_raw(Some(worktree), &args, environment, None)
+            .await?;
+        self.require_success(&output)
     }
 
     pub async fn load_checkpoint(
@@ -2351,7 +2426,7 @@ impl GitStore {
             let path = bytes_to_path(path);
             let basename = path.file_name().unwrap_or_default().as_bytes();
             ensure!(
-                !basename.starts_with(b".env"),
+                !crate::secret_policy::is_private_env_name(basename),
                 "TRACKED_SECRET_FILE: {}",
                 path.display()
             );
@@ -2401,7 +2476,7 @@ impl GitStore {
         {
             let relative = bytes_to_path(raw_path);
             let basename = relative.file_name().unwrap_or_default().as_bytes();
-            if basename.starts_with(b".env") && !tracked.contains(raw_path) {
+            if crate::secret_policy::is_private_env_name(basename) && !tracked.contains(raw_path) {
                 continue;
             }
             if is_dependency_output_path(&relative) {
