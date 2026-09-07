@@ -933,6 +933,14 @@ impl Database {
     /// Suspended session has no live lease to surrender — the sweep released it
     /// — so the lease predicate is dropped for those states rather than turning
     /// an explicit release into `LEASE_FENCED`.
+    ///
+    /// The lease itself decides which of those two a session is, exactly as
+    /// `Engine::workspace_lifecycle` does. Reading it off `sessions.state`
+    /// instead made the window between a lease expiring and the next sweep --
+    /// bounded by 30 s in the daemon and unbounded for an embedded host that
+    /// never sweeps -- a window in which the session row still said `active`,
+    /// no live lease existed, and an ordinary `release` came back
+    /// `LEASE_FENCED`.
     fn release_session_in_state(
         &self,
         session_id: &SessionId,
@@ -942,15 +950,30 @@ impl Database {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
-        let session_state: String = transaction
+        transaction
             .query_row(
                 "SELECT state FROM sessions WHERE id=?1 AND workspace_id=?2",
                 params![session_id.0, expected_workspace.0],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
             .ok_or(DbError::LeaseFenced)?;
-        let live_lease_required = session_state == "active";
+        // A lease naming another workspace is the fence: the caller is holding
+        // a handle its own session already rotated away from.
+        let current_lease = transaction
+            .query_row(
+                "SELECT workspace_id, expires_at_ms FROM leases WHERE session_id=?1 \
+                 AND released_at_ms IS NULL ORDER BY fence DESC LIMIT 1",
+                params![session_id.0],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if let Some((workspace, _)) = &current_lease
+            && workspace != &expected_workspace.0
+        {
+            return Err(DbError::LeaseFenced);
+        }
+        let live_lease_required = current_lease.is_some_and(|(_, expires)| expires >= now);
         let released = transaction.execute(
             "UPDATE leases SET released_at_ms=?3 \
              WHERE session_id=?1 AND workspace_id=?2 AND released_at_ms IS NULL \
@@ -3343,6 +3366,145 @@ mod tests {
             database.begin_operation(&actor.id, "same", "other", "session_open"),
             Err(DbError::IdempotencyConflict)
         ));
+    }
+
+    /// One repository, one workspace and one active session on a database at
+    /// `path`, ready for a second connection to race against.
+    fn session_fixture(path: &Path, workspace_path: &Path) -> (Database, SessionRecord) {
+        let database = Database::open(path).unwrap();
+        let repository = database
+            .upsert_repository("local:race", &workspace_path.join("bare"), Some("main"))
+            .unwrap();
+        let workspace = WorkspaceRecord {
+            id: WorkspaceId("ws_race".into()),
+            repository_id: repository.id.clone(),
+            session_id: None,
+            path: workspace_path.join("workspace"),
+            base_ref: "origin/main".into(),
+            base_oid: ObjectId("opaque-object-id".into()),
+            head_oid: ObjectId("opaque-object-id".into()),
+            state: "ready".into(),
+            predecessor_id: None,
+            dependency_state: "ready".into(),
+        };
+        database.create_workspace(&workspace).unwrap();
+        let session = SessionRecord {
+            id: SessionId("session-race".into()),
+            repository_id: repository.id,
+            workspace_id: workspace.id,
+            intent: None,
+            state: "active".into(),
+        };
+        database.create_session_and_lease(&session, 120).unwrap();
+        (database, session)
+    }
+
+    fn unreleased_leases(path: &Path, session: &SessionId) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM leases WHERE session_id=?1 AND released_at_ms IS NULL",
+                params![session.0],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `live_lease_per_session` is a partial unique index, so two racing
+    /// reattaches cannot both insert. Whichever loses must observe the winner's
+    /// lease rather than a violated index or a second live lease.
+    #[test]
+    fn two_concurrent_reattaches_leave_exactly_one_live_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let (database, session) = session_fixture(&path, directory.path());
+        database.mark_expired_leases(now_ms() + 200_000).unwrap();
+        assert_eq!(unreleased_leases(&path, &session.id), 0);
+
+        let outcomes = std::thread::scope(|scope| {
+            let handles = ["lease-a", "lease-b"].map(|lease| {
+                let path = path.clone();
+                let session = session.clone();
+                scope.spawn(move || {
+                    Database::open(&path).unwrap().reattach_session(
+                        &session.id,
+                        &session.workspace_id,
+                        &LeaseId(lease.into()),
+                        120,
+                    )
+                })
+            });
+            handles.map(|handle| handle.join().unwrap())
+        });
+
+        assert!(
+            outcomes.iter().any(Result::is_ok),
+            "at least one reattach must win"
+        );
+        assert_eq!(unreleased_leases(&path, &session.id), 1);
+        assert_eq!(
+            database.session(&session.id).unwrap().unwrap().state,
+            "active"
+        );
+        let live = database
+            .active_lease_for_session(&session.id)
+            .unwrap()
+            .unwrap();
+        for outcome in outcomes.iter().flatten() {
+            assert_eq!(
+                outcome.id, live.id,
+                "a successful reattach returns the one live lease"
+            );
+        }
+    }
+
+    /// A reattach and a release naming the same session are both legitimate.
+    /// Whichever commits second must see the first: a released session never
+    /// keeps a live lease, and a reattached one is never half-released.
+    #[test]
+    fn a_reattach_racing_a_release_never_leaves_a_live_lease_on_a_released_session() {
+        for lease in ["lease-race-1", "lease-race-2"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.sqlite");
+            let (database, session) = session_fixture(&path, directory.path());
+            database.mark_expired_leases(now_ms() + 200_000).unwrap();
+
+            let (reattached, released) = std::thread::scope(|scope| {
+                let reattach = {
+                    let path = path.clone();
+                    let session = session.clone();
+                    scope.spawn(move || {
+                        Database::open(&path).unwrap().reattach_session(
+                            &session.id,
+                            &session.workspace_id,
+                            &LeaseId(lease.into()),
+                            120,
+                        )
+                    })
+                };
+                let release = {
+                    let path = path.clone();
+                    let session = session.clone();
+                    scope.spawn(move || {
+                        Database::open(&path)
+                            .unwrap()
+                            .release_session(&session.id, &session.workspace_id)
+                    })
+                };
+                (reattach.join().unwrap(), release.join().unwrap())
+            });
+
+            let state = database.session(&session.id).unwrap().unwrap().state;
+            let live = unreleased_leases(&path, &session.id);
+            if released.is_ok() {
+                assert_eq!(state, "released");
+                assert_eq!(live, 0, "a released session surrenders every lease");
+            } else {
+                assert!(reattached.is_ok(), "one of the two has to win");
+                assert_eq!(state, "active");
+                assert_eq!(live, 1);
+            }
+        }
     }
 
     #[test]

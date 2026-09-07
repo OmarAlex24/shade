@@ -454,6 +454,124 @@ async fn release_works_on_a_dormant_workspace_and_only_then_is_it_gc_eligible() 
     assert_eq!(again.code, "WORKSPACE_NOT_FOUND");
 }
 
+/// Expire the lease the way real time does, without running the sweep that
+/// rewrites the session and workspace rows.
+///
+/// This is the window every embedded host lives in: `MaintenanceSweep` is at
+/// most 30 s away in the daemon and never arrives at all for a host that only
+/// issues explicit intents, so `release` has to behave here exactly as it does
+/// afterwards.
+fn expire_lease_without_sweeping(root: &Path, session: &SessionId) {
+    let connection =
+        rusqlite::Connection::open(EngineConfig::at(root.join("state")).database_path()).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE leases SET expires_at_ms=?2 WHERE session_id=?1 AND released_at_ms IS NULL",
+            rusqlite::params![session.0, shade_engine::db::now_ms() - 1],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "exactly one live lease to expire");
+}
+
+#[tokio::test]
+async fn an_unswept_expired_lease_behaves_exactly_like_a_swept_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    expire_lease_without_sweeping(directory.path(), &opened.session);
+
+    // The row still says `active`; only the deadline has passed.
+    assert_eq!(session_state(&engine, &opened.session), "active");
+    assert_eq!(workspace_state(&engine, &opened), "ready");
+
+    let context: CompactContext = completed(
+        engine
+            .query(query(Query::Context {
+                selector: selector(&opened),
+            }))
+            .await,
+    );
+    assert_eq!(context.lifecycle, "dormant");
+
+    // A mutation is refused the same way it is after the sweep: recoverable,
+    // and naming the command that recovers it.
+    let refused = failed(
+        engine
+            .execute(execute(
+                "checkpoint-unswept",
+                Intent::WorkspaceCheckpoint {
+                    selector: selector(&opened),
+                    reason: "unswept".into(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(refused.code, "LEASE_EXPIRED");
+    assert!(
+        refused.next.unwrap().contains("shade attach"),
+        "dormancy names the command that recovers it"
+    );
+
+    // And release still works. Deriving the lease requirement from the session
+    // row instead of the lease made this return LEASE_FENCED.
+    let released: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "release-unswept",
+                Intent::WorkspaceRelease {
+                    selector: selector(&opened),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(released["released"], true);
+    assert_eq!(session_state(&engine, &opened.session), "released");
+    assert_eq!(workspace_state(&engine, &opened), "released");
+    assert!(
+        engine
+            .database()
+            .active_lease_for_session(&opened.session)
+            .unwrap()
+            .is_none_or(|lease| lease.released_at_ms.is_some()),
+        "the release surrenders the expired lease row too"
+    );
+
+    let collected = collect(&engine, "gc-unswept-release").await;
+    assert_eq!(collected["deleted"], 1);
+}
+
+#[tokio::test]
+async fn an_unswept_dormant_session_can_still_be_reattached() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    expire_lease_without_sweeping(directory.path(), &opened.session);
+
+    let resumed: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "attach-unswept",
+                Intent::SessionReattach {
+                    session_id: opened.session.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_ne!(resumed.lease, opened.lease, "a fresh lease at a new fence");
+    assert_eq!(resumed.workspace, opened.workspace);
+    assert_eq!(session_state(&engine, &opened.session), "active");
+}
+
 #[tokio::test]
 async fn context_reports_lifecycle_dormant_and_active() {
     let directory = tempfile::tempdir().unwrap();
