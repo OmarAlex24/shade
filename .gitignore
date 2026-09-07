@@ -3,6 +3,7 @@
 /dist/
 __pycache__/
 /.shade/
+/.claude/worktrees/
 *.db
 *.db-shm
 *.db-wal

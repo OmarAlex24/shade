@@ -1,8 +1,8 @@
 use crate::config::EngineConfig;
 use crate::db::{
-    BeginOperation, CheckpointRecord, Database, DbError, OperationRecord, PublishIntentRecord,
-    PublishResolutionRecord, RepositoryRecord, ReviewRecord, SessionRecord, WorkspaceRecord,
-    now_ms,
+    BeginOperation, CheckpointRecord, Database, DbError, LeaseRecord, OperationRecord,
+    PublishIntentRecord, PublishResolutionRecord, RepositoryRecord, ReviewRecord, SessionRecord,
+    WorkspaceRecord, now_ms,
 };
 use crate::dependencies::{
     DependencyContext as ReadinessContext, DependencyError, DependencyService,
@@ -20,7 +20,8 @@ use shade_protocol::{
     DependencyContext as ProtocolDependencyContext, EventEnvelope, ExecuteRequest, HandoffId,
     Intent, LeaseId, ObjectId, OpenSession, OpenedSession, OperationId, Outcome, PROTOCOL_VERSION,
     Query, QueryRequest, RepositoryId, RepositoryLocator, ResponseBody, ReviewAction, ReviewId,
-    ReviewRequired, SessionId, ShadeError, WireResponse, WorkspaceId, WorkspaceSelector,
+    ReviewRequired, SessionId, SessionStatus, ShadeError, WireResponse, WorkspaceId,
+    WorkspaceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
@@ -83,6 +84,23 @@ fn simple_branch(value: &str) -> Option<String> {
         return None;
     }
     Some(value.strip_prefix("origin/").unwrap_or(value).to_owned())
+}
+
+/// Does a `--base` argument name the base a workspace was already cut from?
+///
+/// `open` normalizes `main` to `origin/main` before storing it, so a literal
+/// comparison would reject the most common reattach there is.
+fn base_matches(requested: &str, stored: &str) -> bool {
+    if requested == stored {
+        return true;
+    }
+    if let Some(commit) = stored.strip_prefix("oid:") {
+        return commit.eq_ignore_ascii_case(requested);
+    }
+    match (simple_branch(requested), simple_branch(stored)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn saturating_u32(value: usize) -> u32 {
@@ -337,6 +355,29 @@ pub struct Engine {
 /// Sweep threshold for the keyed-lock map. Below it the common path stays
 /// O(1); at or above it a lookup also drops entries nobody holds any more.
 const KEYED_LOCK_SWEEP_THRESHOLD: usize = 256;
+
+/// What a workspace is allowed to do right now, derived from the columns that
+/// already exist. Mutations still demand `Lifecycle::Active`; the operations
+/// that survive a lease expiry (`release`, `context`) branch on this instead.
+#[derive(Debug)]
+enum Lifecycle {
+    Active { lease: LeaseRecord },
+    Dormant,
+    Suspended,
+    Released,
+}
+
+impl Lifecycle {
+    /// `active | dormant | suspended | released`, as reported on the wire.
+    fn label(&self) -> &'static str {
+        match self {
+            Lifecycle::Active { .. } => "active",
+            Lifecycle::Dormant => "dormant",
+            Lifecycle::Suspended => "suspended",
+            Lifecycle::Released => "released",
+        }
+    }
+}
 
 #[derive(Default)]
 struct LifecycleLocks {
@@ -642,6 +683,9 @@ impl Engine {
         let actor_principal = operation_principal(actor);
         match intent {
             Intent::SessionOpen(request) => self.open_session(request, operation).await,
+            Intent::SessionReattach { session_id } => {
+                self.reattach_session(session_id, None, operation).await
+            }
             Intent::RepositoryWarm { repository } => self.warm(repository, operation).await,
             Intent::LeaseHeartbeat {
                 session_id,
@@ -747,6 +791,11 @@ impl Engine {
                     .await
             }
             Intent::Reconcile => {
+                // Rows written by a pre-dormancy binary still say `orphaned`,
+                // which the collector treats as collectible. Normalizing before
+                // anything else runs is what stops the first sweep after an
+                // upgrade from deleting them.
+                let normalized = self.database.normalize_legacy_dormant_states()?;
                 let expired = self.database.mark_expired_leases(now_ms())?;
                 crate::faults::hit(crate::faults::Point::ReconcileLeasesExpired);
                 let publish_recovery = self.reconcile_publish_operations(operation).await?;
@@ -756,7 +805,10 @@ impl Engine {
                 let staging = self.cleanup_staging()?;
                 crate::faults::hit(crate::faults::Point::ReconcileCompleted);
                 Ok(Outcome::Completed(json!({
-                    "expired_sessions": expired,
+                    "expired_sessions": expired.sessions,
+                    "dormant_sessions": expired.sessions,
+                    "dormant_workspaces": expired.workspaces,
+                    "legacy_states_normalized": normalized,
                     "interrupted_operations": interrupted,
                     "publishes_completed": publish_recovery.publishes_completed,
                     "publishes_pending": publish_recovery.publishes_pending,
@@ -772,8 +824,14 @@ impl Engine {
                 })))
             }
             Intent::MaintenanceSweep => {
-                let expired = self.database.mark_expired_leases(now_ms())?;
-                Ok(Outcome::Completed(json!({"expired_sessions": expired})))
+                let sweep = self.database.mark_expired_leases(now_ms())?;
+                Ok(Outcome::Completed(json!({
+                    // `expired_sessions` is load-bearing for existing hosts;
+                    // the dormancy counters are additive.
+                    "expired_sessions": sweep.sessions,
+                    "dormant_sessions": sweep.sessions,
+                    "dormant_workspaces": sweep.workspaces,
+                })))
             }
             Intent::GarbageCollect => self.garbage_collect(operation).await,
         }
@@ -833,6 +891,41 @@ impl Engine {
             } => Ok(Outcome::Completed(json!({
                 "events": self.events(after_cursor, limit)?,
             }))),
+            Query::Session { session_id } => {
+                // Answerable without a live lease: this is what a caller that
+                // just lost one uses to find out whether its work survived.
+                let session = self
+                    .database
+                    .session(&session_id)?
+                    .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+                let workspace = self
+                    .database
+                    .workspace(&session.workspace_id)?
+                    .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
+                let lease = self.database.active_lease_for_session(&session_id)?;
+                let live = lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.expires_at_ms >= now_ms());
+                let lifecycle = match session.state.as_str() {
+                    "active" if live => "active",
+                    "active" | "dormant" | "orphaned" => "dormant",
+                    "suspended" => "suspended",
+                    _ => "released",
+                };
+                let materialized = workspace.path.join(".git").is_file();
+                Ok(Outcome::Completed(
+                    serde_json::to_value(SessionStatus {
+                        session: session_id,
+                        lifecycle: lifecycle.to_owned(),
+                        workspace: workspace.id.clone(),
+                        lease: lease.as_ref().map(|lease| lease.id.clone()),
+                        lease_expires_at_ms: lease.as_ref().map(|lease| lease.expires_at_ms),
+                        cwd: materialized.then(|| workspace.path.to_string_lossy().into_owned()),
+                        materialized,
+                    })
+                    .map_err(EngineError::internal)?,
+                ))
+            }
             Query::Doctor => {
                 let mut health = self.database.doctor()?;
                 if let Value::Object(ref mut object) = health {
@@ -1438,12 +1531,16 @@ impl Engine {
             .clone()
             .ok_or_else(|| EngineError::domain("WORKSPACE_SESSION_UNAVAILABLE", "safe"))?;
         let lease = self.database.active_lease_for_session(&session)?;
+        // `lease` keeps its historical `live | expired | released` domain for
+        // callers that already branch on it; `lifecycle` is the new, coarser
+        // truth that says whether the work is still there.
         let lease_state = match lease {
             Some(lease) if lease.expires_at_ms >= now_ms() => "live",
             Some(_) => "expired",
             None => "released",
         };
-        self.compact_context_for(workspace, session, lease_state)
+        let lifecycle = self.workspace_lifecycle(workspace)?;
+        self.compact_context_for(workspace, session, lease_state, lifecycle.label())
             .await
     }
 
@@ -1452,6 +1549,7 @@ impl Engine {
         workspace: &WorkspaceRecord,
         session: SessionId,
         lease_state: &str,
+        lifecycle: &str,
     ) -> Result<CompactContext, EngineError> {
         // `context` is observational: one porcelain-v2 invocation returns
         // both the counters and detached HEAD. Content retention boundaries
@@ -1494,6 +1592,7 @@ impl Engine {
                 untracked: saturating_u32(status.untracked),
             },
             lease: lease_state.to_owned(),
+            lifecycle: lifecycle.to_owned(),
             dependencies: ProtocolDependencyContext {
                 state: workspace.dependency_state.clone(),
                 providers,
@@ -1532,7 +1631,7 @@ impl Engine {
             self.config.socket.to_string_lossy().into_owned(),
         );
         let compact_context = self
-            .compact_context_for(&ready_workspace, session_id.clone(), "live")
+            .compact_context_for(&ready_workspace, session_id.clone(), "live", "active")
             .await?;
         Ok(OpenedSession {
             session: session_id,
@@ -1541,6 +1640,9 @@ impl Engine {
             cwd,
             env,
             compact_context,
+            // The daemon has no keepalive of its own to report; the CLI fills
+            // this in for the process it actually spawned.
+            keepalive: None,
         })
     }
 
@@ -1550,25 +1652,19 @@ impl Engine {
         operation: &OperationId,
     ) -> Result<Outcome, EngineError> {
         if let Some(existing) = self.database.session(&request.session_id)? {
-            if existing.state == "active" {
-                let workspace = self
-                    .database
-                    .workspace(&existing.workspace_id)?
-                    .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
-                let lease = self
-                    .database
-                    .active_lease_for_session(&request.session_id)?
-                    .ok_or_else(|| EngineError::domain("LEASE_EXPIRED", "never"))?;
-                return Ok(Outcome::Completed(
-                    serde_json::to_value(
-                        self.opened_session(request.session_id, &workspace, lease)
-                            .await?,
-                    )
-                    .map_err(EngineError::internal)?,
-                ));
-            }
-            return Err(EngineError::domain("SESSION_ALREADY_RELEASED", "never")
-                .next("open with a new stable session id"));
+            // `open` is the single door: an id the host already used resumes
+            // the work behind it rather than failing, so a host that lost its
+            // lease never has to know that dormancy exists.
+            return match existing.state.as_str() {
+                "active" | "dormant" | "orphaned" => {
+                    self.reattach_session(request.session_id, request.base.as_deref(), operation)
+                        .await
+                }
+                "suspended" => Err(EngineError::domain("SESSION_SUSPENDED", "never")
+                    .next("shade wake --session <id>")),
+                _ => Err(EngineError::domain("SESSION_ALREADY_RELEASED", "never")
+                    .next("open with a new stable session id")),
+            };
         }
 
         let freshness_requested_at = Instant::now();
@@ -1628,6 +1724,78 @@ impl Engine {
                 Err(error)
             }
         }
+    }
+
+    /// Resume a session on the workspace it already owns.
+    ///
+    /// Reattach is deliberately not a materialization path: the tree, the
+    /// dependency layer and the secret baseline all survived the lease expiry,
+    /// so the whole state change is the one SQLite transaction in
+    /// `Database::reattach_session` and a crash on either side of it leaves a
+    /// consistent Dormant or Active session.
+    async fn reattach_session(
+        &self,
+        session_id: SessionId,
+        base: Option<&str>,
+        operation: &OperationId,
+    ) -> Result<Outcome, EngineError> {
+        let session = self
+            .database
+            .session(&session_id)?
+            .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+        let workspace = self
+            .database
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
+        let _lifecycle = self
+            .keyed_lock(format!("lifecycle:{}", workspace.id.0))
+            .await;
+        // Re-read under the lock: a concurrent release or reattach may have
+        // moved the session between the dispatch above and this point.
+        let session = self
+            .database
+            .session(&session_id)?
+            .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+        match session.state.as_str() {
+            "active" | "dormant" | "orphaned" => {}
+            "suspended" => {
+                return Err(EngineError::domain("SESSION_SUSPENDED", "never")
+                    .next("shade wake --session <id>"));
+            }
+            _ => {
+                return Err(EngineError::domain("SESSION_ALREADY_RELEASED", "never")
+                    .next("open with a new stable session id"));
+            }
+        }
+        // A resumed session keeps the base it was cut from. Silently ignoring
+        // a different `--base` would hand the caller a workspace that is not
+        // what they asked for.
+        if let Some(requested) = base
+            && !base_matches(requested, &workspace.base_ref)
+        {
+            return Err(
+                EngineError::domain("SESSION_BASE_MISMATCH", "never").next(format!(
+                    "shade fork --session <new-id> (this session is on {})",
+                    workspace.base_ref
+                )),
+            );
+        }
+        if !workspace.path.join(".git").is_file() {
+            return Err(EngineError::domain("WORKSPACE_NOT_MATERIALIZED", "never")
+                .next("shade release and open a new session"));
+        }
+        self.database
+            .bind_operation_resource(operation, &workspace.id.0, "reattach")?;
+        let lease = self.database.reattach_session(
+            &session_id,
+            &workspace.id,
+            &LeaseId(format!("lease_{}", ulid::Ulid::new())),
+            self.config.lease_ttl_secs,
+        )?;
+        Ok(Outcome::Completed(
+            serde_json::to_value(self.opened_session(session_id, &workspace, lease).await?)
+                .map_err(EngineError::internal)?,
+        ))
     }
 
     async fn warm(
@@ -1802,20 +1970,59 @@ impl Engine {
         }
     }
 
-    fn require_live_lease(&self, workspace: &WorkspaceRecord) -> Result<(), EngineError> {
+    /// Classify a workspace without demanding exclusivity. A lease that names
+    /// another workspace is still a fence — the caller is holding a stale
+    /// handle, which is a different failure from simply having gone idle.
+    fn workspace_lifecycle(&self, workspace: &WorkspaceRecord) -> Result<Lifecycle, EngineError> {
+        if matches!(workspace.state.as_str(), "released" | "retained" | "failed") {
+            return Ok(Lifecycle::Released);
+        }
+        if workspace.state == "suspended" {
+            return Ok(Lifecycle::Suspended);
+        }
         let session_id = workspace
             .session_id
             .as_ref()
             .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_LEASED", "never"))?;
-        let lease = self
-            .database
-            .active_lease_for_session(session_id)?
-            .ok_or_else(|| EngineError::domain("LEASE_EXPIRED", "never"))?;
-        if lease.workspace_id != workspace.id || lease.expires_at_ms < now_ms() {
+        let Some(lease) = self.database.active_lease_for_session(session_id)? else {
+            return Ok(Lifecycle::Dormant);
+        };
+        if lease.workspace_id != workspace.id {
             return Err(EngineError::domain("LEASE_FENCED", "never")
                 .next("use the current successor workspace"));
         }
-        Ok(())
+        if lease.expires_at_ms < now_ms() {
+            // The sweep has not run yet; the session is already dormant in
+            // every sense that matters to a caller.
+            return Ok(Lifecycle::Dormant);
+        }
+        Ok(Lifecycle::Active { lease })
+    }
+
+    /// The gate every mutation keeps. Dormancy is recoverable, so it names the
+    /// command that recovers it instead of reading as data loss.
+    fn require_live_lease(&self, workspace: &WorkspaceRecord) -> Result<LeaseRecord, EngineError> {
+        match self.workspace_lifecycle(workspace)? {
+            Lifecycle::Active { lease } => Ok(lease),
+            Lifecycle::Dormant => {
+                let session = workspace
+                    .session_id
+                    .as_ref()
+                    .map(|session| session.0.as_str())
+                    .unwrap_or("<id>");
+                Err(EngineError::domain("LEASE_EXPIRED", "never")
+                    .next(format!("shade attach --session {session}")))
+            }
+            Lifecycle::Suspended => {
+                Err(EngineError::domain("SESSION_SUSPENDED", "never")
+                    .next("shade wake --session <id>"))
+            }
+            // A released workspace has no lease either; keep the code every
+            // SDK already treats as terminal rather than minting a new one.
+            Lifecycle::Released => {
+                Err(EngineError::domain("LEASE_EXPIRED", "never").next("open a new session"))
+            }
+        }
     }
 
     async fn sync_workspace(
@@ -2657,7 +2864,20 @@ impl Engine {
         let _lifecycle = self
             .keyed_lock(format!("lifecycle:{}", workspace.id.0))
             .await;
-        self.require_live_lease(&workspace)?;
+        // Release is the one command that must keep working after a lease
+        // expires: it is the only door to deletion, so requiring an unexpired
+        // lease would make idle work permanently unreleasable.
+        match self.workspace_lifecycle(&workspace)? {
+            Lifecycle::Active { .. } | Lifecycle::Dormant => {}
+            Lifecycle::Suspended => {
+                return Err(EngineError::domain("SESSION_SUSPENDED", "never")
+                    .next("shade wake --session <id>"));
+            }
+            Lifecycle::Released => {
+                return Err(EngineError::domain("WORKSPACE_ALREADY_RELEASED", "never")
+                    .next("open a new session"));
+            }
+        }
         let status = self
             .git
             .status(&workspace.path)
@@ -3865,6 +4085,7 @@ fn intent_kind(intent: &Intent) -> &'static str {
         Intent::ReviewResolve { .. } => "review_resolve",
         Intent::SuccessorAdopt { .. } => "successor_adopt",
         Intent::GarbageCollect => "garbage_collect",
+        Intent::SessionReattach { .. } => "session_reattach",
         Intent::MaintenanceSweep => "maintenance_sweep",
         Intent::Reconcile => "reconcile",
     }

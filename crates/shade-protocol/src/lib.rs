@@ -164,6 +164,10 @@ pub enum Intent {
     SuccessorAdopt {
         handoff_id: HandoffId,
     },
+    /// Resume a dormant session on its existing workspace with a fresh lease.
+    SessionReattach {
+        session_id: SessionId,
+    },
     GarbageCollect,
     MaintenanceSweep,
     Reconcile,
@@ -197,6 +201,10 @@ pub enum Query {
     Events {
         after_cursor: i64,
         limit: u32,
+    },
+    /// The lifecycle of one session, answerable without a live lease.
+    Session {
+        session_id: SessionId,
     },
     Doctor,
     Diagnostics {
@@ -268,6 +276,21 @@ pub struct DependencyContext {
     pub blocked_builds: Vec<String>,
 }
 
+fn lifecycle_active() -> String {
+    "active".into()
+}
+
+/// The common case is elided on the wire.
+///
+/// `context` is the response an agent reads most often and it lives inside a
+/// 512-byte budget with two bytes to spare; spending twenty-one of them
+/// repeating `active` on every healthy workspace would buy nothing. An absent
+/// `lifecycle` deserializes back to `active`, so a v1 reader and a v1 writer
+/// still agree, and the field appears exactly when it carries news.
+fn lifecycle_is_active(value: &String) -> bool {
+    value == "active"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactContext {
     pub workspace: WorkspaceId,
@@ -278,8 +301,49 @@ pub struct CompactContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_sha: Option<ObjectId>,
     pub changes: CompactChanges,
+    /// `live | expired | released`, kept for compatibility with v1 callers.
     pub lease: String,
+    /// `active | dormant | suspended | released`; absent means `active`.
+    #[serde(
+        default = "lifecycle_active",
+        skip_serializing_if = "lifecycle_is_active"
+    )]
+    pub lifecycle: String,
     pub dependencies: DependencyContext,
+}
+
+/// The lifecycle of one session, independent of any live lease. Answering this
+/// is how a keepalive decides between renewing, reattaching and exiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatus {
+    pub session: SessionId,
+    /// `active | dormant | suspended | released`.
+    pub lifecycle: String,
+    pub workspace: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<LeaseId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_ms: Option<i64>,
+    /// Absent when the workspace holds no materialized tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub materialized: bool,
+}
+
+/// Reported by the CLI only. The daemon and the SDKs never populate it: SDK
+/// hosts heartbeat in-process and are opted out by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeepaliveStatus {
+    /// `started | skipped | failed | stopped`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +354,8 @@ pub struct OpenedSession {
     pub cwd: String,
     pub env: BTreeMap<String, String>,
     pub compact_context: CompactContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<KeepaliveStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,4 +439,83 @@ pub struct EventEnvelope {
     pub resource: String,
     pub payload: Value,
     pub created_at_ms: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(lifecycle: &str) -> CompactContext {
+        CompactContext {
+            workspace: WorkspaceId("ws_1".into()),
+            session: SessionId("session-1".into()),
+            base_ref: "origin/main".into(),
+            base_sha: ObjectId("abc".into()),
+            head_sha: ObjectId("def".into()),
+            remote_sha: None,
+            changes: CompactChanges {
+                staged: 0,
+                unstaged: 0,
+                untracked: 0,
+            },
+            lease: "live".into(),
+            lifecycle: lifecycle.into(),
+            dependencies: DependencyContext {
+                state: "ready".into(),
+                providers: Vec::new(),
+                blocked_builds: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn an_active_lifecycle_is_elided_and_restored_but_any_other_is_carried() {
+        let active = serde_json::to_string(&context("active")).unwrap();
+        assert!(
+            !active.contains("lifecycle"),
+            "the common case must not spend wire budget: {active}"
+        );
+        let decoded: CompactContext = serde_json::from_str(&active).unwrap();
+        assert_eq!(decoded.lifecycle, "active");
+
+        for lifecycle in ["dormant", "suspended", "released"] {
+            let encoded = serde_json::to_string(&context(lifecycle)).unwrap();
+            assert!(encoded.contains(&format!("\"lifecycle\":\"{lifecycle}\"")));
+            let decoded: CompactContext = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.lifecycle, lifecycle);
+        }
+    }
+
+    #[test]
+    fn a_v1_context_without_a_lifecycle_field_reads_as_active() {
+        let legacy = serde_json::json!({
+            "workspace": "ws_1",
+            "session": "session-1",
+            "base_ref": "origin/main",
+            "base_sha": "abc",
+            "head_sha": "def",
+            "changes": {"staged": 0, "unstaged": 0, "untracked": 0},
+            "lease": "live",
+            "dependencies": {"state": "ready"},
+        });
+        let decoded: CompactContext = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.lifecycle, "active");
+    }
+
+    #[test]
+    fn a_session_status_always_states_its_lifecycle() {
+        let status = SessionStatus {
+            session: SessionId("session-1".into()),
+            lifecycle: "dormant".into(),
+            workspace: WorkspaceId("ws_1".into()),
+            lease: None,
+            lease_expires_at_ms: None,
+            cwd: Some("/tmp/ws".into()),
+            materialized: true,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["lifecycle"], "dormant");
+        assert_eq!(encoded.get("lease"), None);
+        assert_eq!(encoded["materialized"], true);
+    }
 }

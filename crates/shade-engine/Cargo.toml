@@ -37,5 +37,9 @@ walkdir.workspace = true
 # Self-dependency so the crate's own integration tests (compiled as external
 # crates) see the `test-support` fakes without a command-line `--features`.
 shade-engine = { path = ".", features = ["test-support"] }
+# Integration tests reach the database file directly to plant the rows an
+# older binary would have written; the engine deliberately exposes no writer
+# for a state it never produces.
+rusqlite.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

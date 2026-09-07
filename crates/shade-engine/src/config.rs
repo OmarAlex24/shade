@@ -78,6 +78,13 @@ impl EngineConfig {
         self.root.join("runtime")
     }
 
+    /// Where the CLI keeps one private pidfile per keepalive. The daemon
+    /// never reads this directory; it exists so a keepalive can be found and
+    /// stopped by a later CLI invocation.
+    pub fn keepalive_dir(&self) -> PathBuf {
+        self.runtime_dir().join("keepalive")
+    }
+
     pub fn secrets_dir(&self) -> PathBuf {
         self.root.join("secrets")
     }

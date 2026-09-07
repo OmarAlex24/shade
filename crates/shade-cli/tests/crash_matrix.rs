@@ -269,7 +269,7 @@ impl Fixture {
         assert_eq!(
             count(
                 &db,
-                "SELECT count(*) FROM workspaces WHERE state NOT IN ('ready','released','orphaned','handoff_pending','resolution','retained')"
+                "SELECT count(*) FROM workspaces WHERE state NOT IN ('ready','released','dormant','handoff_pending','resolution','retained')"
             ),
             0
         );
@@ -735,14 +735,11 @@ fn assert_reconciliation_cut(fixture: &Fixture, point: Point) {
     match point {
         Point::ReconcileLeasesExpired => {
             assert_eq!(
-                count(&db, "SELECT count(*) FROM sessions WHERE state='orphaned'"),
+                count(&db, "SELECT count(*) FROM sessions WHERE state='dormant'"),
                 1
             );
             assert_eq!(
-                count(
-                    &db,
-                    "SELECT count(*) FROM workspaces WHERE state='orphaned'"
-                ),
+                count(&db, "SELECT count(*) FROM workspaces WHERE state='dormant'"),
                 1
             );
             assert_eq!(

@@ -155,6 +155,14 @@ pub struct PublishIntentRecord {
     pub anchor_cleaned: bool,
 }
 
+/// What one maintenance sweep moved to dormant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpirySweep {
+    pub sessions: usize,
+    pub workspaces: usize,
+    pub handoffs_cancelled: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffRecord {
     pub id: HandoffId,
@@ -720,6 +728,114 @@ impl Database {
         Ok(lease)
     }
 
+    /// Resume a dormant session on its existing workspace under a fresh lease.
+    ///
+    /// One `IMMEDIATE` transaction frees the expired lease row, mints the
+    /// successor fence and returns both the session and the workspace to their
+    /// live states, so a crash on either side leaves a consistent Dormant or
+    /// Active session and no fault point is needed.
+    pub fn reattach_session(
+        &self,
+        session_id: &SessionId,
+        expected_workspace: &WorkspaceId,
+        lease_id: &LeaseId,
+        ttl_secs: i64,
+    ) -> Result<LeaseRecord, DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM handoffs WHERE session_id=?1 AND state='pending')",
+            params![session_id.0],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(DbError::LeaseFenced);
+        }
+        // Release the expired row first: `live_lease_per_session` is a partial
+        // unique index over unreleased leases, so the successor cannot be
+        // inserted while the dead one still occupies it.
+        transaction.execute(
+            "UPDATE leases SET released_at_ms=?2 WHERE session_id=?1 \
+             AND released_at_ms IS NULL AND expires_at_ms<?2",
+            params![session_id.0, now],
+        )?;
+        let live = transaction
+            .query_row(
+                "SELECT id, session_id, workspace_id, fence, heartbeat_at_ms, expires_at_ms, \
+                 released_at_ms FROM leases WHERE session_id=?1 AND released_at_ms IS NULL \
+                 ORDER BY fence DESC LIMIT 1",
+                params![session_id.0],
+                lease_from_row,
+            )
+            .optional()?;
+        // Reattaching an Active session is idempotent: the caller receives the
+        // lease it already holds rather than a second one.
+        if let Some(lease) = live {
+            if lease.workspace_id != *expected_workspace {
+                return Err(DbError::LeaseFenced);
+            }
+            transaction.commit()?;
+            return Ok(lease);
+        }
+        let session = transaction.execute(
+            "UPDATE sessions SET state='active', updated_at_ms=?3 \
+             WHERE id=?1 AND workspace_id=?2 AND state IN ('active','dormant')",
+            params![session_id.0, expected_workspace.0, now],
+        )?;
+        if session != 1 {
+            return Err(DbError::LeaseFenced);
+        }
+        let workspace = transaction.execute(
+            "UPDATE workspaces SET state='ready', session_id=?2, updated_at_ms=?3 \
+             WHERE id=?1 AND state IN ('ready','dormant')",
+            params![expected_workspace.0, session_id.0, now],
+        )?;
+        if workspace != 1 {
+            return Err(DbError::LeaseFenced);
+        }
+        let fence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(fence), 0) + 1 FROM leases WHERE session_id=?1",
+            params![session_id.0],
+            |row| row.get(0),
+        )?;
+        let lease = LeaseRecord {
+            id: lease_id.clone(),
+            session_id: session_id.clone(),
+            workspace_id: expected_workspace.clone(),
+            fence,
+            heartbeat_at_ms: now,
+            expires_at_ms: now + ttl_secs * 1000,
+            released_at_ms: None,
+        };
+        transaction.execute(
+            "INSERT INTO leases \
+             (id, session_id, workspace_id, fence, heartbeat_at_ms, expires_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                lease.id.0,
+                lease.session_id.0,
+                lease.workspace_id.0,
+                lease.fence,
+                lease.heartbeat_at_ms,
+                lease.expires_at_ms,
+            ],
+        )?;
+        append_event(
+            &transaction,
+            "session.reattached",
+            &session_id.0,
+            &json!({"session": session_id, "workspace": expected_workspace, "lease": lease.id}),
+        )?;
+        append_event(
+            &transaction,
+            "lease.acquired",
+            &lease.id.0,
+            &json!({"lease": lease.id, "workspace": lease.workspace_id}),
+        )?;
+        transaction.commit()?;
+        Ok(lease)
+    }
+
     pub fn session(&self, id: &SessionId) -> Result<Option<SessionRecord>, DbError> {
         let connection = self.connection()?;
         connection
@@ -810,6 +926,13 @@ impl Database {
         self.release_session_in_state(session_id, expected_workspace, "released")
     }
 
+    /// Release a session from any of its non-terminal lifecycle states.
+    ///
+    /// An Active session must still surrender a live lease, which is what
+    /// fences a caller whose lease already rotated to a successor. A Dormant or
+    /// Suspended session has no live lease to surrender — the sweep released it
+    /// — so the lease predicate is dropped for those states rather than turning
+    /// an explicit release into `LEASE_FENCED`.
     fn release_session_in_state(
         &self,
         session_id: &SessionId,
@@ -817,23 +940,37 @@ impl Database {
         workspace_state: &str,
     ) -> Result<(), DbError> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
+        let session_state: String = transaction
+            .query_row(
+                "SELECT state FROM sessions WHERE id=?1 AND workspace_id=?2",
+                params![session_id.0, expected_workspace.0],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DbError::LeaseFenced)?;
+        let live_lease_required = session_state == "active";
         let released = transaction.execute(
             "UPDATE leases SET released_at_ms=?3 \
              WHERE session_id=?1 AND workspace_id=?2 AND released_at_ms IS NULL \
-               AND expires_at_ms>=?3 AND NOT EXISTS (SELECT 1 FROM handoffs h \
+               AND (?4=0 OR expires_at_ms>=?3) AND NOT EXISTS (SELECT 1 FROM handoffs h \
                  WHERE h.session_id=?1 AND h.predecessor_workspace_id=?2 AND h.state='pending')",
-            params![session_id.0, expected_workspace.0, now],
+            params![
+                session_id.0,
+                expected_workspace.0,
+                now,
+                i64::from(live_lease_required)
+            ],
         )?;
         let session = transaction.execute(
             "UPDATE sessions SET state='released', updated_at_ms=?3 \
-             WHERE id=?1 AND workspace_id=?2 AND state='active' \
+             WHERE id=?1 AND workspace_id=?2 AND state IN ('active','dormant','suspended') \
                AND NOT EXISTS (SELECT 1 FROM handoffs h WHERE h.session_id=?1 \
                  AND h.predecessor_workspace_id=?2 AND h.state='pending')",
             params![session_id.0, expected_workspace.0, now],
         )?;
-        if released != 1 || session != 1 {
+        if (live_lease_required && released != 1) || session != 1 {
             return Err(DbError::LeaseFenced);
         }
         crate::faults::hit(crate::faults::Point::ReleaseLeaseReleased);
@@ -2032,7 +2169,14 @@ impl Database {
         Ok(changed == 1)
     }
 
-    pub fn mark_expired_leases(&self, now: i64) -> Result<usize, DbError> {
+    /// Expire every lease whose deadline has passed and move its session and
+    /// workspace to `dormant`.
+    ///
+    /// Dormant is not a collectible state: the tree, its checkpoints and its
+    /// secrets all survive, and only an explicit `release` ever makes them
+    /// eligible for GC. An expiry is a loss of exclusivity, never a loss of
+    /// work.
+    pub fn mark_expired_leases(&self, now: i64) -> Result<ExpirySweep, DbError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let mut statement = transaction.prepare(
@@ -2046,14 +2190,30 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
+        let mut statement = transaction.prepare(
+            "SELECT id FROM sessions WHERE state='active' AND id IN \
+             (SELECT session_id FROM leases WHERE released_at_ms IS NULL AND expires_at_ms<?1)",
+        )?;
+        let dormant_sessions = statement
+            .query_map(params![now], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut statement = transaction.prepare(
+            "SELECT id FROM workspaces WHERE state='ready' AND session_id IN \
+             (SELECT session_id FROM leases WHERE released_at_ms IS NULL AND expires_at_ms<?1)",
+        )?;
+        let dormant_workspaces = statement
+            .query_map(params![now], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
         let changed = transaction.execute(
-            "UPDATE sessions SET state='orphaned', updated_at_ms=?1 \
+            "UPDATE sessions SET state='dormant', updated_at_ms=?1 \
              WHERE state='active' AND id IN (SELECT session_id FROM leases \
                WHERE released_at_ms IS NULL AND expires_at_ms<?1)",
             params![now],
         )?;
         transaction.execute(
-            "UPDATE workspaces SET state='orphaned', updated_at_ms=?1 \
+            "UPDATE workspaces SET state='dormant', updated_at_ms=?1 \
              WHERE state='ready' AND session_id IN (SELECT session_id FROM leases \
                WHERE released_at_ms IS NULL AND expires_at_ms<?1)",
             params![now],
@@ -2062,6 +2222,23 @@ impl Database {
             "UPDATE leases SET released_at_ms=?1 WHERE released_at_ms IS NULL AND expires_at_ms<?1",
             params![now],
         )?;
+        for session in &dormant_sessions {
+            append_event(
+                &transaction,
+                "session.dormant",
+                session,
+                &json!({"session": session}),
+            )?;
+        }
+        for workspace in &dormant_workspaces {
+            append_event(
+                &transaction,
+                "workspace.dormant",
+                workspace,
+                &json!({"workspace": workspace}),
+            )?;
+        }
+        let handoffs_cancelled = expired_handoffs.len();
         for (handoff_id, successor_id) in expired_handoffs {
             transaction.execute(
                 "UPDATE handoffs SET state='cancelled', cancelled_at_ms=?2 \
@@ -2081,7 +2258,33 @@ impl Database {
             )?;
         }
         transaction.commit()?;
-        Ok(changed)
+        Ok(ExpirySweep {
+            sessions: changed,
+            workspaces: dormant_workspaces.len(),
+            handoffs_cancelled,
+        })
+    }
+
+    /// Rewrite rows left by a binary that still wrote `orphaned`.
+    ///
+    /// The state columns carry no CHECK constraint, so renaming the value is a
+    /// data change rather than DDL: `user_version` stays 1 and an older binary
+    /// can still open the same database. It simply never collects a `dormant`
+    /// row, which is the fail-safe direction.
+    pub fn normalize_legacy_dormant_states(&self) -> Result<usize, DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let now = now_ms();
+        let sessions = transaction.execute(
+            "UPDATE sessions SET state='dormant', updated_at_ms=?1 WHERE state='orphaned'",
+            params![now],
+        )?;
+        let workspaces = transaction.execute(
+            "UPDATE workspaces SET state='dormant', updated_at_ms=?1 WHERE state='orphaned'",
+            params![now],
+        )?;
+        transaction.commit()?;
+        Ok(sessions + workspaces)
     }
 
     pub fn recover_interrupted_operations(
@@ -2156,7 +2359,7 @@ impl Database {
             "UPDATE workspaces SET state='recovering', updated_at_ms=?3 \
              WHERE id=?1 AND state IN ('materializing','deleting','recovering') \
                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.workspace_id=?1 \
-                 AND s.state='active') \
+                 AND s.state IN ('active','dormant','suspended')) \
                AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.workspace_id=?1 \
                  AND l.released_at_ms IS NULL) \
                AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.workspace_id=?1 \
@@ -2257,11 +2460,40 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        let dormant_sessions: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE state='dormant'",
+            [],
+            |row| row.get(0),
+        )?;
+        let suspended_sessions: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE state='suspended'",
+            [],
+            |row| row.get(0),
+        )?;
+        let suspended_workspaces: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE state='suspended'",
+            [],
+            |row| row.get(0),
+        )?;
+        // A suspended workspace with no sleep checkpoint has lost its content
+        // pointer. Counting it makes a broken invariant visible instead of
+        // silent.
+        let suspended_without_checkpoint: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM workspaces w WHERE w.state='suspended' \
+             AND NOT EXISTS (SELECT 1 FROM checkpoints c WHERE c.workspace_id=w.id \
+               AND c.state='ready' AND c.reason='sleep')",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(json!({
             "state": integrity,
             "sessions": active_sessions,
             "workspaces": live_workspaces,
             "operations": running_operations,
+            "sessions_dormant": dormant_sessions,
+            "sessions_suspended": suspended_sessions,
+            "workspaces_suspended": suspended_workspaces,
+            "suspended_without_checkpoint": suspended_without_checkpoint,
         }))
     }
 }
@@ -2484,13 +2716,18 @@ fn close_reviewed_workspace(
         params![workspace.0, now],
     )?;
     let mut statement = transaction.prepare(
-        "SELECT id FROM sessions WHERE workspace_id=?1 AND state IN ('active','orphaned')",
+        "SELECT id FROM sessions WHERE workspace_id=?1 \
+         AND state IN ('active','dormant','suspended','orphaned')",
     )?;
     let sessions = statement
         .query_map(params![workspace.0], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
-    transaction.execute("UPDATE sessions SET state='released', updated_at_ms=?2 WHERE workspace_id=?1 AND state IN ('active','orphaned')", params![workspace.0, now])?;
+    transaction.execute(
+        "UPDATE sessions SET state='released', updated_at_ms=?2 WHERE workspace_id=?1 \
+         AND state IN ('active','dormant','suspended','orphaned')",
+        params![workspace.0, now],
+    )?;
     transaction.execute(
         "UPDATE workspaces SET state=?2, updated_at_ms=?3 WHERE id=?1",
         params![workspace.0, state, now],
@@ -2833,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_expiry_makes_workspace_collectable_only_after_grace() {
+    fn lease_expiry_leaves_a_dormant_workspace_that_is_never_collectable() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("state.sqlite")).unwrap();
         let repository = database
@@ -2860,8 +3097,77 @@ mod tests {
             state: "active".into(),
         };
         database.create_session_and_lease(&session, 1).unwrap();
-        database.mark_expired_leases(now_ms() + 2_000).unwrap();
+        let sweep = database.mark_expired_leases(now_ms() + 2_000).unwrap();
+        assert_eq!(sweep.sessions, 1);
+        assert_eq!(sweep.workspaces, 1);
+        assert_eq!(
+            database.session(&session.id).unwrap().unwrap().state,
+            "dormant"
+        );
+        assert_eq!(
+            database
+                .workspace(&session.workspace_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "dormant"
+        );
+        // An expiry is a loss of exclusivity, not a loss of work: no elapsed
+        // grace makes a dormant workspace collectable.
+        assert!(database.gc_candidates(now_ms() + 3_000).unwrap().is_empty());
+        database
+            .release_session(&session.id, &session.workspace_id)
+            .unwrap();
         assert_eq!(database.gc_candidates(now_ms() + 3_000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_orphaned_rows_are_normalized_to_dormant_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("state.sqlite")).unwrap();
+        let repository = database
+            .upsert_repository("local:legacy", &directory.path().join("bare"), Some("main"))
+            .unwrap();
+        let workspace = WorkspaceRecord {
+            id: WorkspaceId("ws_legacy".into()),
+            repository_id: repository.id.clone(),
+            session_id: None,
+            path: directory.path().join("workspace"),
+            base_ref: "origin/main".into(),
+            base_oid: ObjectId("opaque-object-id".into()),
+            head_oid: ObjectId("opaque-object-id".into()),
+            state: "ready".into(),
+            predecessor_id: None,
+            dependency_state: "ready".into(),
+        };
+        database.create_workspace(&workspace).unwrap();
+        let session = SessionRecord {
+            id: SessionId("session-legacy".into()),
+            repository_id: repository.id,
+            workspace_id: workspace.id.clone(),
+            intent: None,
+            state: "active".into(),
+        };
+        database.create_session_and_lease(&session, 1).unwrap();
+        {
+            let connection = database.connection().unwrap();
+            connection
+                .execute("UPDATE sessions SET state='orphaned'", [])
+                .unwrap();
+            connection
+                .execute("UPDATE workspaces SET state='orphaned'", [])
+                .unwrap();
+        }
+        assert_eq!(database.normalize_legacy_dormant_states().unwrap(), 2);
+        assert_eq!(
+            database.session(&session.id).unwrap().unwrap().state,
+            "dormant"
+        );
+        assert_eq!(
+            database.workspace(&workspace.id).unwrap().unwrap().state,
+            "dormant"
+        );
+        assert_eq!(database.normalize_legacy_dormant_states().unwrap(), 0);
     }
 
     #[test]
@@ -3462,7 +3768,14 @@ mod tests {
         let pending = database
             .prepare_successor_handoff(&operation, "host", &session.id, &parent.id, &successor.id)
             .unwrap();
-        assert_eq!(database.mark_expired_leases(now_ms() + 121_000).unwrap(), 1);
+        assert_eq!(
+            database.mark_expired_leases(now_ms() + 121_000).unwrap(),
+            crate::db::ExpirySweep {
+                sessions: 1,
+                workspaces: 1,
+                handoffs_cancelled: 1,
+            }
+        );
         assert_eq!(
             database
                 .handoff(&pending.handoff_id)
@@ -3477,7 +3790,7 @@ mod tests {
         );
         assert_eq!(
             database.session(&session.id).unwrap().unwrap().state,
-            "orphaned"
+            "dormant"
         );
     }
 

@@ -818,6 +818,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
             unstaged: 1,
             untracked: 3,
         },
+        lifecycle: "active".into(),
         lease: "live".into(),
         dependencies: DependencyContext {
             state: "ready".into(),
@@ -1318,7 +1319,11 @@ mod tests {
     #[test]
     fn common_response_fixtures_fit_the_budget() {
         let evidence = common_response_budget(Vec::new()).unwrap();
-        assert!(evidence.within_threshold);
+        assert!(
+            evidence.within_threshold,
+            "largest fixture is {} bytes against a {}-byte budget: {:?}",
+            evidence.max_bytes, COMMON_RESPONSE_LIMIT_BYTES, evidence.samples
+        );
         assert!(evidence.max_bytes <= COMMON_RESPONSE_LIMIT_BYTES);
         assert_eq!(evidence.samples.len(), 7);
     }
