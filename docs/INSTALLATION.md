@@ -36,6 +36,21 @@ Installation atomically copies that same executable to
 launchd domain. The installed binary serves both CLI and daemon commands.
 Installation returns success after the private socket answers `doctor`.
 
+Running the installer again upgrades an installation that is already running.
+launchd acknowledges `bootout` when it accepts the request rather than when the
+job is gone, and it rejects a `bootstrap` that arrives inside that window,
+leaving the domain with no service at all. The installer therefore boots the old
+service out, waits for `launchctl print` to stop reporting it, bootstraps the new
+one and retries that bootstrap with backoff before giving up. Its result carries
+`restarted`. A bootstrap that is still refused returns
+`LAUNCHAGENT_BOOTSTRAP_FAILED` (`retry: safe`), records launchd's own stderr as a
+durable diagnostic and names the exact `launchctl bootstrap` command in `next`,
+because the previous service is already gone by then. A daemon that never binds
+its socket or never answers `doctor` returns `LAUNCHAGENT_NOT_READY` the same
+way. Any other command that reaches an absent or refused socket answers
+`DAEMON_NOT_RUNNING` (`retry: safe`) instead of a generic failure with a
+recorded diagnostic per attempt.
+
 The plist supplies the selected Shade root and socket, a restrictive umask,
 KeepAlive, and a canonical snapshot of existing host PATH directories. Shade
 does not install package managers or runtimes. Reinstall after changing the
@@ -66,12 +81,18 @@ never selected by these arguments.
 
 The test verifies binary identity, private plist/socket permissions, host npm
 readiness and blocked lifecycle hooks. It kills its own service with SIGKILL,
-waits for KeepAlive, and verifies the same SQLite inode and workspace. Finally
+waits for KeepAlive, and verifies the same SQLite inode and workspace. It then
+installs a second time over that running service, with the hidden upgrade
+argument that is the only way to aim an acceptance install at a label that
+already exists. It stops that daemon first, so it cannot answer SIGTERM while
+the installer runs and launchd's teardown window is certain rather than a
+matter of timing, and verifies the service comes back under a new process id
+with the same database and an answering `doctor`. Finally
 it unloads the service, waits for launchd to reap it and removes its temporary
 files. It also creates a failure through the installed daemon and verifies its
 private diagnostic through the Rust SDK, after KeepAlive restart and through
 `doctor --diagnostics` after unloading. `SHADE_INSTALL_EVIDENCE` records the binary digest, process identities,
-open/restart timings and completed checks. `SHADE_INSTALL_KEEP_ROOT=1` retains
+open/restart/upgrade timings and completed checks. `SHADE_INSTALL_KEEP_ROOT=1` retains
 only the test files for diagnosis; its service is still unloaded on failure.
 
 This operational evidence is separate from the APFS latency gate and must be

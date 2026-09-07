@@ -38,6 +38,8 @@ cargo build --release
 
 `shade install` copies the same binary to `~/Library/Application Support/Shade/bin/shade`, writes a private LaunchAgent plist for the `com.shade.daemon` label, and bootstraps it in your GUI launchd domain. The one binary serves both the CLI and the daemon.
 
+Running it again upgrades in place. launchd acknowledges a `bootout` before the old job is actually gone and refuses a `bootstrap` that arrives inside that window, so the installer waits for launchd to report the service removed, retries the bootstrap, and only reports success once the socket answers `doctor`. The result carries `restarted`, and a bootstrap that is still refused fails with `LAUNCHAGENT_BOOTSTRAP_FAILED`, launchd's own reason in the diagnostic and the exact `launchctl bootstrap` command in `next`. A command that finds no daemon behind its socket answers `DAEMON_NOT_RUNNING` with the same two ways to start it.
+
 Every command prints exactly one minified JSON value on stdout. `shade --help` and `shade --version` print JSON too. `events --follow` prints JSONL. There is no prompt, color, table or human presentation mode.
 
 ```zsh

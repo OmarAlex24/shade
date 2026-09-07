@@ -11,7 +11,7 @@ Outcomes:
 - `review_required`: no secret values are present; resolve the review explicitly.
 - `conflict`: work only in the returned resolution workspace, then send `resolution_complete` (`shade resolve`, or `session.resolve` in the SDKs); the outcome is a successor for the parent session.
 
-Errors contain `code`, `retry`, optional `operation`, optional `next`, and optional `diagnostics_id`. They never embed command transcripts, secret fragments, access tokens, absolute tool paths, or a human-only fallback.
+Errors contain `code`, `retry`, optional `operation`, optional `next`, and optional `diagnostics_id`. They never embed command transcripts, secret fragments, access tokens, absolute tool paths, or a human-only fallback. A CLI that cannot reach the socket at all answers `DAEMON_NOT_RUNNING` (`retry: safe`) whose `next` names `shade install` and the `launchctl bootstrap` command, rather than a generic failure with a recorded diagnostic per attempt: no daemon ever saw the request.
 
 Completed values are nested at `outcome.result`:
 

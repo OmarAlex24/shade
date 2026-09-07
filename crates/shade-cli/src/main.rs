@@ -200,6 +200,11 @@ struct InstallArgs {
     harness_root: Option<PathBuf>,
     #[arg(long, hide = true, requires = "harness_install")]
     harness_label: Option<String>,
+    /// Replace the isolated acceptance service instead of refusing to. The
+    /// upgrade path only exists over a service that is already running, so the
+    /// harness has to be able to ask for exactly that.
+    #[arg(long, hide = true, requires = "harness_install")]
+    harness_upgrade: bool,
 }
 
 #[derive(Debug, Args)]
@@ -396,6 +401,10 @@ fn main() {
                     error: error.clone(),
                 },
             });
+            std::process::exit(1);
+        }
+        if daemon_unreachable(&error) {
+            emit(&daemon_not_running());
             std::process::exit(1);
         }
         let diagnostics_id = diagnostic_config.and_then(|config| {
@@ -1252,6 +1261,36 @@ fn local_error(
     response
 }
 
+/// A socket that is absent, or that refuses the connection, is not a CLI defect
+/// and does not deserve a durable diagnostic per attempt: the daemon is not
+/// running. `shade doctor` used to answer that with `CLI_FAILED` and a recorded
+/// "No such file or directory", which names neither the condition nor the way
+/// out of it.
+fn daemon_unreachable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ClientError>(),
+            Some(ClientError::Io(io))
+                if matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+        )
+    })
+}
+
+fn daemon_not_running() -> WireResponse {
+    local_error(
+        "DAEMON_NOT_RUNNING",
+        "safe",
+        &format!(
+            "start the daemon with `shade install`, or `launchctl bootstrap gui/{} ~/Library/LaunchAgents/com.shade.daemon.plist`",
+            unsafe { libc::geteuid() }
+        ),
+        None,
+    )
+}
+
 fn local_timeout(operation: Option<OperationId>, idempotency_key: Option<&str>) -> WireResponse {
     let next = idempotency_key.map_or_else(
         || "query events, then retry the request".to_owned(),
@@ -1498,6 +1537,17 @@ fn emit_event_page(response: WireResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// launchd acknowledges `bootout` when it accepts the request, not when the job
+/// is gone, and it rejects a `bootstrap` that arrives inside that window. The
+/// rejection leaves the domain with no service at all, so an upgrade over a
+/// running daemon used to end with nothing loaded and no socket. Wait for the
+/// removal to land, then bootstrap, and retry anyway: an acknowledgement is not
+/// a completion, and the wait alone is not a guarantee.
+const SERVICE_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SERVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const BOOTSTRAP_ATTEMPTS: u32 = 5;
+const SOCKET_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn install(config: &EngineConfig, args: &InstallArgs) -> anyhow::Result<serde_json::Value> {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         anyhow::bail!("Shade supports Apple Silicon macOS only");
@@ -1505,13 +1555,11 @@ async fn install(config: &EngineConfig, args: &InstallArgs) -> anyhow::Result<se
     let (install_root, agents, label) = install_locations(config, args)?;
     let domain = format!("gui/{}", unsafe { libc::geteuid() });
     let service = format!("{domain}/{label}");
-    if args.harness_install
-        && std::process::Command::new("/bin/launchctl")
-            .args(["print", &service])
-            .output()?
-            .status
-            .success()
-    {
+    // An acceptance label is disposable and always fresh, so a collision means
+    // the harness aimed at a live service. Only a run that asks for the
+    // replacement path on purpose may take one over.
+    let replace = !args.harness_install || args.harness_upgrade;
+    if !replace && service_loaded(&service) {
         anyhow::bail!("the isolated acceptance label already exists");
     }
     let bin = install_root.join("bin/shade");
@@ -1526,30 +1574,121 @@ async fn install(config: &EngineConfig, args: &InstallArgs) -> anyhow::Result<se
     let plist = agents.join(format!("{label}.plist"));
     let content = launch_agent_plist(&label, &bin, config)?;
     atomic_write(&plist, content.as_bytes(), 0o600)?;
-    if !args.harness_install {
-        let _ = std::process::Command::new("/bin/launchctl")
-            .args(["bootout", &service])
-            .output();
-    }
-    let output = std::process::Command::new("/bin/launchctl")
-        .args(["bootstrap", &domain, &plist.to_string_lossy()])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("launchagent bootstrap failed");
+    let restarted = replace && stop_service(&service).await;
+    if let Err(detail) = bootstrap_service(&domain, &plist).await {
+        return Err(launchagent_error(
+            config,
+            "LAUNCHAGENT_BOOTSTRAP_FAILED",
+            &domain,
+            &plist,
+            format!("launchagent bootstrap failed (restarted={restarted}): {detail}"),
+        ));
     }
     if let Err(error) = wait_for_installed_daemon(config).await {
-        let _ = std::process::Command::new("/bin/launchctl")
-            .args(["bootout", &service])
-            .output();
-        return Err(error);
+        stop_service(&service).await;
+        return Err(launchagent_error(
+            config,
+            "LAUNCHAGENT_NOT_READY",
+            &domain,
+            &plist,
+            format!("{error:#}"),
+        ));
     }
     Ok(json!({
         "installed": bin,
         "launch_agent": plist,
         "label": label,
+        "restarted": restarted,
         "root": config.root,
         "socket": config.socket,
     }))
+}
+
+fn service_loaded(service: &str) -> bool {
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", service])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Removes a loaded service and waits for launchd to finish removing it.
+/// Answers whether there was a service to replace.
+async fn stop_service(service: &str) -> bool {
+    let loaded = service_loaded(service);
+    let _ = std::process::Command::new("/bin/launchctl")
+        .args(["bootout", service])
+        .output();
+    let deadline = tokio::time::Instant::now() + SERVICE_REMOVAL_TIMEOUT;
+    while service_loaded(service) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(SERVICE_POLL_INTERVAL).await;
+    }
+    loaded
+}
+
+/// Answers launchd's own stderr from the last rejected attempt: "bootstrap
+/// failed" alone names neither the reason nor anything the caller can act on.
+async fn bootstrap_service(domain: &str, plist: &Path) -> Result<(), String> {
+    let mut delay = SERVICE_POLL_INTERVAL;
+    let mut detail = String::new();
+    for attempt in 0..BOOTSTRAP_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
+        detail = match std::process::Command::new("/bin/launchctl")
+            .args(["bootstrap", domain, &plist.to_string_lossy()])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if stderr.is_empty() {
+                    format!("launchctl bootstrap exited with {}", output.status)
+                } else {
+                    stderr
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+    }
+    Err(detail)
+}
+
+/// A failed bootstrap leaves the GUI domain with no service: whatever ran
+/// before is already gone. Name the one command that puts it back, and keep
+/// launchd's own words in the durable diagnostic rather than in the response.
+fn launchagent_error(
+    config: &EngineConfig,
+    code: &str,
+    domain: &str,
+    plist: &Path,
+    detail: String,
+) -> anyhow::Error {
+    let diagnostics_id = shade_engine::diagnostics::record_cli_error(config, &detail)
+        .ok()
+        .map(|diagnostic| diagnostic.id);
+    ClientError::Domain(ShadeError {
+        code: code.into(),
+        retry: "safe".into(),
+        operation: None,
+        next: Some(format!(
+            "run `launchctl bootstrap {domain} {}`",
+            home_relative(plist)
+        )),
+        diagnostics_id,
+    })
+    .into()
+}
+
+/// An error carries no home directory: `~` is shorter, exact for a shell, and
+/// keeps the account name out of a machine-readable response.
+fn home_relative(path: &Path) -> String {
+    dirs::home_dir()
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+        .map_or_else(
+            || path.display().to_string(),
+            |rest| format!("~/{}", rest.display()),
+        )
 }
 
 fn install_locations(
@@ -1597,6 +1736,19 @@ fn install_locations(
 
 async fn wait_for_installed_daemon(config: &EngineConfig) -> anyhow::Result<()> {
     use std::time::Duration;
+    // The socket is the daemon's first observable side effect. Waiting for it
+    // separates "launchd never started the job" from "the job is still warming
+    // up"; `doctor` then proves the runtime behind it actually answers.
+    let socket_deadline = tokio::time::Instant::now() + SOCKET_READY_TIMEOUT;
+    while !std::fs::symlink_metadata(&config.socket)
+        .is_ok_and(|metadata| metadata.file_type().is_socket())
+    {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < socket_deadline,
+            "installed LaunchAgent never bound its socket"
+        );
+        tokio::time::sleep(SERVICE_POLL_INTERVAL).await;
+    }
     let client = ShadeClient::with_options(
         &config.socket,
         shade_protocol::Actor {
@@ -2077,6 +2229,53 @@ trailing"#;
         assert_eq!(
             error.next.as_deref(),
             Some("retry with --idempotency-key generated-retry-key")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_refused_socket_reports_a_daemon_that_is_not_running() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let error = anyhow::Error::new(ClientError::Io(std::io::Error::from(kind)))
+                .context("query doctor");
+            assert!(daemon_unreachable(&error), "{kind:?} is not mapped");
+        }
+        // Everything else keeps the generic failure and its diagnostic: a bare
+        // filesystem error never reached the socket at all.
+        assert!(!daemon_unreachable(&anyhow::Error::new(
+            ClientError::ResponseEmpty
+        )));
+        assert!(!daemon_unreachable(&anyhow::Error::new(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+
+        let response = daemon_not_running();
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= 512);
+        let ResponseBody::Error { error } = response.body else {
+            panic!("expected a structured error");
+        };
+        assert_eq!(error.code, "DAEMON_NOT_RUNNING");
+        assert_eq!(error.retry, "safe");
+        assert!(error.diagnostics_id.is_none());
+        let next = error.next.unwrap();
+        assert!(next.contains("shade install"));
+        assert!(next.contains("launchctl bootstrap gui/"));
+        assert!(!next.contains("/Users/"));
+    }
+
+    #[test]
+    fn a_home_relative_recovery_command_keeps_the_account_out_of_the_response() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            home_relative(&home.join("Library/LaunchAgents/com.shade.daemon.plist")),
+            "~/Library/LaunchAgents/com.shade.daemon.plist"
+        );
+        assert_eq!(
+            home_relative(Path::new("/private/tmp/shade/agent.plist")),
+            "/private/tmp/shade/agent.plist"
         );
     }
 

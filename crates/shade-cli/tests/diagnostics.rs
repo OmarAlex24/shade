@@ -116,17 +116,47 @@ fn daemon_error_details_survive_restart_and_remain_readable_without_a_daemon() {
 }
 
 #[test]
+fn an_absent_daemon_is_named_instead_of_recording_a_diagnostic_per_attempt() {
+    let temporary = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = temporary.path();
+    let offline = cli(root, &["doctor"]);
+    assert_eq!(offline["status"], "error", "{offline}");
+    assert_eq!(offline["error"]["code"], "DAEMON_NOT_RUNNING");
+    assert_eq!(offline["error"]["retry"], "safe");
+    let next = offline["error"]["next"].as_str().unwrap();
+    assert!(next.contains("shade install"), "{next}");
+    assert!(next.contains("launchctl bootstrap gui/"), "{next}");
+    // The daemon was never running, so there is nothing to diagnose and no
+    // reason to open a database to say so.
+    assert!(offline["error"]["diagnostics_id"].is_null(), "{offline}");
+    assert!(!root.join("state/state.sqlite").exists());
+    assert!(!root.join("s.sock").exists());
+}
+
+#[test]
 fn a_local_cli_failure_has_a_private_diagnostic_without_starting_the_daemon() {
     let temporary = tempfile::tempdir_in("/private/tmp").unwrap();
     let root = temporary.path();
-    let failed = cli(root, &["doctor"]);
+    // A socket path longer than the address family allows never reaches a
+    // daemon, and is a defect in the invocation rather than an absent service.
+    let unusable = root.join("s".repeat(120));
+    let output = Command::new(env!("CARGO_BIN_EXE_shade"))
+        .arg("--socket")
+        .arg(&unusable)
+        .arg("doctor")
+        .env("SHADE_ROOT", root.join("state"))
+        .output()
+        .unwrap();
+    let failed: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(failed["status"], "error", "{failed}");
+    assert_eq!(failed["error"]["code"], "CLI_FAILED");
     let id = failed["error"]["diagnostics_id"]
         .as_str()
         .expect("missing local diagnostic id");
     let diagnostic = cli(root, &["doctor", "--diagnostics", id]);
     assert_eq!(diagnostic["status"], "ok", "{diagnostic}");
     assert_eq!(diagnostic["outcome"]["result"]["origin"], "cli");
+    assert!(!unusable.exists());
     assert!(!root.join("s.sock").exists());
 }
 
