@@ -1564,3 +1564,60 @@ async fn demoting_a_dormant_workspace_to_failed_is_counted_and_says_why() {
     );
     assert_eq!(again["dormant_workspaces_failed"], 0);
 }
+
+/// `LEASE_FENCED` means something superseded you: go use the successor. A
+/// workspace that is mid-resolution, mid-handoff or failed has no successor,
+/// so answering an attach with that code and `next: "use the current successor
+/// workspace"` sent the caller looking for a workspace that does not exist.
+#[tokio::test]
+async fn attaching_a_workspace_that_is_not_attachable_is_not_a_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened) = dormant_session(directory.path()).await;
+
+    // A resolution workspace: a real state a dormant session can be found in
+    // after a conflicting publish.
+    engine
+        .database()
+        .mark_workspace_state(&opened.workspace, "resolution")
+        .unwrap();
+
+    let error = failed(
+        engine
+            .execute(execute(
+                "attach-unattachable",
+                Intent::SessionReattach {
+                    session_id: opened.session.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(error.code, "WORKSPACE_NOT_ATTACHABLE");
+    assert_eq!(error.retry, "never");
+    let next = error.next.expect("the error says what to do about it");
+    assert!(next.contains("resolution"), "it names the state: {next}");
+    assert!(
+        !next.contains("successor"),
+        "and does not send the caller after a successor that does not exist"
+    );
+
+    // The session is untouched: nothing was half-attached on the way out.
+    assert_eq!(session_state(&engine, &opened.session), "dormant");
+    assert_eq!(workspace_state(&engine, &opened), "resolution");
+
+    // And a workspace that *is* attachable still attaches.
+    engine
+        .database()
+        .mark_workspace_state(&opened.workspace, "dormant")
+        .unwrap();
+    let resumed: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "attach-after",
+                Intent::SessionReattach {
+                    session_id: opened.session.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(resumed.workspace, opened.workspace);
+}

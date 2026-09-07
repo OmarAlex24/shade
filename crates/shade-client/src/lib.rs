@@ -1218,6 +1218,7 @@ fn terminal_lease_error(code: &str) -> bool {
             | "WORKSPACE_RELEASED"
             | "WORKSPACE_ALREADY_RELEASED"
             | "WORKSPACE_NOT_MATERIALIZED"
+            | "WORKSPACE_NOT_ATTACHABLE"
             | "SESSION_ALREADY_RELEASED"
             | "SESSION_NOT_FOUND"
             | "SESSION_SUSPENDED"

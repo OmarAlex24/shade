@@ -28,6 +28,8 @@ pub enum DbError {
     IdempotencyConflict,
     #[error("lease or workspace fence no longer matches")]
     LeaseFenced,
+    #[error("workspace is {state} and cannot take a new lease")]
+    WorkspaceNotAttachable { state: String },
     #[error("handoff was not found")]
     HandoffNotFound,
     #[error("handoff belongs to another actor")]
@@ -837,6 +839,19 @@ impl Database {
         )?;
         if session != 1 {
             return Err(DbError::LeaseFenced);
+        }
+        // A workspace that is neither `ready` nor `dormant` is not fenced --
+        // nothing superseded this caller -- it is mid-resolution, mid-handoff
+        // or failed. Saying `LEASE_FENCED` and pointing at "the current
+        // successor workspace" sent the caller looking for a successor that
+        // does not exist.
+        let state: String = transaction.query_row(
+            "SELECT state FROM workspaces WHERE id=?1",
+            params![expected_workspace.0],
+            |row| row.get(0),
+        )?;
+        if !matches!(state.as_str(), "ready" | "dormant") {
+            return Err(DbError::WorkspaceNotAttachable { state });
         }
         let workspace = transaction.execute(
             "UPDATE workspaces SET state='ready', session_id=?2, updated_at_ms=?3 \

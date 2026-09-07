@@ -329,6 +329,11 @@ impl From<DbError> for EngineError {
             DbError::LeaseFenced => {
                 Self::domain("LEASE_FENCED", "never").next("use the current successor workspace")
             }
+            DbError::WorkspaceNotAttachable { state } => {
+                Self::domain("WORKSPACE_NOT_ATTACHABLE", "never").next(format!(
+                    "the workspace is {state}; finish or release it before attaching"
+                ))
+            }
             DbError::HandoffNotFound => Self::domain("HANDOFF_NOT_FOUND", "never"),
             DbError::HandoffOwnerMismatch => Self::domain("HANDOFF_FORBIDDEN", "never"),
             DbError::HandoffNotPending => Self::domain("HANDOFF_ALREADY_RESOLVED", "never"),
