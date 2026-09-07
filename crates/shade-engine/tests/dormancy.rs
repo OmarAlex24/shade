@@ -1621,3 +1621,47 @@ async fn attaching_a_workspace_that_is_not_attachable_is_not_a_fence() {
     );
     assert_eq!(resumed.workspace, opened.workspace);
 }
+
+/// The opened session's compact context reported `dependencies.state: ready`
+/// unconditionally. On a reattach that is a claim about the tree the engine
+/// never checked: a workspace whose lifecycle scripts are blocked comes back
+/// from a dormancy still blocked, and a caller told otherwise runs a build
+/// against dependencies that were never installed.
+#[tokio::test]
+async fn reattach_reports_the_dependency_state_the_workspace_actually_has() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened) = dormant_session(directory.path()).await;
+    assert_eq!(opened.compact_context.dependencies.state, "ready");
+
+    engine
+        .database()
+        .set_dependency_state(&opened.workspace, "blocked")
+        .unwrap();
+
+    let resumed: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "attach-blocked",
+                Intent::SessionReattach {
+                    session_id: opened.session.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(resumed.workspace, opened.workspace);
+    assert_eq!(
+        resumed.compact_context.dependencies.state, "blocked",
+        "the reattach reports the record, not an assumption"
+    );
+
+    // And the standalone context query agrees, which is the whole point: the
+    // two answers used to disagree about the same workspace.
+    let context: CompactContext = completed(
+        engine
+            .query(query(Query::Context {
+                selector: selector(&opened),
+            }))
+            .await,
+    );
+    assert_eq!(context.dependencies.state, "blocked");
+}

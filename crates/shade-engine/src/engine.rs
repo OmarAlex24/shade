@@ -1701,7 +1701,13 @@ impl Engine {
         let mut ready_workspace = workspace.clone();
         ready_workspace.session_id = Some(session_id.clone());
         ready_workspace.state = "ready".into();
-        ready_workspace.dependency_state = "ready".into();
+        // The workspace is ready by construction -- every caller has just made
+        // it so -- but its dependency state is a fact about the tree, not an
+        // assumption. Forcing `ready` told a caller reattaching a workspace
+        // whose scripts are blocked that its dependencies were installed.
+        if let Some(current) = self.database.workspace(&workspace.id)? {
+            ready_workspace.dependency_state = current.dependency_state;
+        }
         let cwd = ready_workspace.path.to_string_lossy().into_owned();
         let mut env = BTreeMap::new();
         env.insert("SHADE_SESSION".into(), session_id.0.clone());

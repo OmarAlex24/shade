@@ -231,7 +231,7 @@ pub async fn run(config: &EngineConfig, client: &ShadeClient, args: RunArgs) -> 
     // The parent writes the pidfile immediately after `spawn`, but "immediately"
     // is still after this child may have reached `exec`. Wait a bounded moment
     // rather than treating the race as a missing registration.
-    let Some(mut record) = await_pidfile(config, &args.session) else {
+    let Some(mut record) = await_pidfile(config, &args.session).await else {
         log.line("pidfile_missing");
         return Ok(());
     };
@@ -357,7 +357,11 @@ pub async fn run(config: &EngineConfig, client: &ShadeClient, args: RunArgs) -> 
 }
 
 /// Poll for this keepalive's own pidfile for a bounded moment.
-fn await_pidfile(config: &EngineConfig, session: &str) -> Option<registry::KeepaliveRecord> {
+///
+/// Async because it runs on the child's runtime, before the heartbeat loop
+/// starts: a `std::thread::sleep` here parks the whole reactor, and the child
+/// has a signal handler and a socket client on it.
+async fn await_pidfile(config: &EngineConfig, session: &str) -> Option<registry::KeepaliveRecord> {
     let deadline = Instant::now() + PIDFILE_WAIT;
     loop {
         if let Some(record) = registry::read(config, session) {
@@ -366,7 +370,7 @@ fn await_pidfile(config: &EngineConfig, session: &str) -> Option<registry::Keepa
         if Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(STOP_POLL);
+        tokio::time::sleep(STOP_POLL).await;
     }
 }
 
