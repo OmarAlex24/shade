@@ -920,7 +920,7 @@ impl Engine {
                     .await?;
                 // Both sweeps are no-ops unless an operator configured them.
                 let auto_slept = self.auto_sleep_dormant(operation).await?;
-                let retention_released = self.expire_suspended_retention()?;
+                let retention_released = self.expire_suspended_retention().await?;
                 Ok(Outcome::Completed(json!({
                     // `expired_sessions` is load-bearing for existing hosts;
                     // the dormancy counters are additive.
@@ -2441,6 +2441,7 @@ impl Engine {
             "successor_materialize",
         )?;
         crate::faults::hit(crate::faults::Point::SuccessorRecorded);
+        self.injected_failure(crate::faults::Point::SuccessorRecorded)?;
         let result = async {
             match source {
                 SuccessorSource::ParentWorkspace => {
@@ -2827,7 +2828,7 @@ impl Engine {
     /// Releasing is not deleting. This only moves a workspace into the state
     /// the collector is allowed to look at; GC still applies every one of its
     /// own gates, and `orphan_grace_secs` still has to elapse afterwards.
-    fn expire_suspended_retention(&self) -> Result<u64, EngineError> {
+    async fn expire_suspended_retention(&self) -> Result<u64, EngineError> {
         let Some(retention_secs) = self.config.suspended_retention_secs else {
             return Ok(0);
         };
@@ -2837,6 +2838,21 @@ impl Engine {
             .database
             .workspaces_in_state_before("suspended", suspended_before)?
         {
+            // The list is a snapshot, and a wake can land on any row in it
+            // between the query and the release. Releasing that row anyway is
+            // not a lost race, it is a woken session whose predecessor was
+            // released underneath it: the caller sees `LEASE_FENCED` on a
+            // successor it just built. Take the lock the wake takes and read
+            // the record again inside it.
+            let _lifecycle = self
+                .keyed_lock(format!("lifecycle:{}", workspace.id.0))
+                .await;
+            let Some(workspace) = self.database.workspace(&workspace.id)? else {
+                continue;
+            };
+            if workspace.state != "suspended" {
+                continue;
+            }
             let Some(session_id) = workspace.session_id.clone() else {
                 continue;
             };

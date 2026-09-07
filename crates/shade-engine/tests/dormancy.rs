@@ -17,6 +17,8 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 const SESSION: &str = "dormancy-session";
 
@@ -1710,6 +1712,87 @@ async fn auto_sleep_and_suspended_retention_are_off_by_default_and_fire_when_con
         workspace_state(&retirer, &opened),
         "released",
         "retention releases; only GC ever deletes"
+    );
+}
+
+/// Retention took a snapshot of every suspension past its span and then
+/// released each row in it, one at a time, without ever looking again. A wake
+/// landing on one of those rows while the list was being drained had its
+/// predecessor released underneath it, and the caller got `LEASE_FENCED` on a
+/// successor it had just built. The sweep now takes the same lifecycle lock
+/// the wake holds and reads the record again inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retention_sweep_never_releases_a_suspension_that_is_being_woken() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = Engine::with_components(
+        EngineConfig::at(directory.path().join("state"))
+            .with_harness_lifecycle_timing(1, 0)
+            .unwrap()
+            .with_suspended_retention_secs(3600)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap();
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    sleep_workspace(&engine, "sleep", &opened).await;
+    backdate(directory.path(), &opened.workspace, 7_200_000);
+
+    // Hold the wake inside its own critical section, where a sweep that does
+    // not take the lock is free to release the workspace it is waking from.
+    let inside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swept = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = Arc::clone(&inside);
+    let released = Arc::clone(&swept);
+    engine.injected_failures().run_once_at(
+        shade_engine::faults::Point::SuccessorRecorded,
+        move || {
+            entered.store(true, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_millis(750);
+            while !released.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        },
+    );
+
+    let waking = engine.clone();
+    let session = opened.session.clone();
+    let woken = tokio::spawn(async move { wake(&waking, "wake-race", &session).await });
+    for _ in 0..400 {
+        if inside.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        inside.load(Ordering::SeqCst),
+        "the wake must be inside its critical section"
+    );
+
+    let sweep: serde_json::Value = completed(
+        engine
+            .execute(system("sweep-retention", Intent::MaintenanceSweep))
+            .await,
+    );
+    swept.store(true, Ordering::SeqCst);
+    let woken: OpenedSession = completed(woken.await.unwrap());
+
+    assert_eq!(
+        sweep["retention_released"], 0,
+        "the suspension was being woken, so retention has nothing to release"
+    );
+    assert_eq!(woken.session, opened.session);
+    assert_ne!(woken.workspace, opened.workspace);
+    assert!(PathBuf::from(&woken.cwd).join("tracked.txt").is_file());
+    assert_eq!(
+        session_state(&engine, &opened.session),
+        "active",
+        "and the session the caller just woke is live, not released"
     );
 }
 
