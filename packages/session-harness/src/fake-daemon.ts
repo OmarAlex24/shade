@@ -887,8 +887,20 @@ export class FakeShadeDaemon {
    * A reattach keeps the workspace and its cwd and hands back a fresh lease,
    * exactly as the engine's `reattach_session` transaction does.
    */
+  /**
+   * Take a lease for a session that is not suspended.
+   *
+   * Reattaching an Active session is idempotent in the daemon: the caller gets
+   * back the lease it already holds, with a full TTL, at the same fence. Only a
+   * session whose lease has actually lapsed is issued a new one. Minting a new
+   * lease every time made the harness assert the opposite of what a real host
+   * observes -- and hid the case where a host caches the lease it was handed.
+   */
   private renewLease(session: FakeSession): OpenedSessionPayload {
-    const lease = this.next("lease", ++this.lease_sequence);
+    const live = session.expires_at_ms >= Date.now();
+    const lease = live
+      ? session.opened.lease
+      : this.next("lease", ++this.lease_sequence);
     // The daemon omits `lifecycle` when it is `active`, so a reattached
     // session drops the key instead of carrying the word.
     const { lifecycle: _revived, ...context } = session.opened.compact_context;

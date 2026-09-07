@@ -135,7 +135,10 @@ test("wake is safe to call on a session that never slept", async () => {
 
   const resumed = await client.sessions.wake("chat-never-slept");
   expect(resumed.workspace).toBe(workspace);
-  expect(resumed.lease).not.toBe(lease);
+  // A session that never slept is simply reattached, and reattaching a live
+  // session is idempotent: the same lease comes back with a full TTL rather
+  // than a second one being minted under a handle that already holds one.
+  expect(resumed.lease).toBe(lease);
 
   await expect(client.sessions.wake("chat-missing")).rejects.toBeInstanceOf(
     ShadeError,
