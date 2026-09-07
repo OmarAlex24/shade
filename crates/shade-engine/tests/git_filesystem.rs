@@ -1163,7 +1163,13 @@ async fn sha256_import_and_opaque_oid_resolution_do_not_assume_sha1_width() {
     let source_identity = store.canonicalize_local(&source).await.unwrap();
     let managed_path = temporary.path().join("managed-sha256.git");
     let (managed, base) = store
-        .import_managed_bare(&source, &managed_path, "main", &source_identity.remote)
+        .import_managed_bare(
+            &source,
+            &managed_path,
+            "main",
+            "refs/heads/main",
+            &source_identity.remote,
+        )
         .await
         .unwrap();
     assert_eq!(base.commit.as_str().len(), 64);
@@ -1317,6 +1323,7 @@ async fn env_templates_are_ordinary_content_while_real_dotenv_files_stay_out() {
             &hostile,
             &temporary.path().join("hostile.git"),
             "main",
+            "refs/heads/main",
             &identity.remote,
         )
         .await
@@ -1344,7 +1351,13 @@ async fn local_import_rejects_tracked_dotenv_before_publishing_the_bare() {
     let source_identity = store.canonicalize_local(&source).await.unwrap();
     let managed_path = temporary.path().join("managed-local.git");
     let error = store
-        .import_managed_bare(&source, &managed_path, "main", &source_identity.remote)
+        .import_managed_bare(
+            &source,
+            &managed_path,
+            "main",
+            "refs/heads/main",
+            &source_identity.remote,
+        )
         .await
         .unwrap_err();
 

@@ -981,6 +981,33 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse,
             COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
+            // The base refusal echoes the ref under the same 120-byte bound
+            // and carries the longest fixed remainder of any `next`, so it is
+            // the wider of the two named rejections and belongs in the sample.
+            "rejected_base_ref",
+            WireResponse {
+                v: shade_protocol::PROTOCOL_VERSION,
+                request_id: request_id.into(),
+                body: ResponseBody::Error {
+                    error: ShadeError {
+                        code: "BASE_REF_NOT_FOUND".into(),
+                        retry: "never".into(),
+                        operation: Some(OperationId("op_01J7W3N7Y9AZ8T6G5F4E3D2C1B".into())),
+                        next: Some(format!(
+                            "no ref named {}...: pass a complete commit SHA or a branch this repository has",
+                            "refs/heads/feature/"
+                                .repeat(7)
+                                .chars()
+                                .take(120)
+                                .collect::<String>()
+                        )),
+                        diagnostics_id: None,
+                    },
+                },
+            },
+            COMMON_RESPONSE_LIMIT_BYTES,
+        ),
+        (
             "structured_error",
             WireResponse {
                 v: shade_protocol::PROTOCOL_VERSION,
@@ -1435,17 +1462,20 @@ mod tests {
             evidence.max_bytes, COMMON_RESPONSE_LIMIT_BYTES, evidence.samples
         );
         assert!(evidence.max_bytes <= COMMON_RESPONSE_LIMIT_BYTES);
-        assert_eq!(evidence.samples.len(), 12);
+        assert_eq!(evidence.samples.len(), 13);
 
-        // A rejection that names its path is the widest error a caller sees,
-        // so it is held to the same budget as every other response.
-        let rejection = evidence
-            .samples
-            .iter()
-            .find(|sample| sample.name == "rejected_repository_path")
-            .unwrap();
-        assert_eq!(rejection.limit_bytes, COMMON_RESPONSE_LIMIT_BYTES);
-        assert!(rejection.bytes <= COMMON_RESPONSE_LIMIT_BYTES);
+        // A rejection that names what it refused -- a path, or the ref a
+        // `--base` asked for -- is the widest error a caller sees, so both are
+        // held to the same budget as every other response.
+        for name in ["rejected_repository_path", "rejected_base_ref"] {
+            let rejection = evidence
+                .samples
+                .iter()
+                .find(|sample| sample.name == name)
+                .unwrap();
+            assert_eq!(rejection.limit_bytes, COMMON_RESPONSE_LIMIT_BYTES);
+            assert!(rejection.bytes <= COMMON_RESPONSE_LIMIT_BYTES);
+        }
 
         // The three lifecycle contexts are measured, not exempted: they are
         // held to the common budget plus the bounded suffix, and the suffix is

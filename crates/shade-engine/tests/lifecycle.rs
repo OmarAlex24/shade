@@ -1124,6 +1124,175 @@ async fn local_clone_uses_origin_identity_and_opens_the_fresh_remote_head() {
     assert_eq!(configured, expected);
 }
 
+/// A branch that has never been pushed is the whole point of moving a worktree
+/// into Shade, and resolving `--base` by fetching it from `origin` refused
+/// exactly those. The repository being opened is asked first: it is where an
+/// unpushed branch lives, and it is what `git worktree add` would have read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_the_remote_has_never_seen_opens_from_the_local_repository() {
+    let directory = tempfile::tempdir().unwrap();
+    let (origin, _writer) = origin_fixture(directory.path());
+    let checkout = clone_origin(directory.path(), &origin, "checkout");
+    git(&checkout, &["config", "user.name", "Shade Test"]);
+    git(&checkout, &["config", "user.email", "shade@test.invalid"]);
+    git(&checkout, &["checkout", "-b", "feat/unpushed"]);
+    fs::write(checkout.join("tracked.txt"), "unpushed work\n").unwrap();
+    git(&checkout, &["add", "tracked.txt"]);
+    git(&checkout, &["commit", "-m", "unpushed"]);
+    let unpushed = git(&checkout, &["rev-parse", "HEAD"]);
+    assert!(
+        !git(&origin, &["for-each-ref", "--format=%(refname)"]).contains("feat/unpushed"),
+        "the fixture must leave the branch unpushed"
+    );
+
+    let engine = test_engine(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "unpushed",
+                "open-unpushed",
+                Intent::SessionOpen(OpenSession {
+                    session_id: SessionId("unpushed".into()),
+                    repository: RepositoryLocator::Local {
+                        path: checkout.to_string_lossy().into_owned(),
+                    },
+                    base: Some("feat/unpushed".into()),
+                    intent: Some("local base".into()),
+                }),
+            ))
+            .await,
+    );
+    assert_eq!(opened.compact_context.base_sha.0, unpushed);
+    assert_eq!(opened.compact_context.base_ref, "refs/heads/feat/unpushed");
+    assert_eq!(
+        fs::read_to_string(Path::new(&opened.cwd).join("tracked.txt")).unwrap(),
+        "unpushed work\n"
+    );
+
+    // The same commit named by its id is the same base, recorded as the
+    // commit because that is how it was asked for.
+    let by_commit: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "unpushed-oid",
+                "open-unpushed-oid",
+                Intent::SessionOpen(OpenSession {
+                    session_id: SessionId("unpushed-oid".into()),
+                    repository: RepositoryLocator::Local {
+                        path: checkout.to_string_lossy().into_owned(),
+                    },
+                    base: Some(unpushed.clone()),
+                    intent: Some("commit base".into()),
+                }),
+            ))
+            .await,
+    );
+    assert_eq!(by_commit.compact_context.base_sha.0, unpushed);
+    assert_eq!(
+        by_commit.compact_context.base_ref,
+        format!("oid:{unpushed}")
+    );
+
+    // `origin/<branch>` still names the remote, so the local branch of that
+    // name cannot answer for it, and a base nothing has is refused by name.
+    let missing = match engine
+        .execute(execute(
+            "absent",
+            "open-absent",
+            Intent::SessionOpen(OpenSession {
+                session_id: SessionId("absent".into()),
+                repository: RepositoryLocator::Local {
+                    path: checkout.to_string_lossy().into_owned(),
+                },
+                base: Some("feat/never-existed".into()),
+                intent: None,
+            }),
+        ))
+        .await
+        .body
+    {
+        ResponseBody::Error { error } => error,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(missing.code, "BASE_REF_NOT_FOUND");
+    assert_eq!(missing.retry, "never");
+    assert!(
+        missing
+            .next
+            .as_ref()
+            .is_some_and(|next| next.contains("feat/never-existed")),
+        "the refusal must name the ref: {missing:?}"
+    );
+}
+
+/// A workspace cut from a local branch keeps that branch as its base, and
+/// `sync` -- which holds the workspace, not the checkout it came from --
+/// resolves it again from the base Shade already imported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_base_survives_reattach_and_sync() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    git(&repository, &["checkout", "-b", "feat/local-only"]);
+    fs::write(repository.join("tracked.txt"), "local branch\n").unwrap();
+    git(&repository, &["add", "tracked.txt"]);
+    git(&repository, &["commit", "-m", "local branch"]);
+    let head = git(&repository, &["rev-parse", "HEAD"]);
+    let engine = test_engine(directory.path());
+    let open = |key: &str, base: &str| {
+        engine.execute(execute(
+            "local-base",
+            key,
+            Intent::SessionOpen(OpenSession {
+                session_id: SessionId("local-base".into()),
+                repository: RepositoryLocator::Local {
+                    path: repository.to_string_lossy().into_owned(),
+                },
+                base: Some(base.to_owned()),
+                intent: None,
+            }),
+        ))
+    };
+    let opened: OpenedSession = completed(open("open-local-base", "feat/local-only").await);
+    assert_eq!(
+        opened.compact_context.base_ref,
+        "refs/heads/feat/local-only"
+    );
+    assert_eq!(opened.compact_context.base_sha.0, head);
+
+    // Reattaching with the same branch is the same base however it is spelled.
+    for (key, spelling) in [
+        ("reopen-plain", "feat/local-only"),
+        ("reopen-qualified", "refs/heads/feat/local-only"),
+    ] {
+        let again: OpenedSession = completed(open(key, spelling).await);
+        assert_eq!(again.workspace, opened.workspace, "{spelling}");
+    }
+
+    let synced = adopt_successor(
+        &engine,
+        "local-base",
+        "adopt-local-sync",
+        engine
+            .execute(execute(
+                "local-base",
+                "sync-local-base",
+                Intent::WorkspaceSync {
+                    selector: WorkspaceSelector {
+                        workspace_id: Some(opened.workspace.clone()),
+                        cwd: None,
+                    },
+                },
+            ))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        synced.compact_context.base_ref,
+        "refs/heads/feat/local-only"
+    );
+    assert_eq!(synced.compact_context.base_sha.0, head);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_clones_of_one_origin_share_import_fetch_and_base() {
     let directory = tempfile::tempdir().unwrap();

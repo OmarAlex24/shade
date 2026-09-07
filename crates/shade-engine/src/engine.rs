@@ -58,11 +58,12 @@ fn checkpoint_record(
     }
 }
 
+/// The base a workspace records is the name it is asked for again by, so the
+/// resolution already chose it: `origin/<branch>` for a ref fetched from the
+/// remote, `refs/heads/<branch>` or `refs/tags/<name>` for one taken from the
+/// repository being opened, and the commit for a base named only by its id.
 fn display_base_ref(base: &BaseRevision) -> String {
     match base.source_ref.as_deref() {
-        Some(reference) if reference.starts_with("refs/heads/") => {
-            format!("origin/{}", &reference["refs/heads/".len()..])
-        }
         Some(reference) => reference.to_owned(),
         None => format!("oid:{}", base.commit),
     }
@@ -75,15 +76,25 @@ fn stored_base_request(base_ref: &str) -> Option<String> {
         .or_else(|| Some(base_ref.to_owned()))
 }
 
+/// The branch a `--base` argument names, in the one spelling every form of it
+/// reduces to. `main`, `origin/main` and the `refs/heads/main` a local base is
+/// recorded as are the same branch; a tag, a commit id and an empty string are
+/// not a branch at all.
 fn simple_branch(value: &str) -> Option<String> {
     if value.is_empty()
         || value.starts_with('-')
-        || value.starts_with("refs/")
         || value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return None;
     }
-    Some(value.strip_prefix("origin/").unwrap_or(value).to_owned())
+    let branch = value
+        .strip_prefix("refs/heads/")
+        .or_else(|| value.strip_prefix("origin/"))
+        .unwrap_or(value);
+    if branch.is_empty() || branch.starts_with("refs/") {
+        return None;
+    }
+    Some(branch.to_owned())
 }
 
 /// Does a `--base` argument name the base a workspace was already cut from?
@@ -232,16 +243,40 @@ fn rejected_path(message: &str, code: &str) -> Option<String> {
     if tail.is_empty() {
         return None;
     }
-    let mut path = tail.to_owned();
-    if path.len() > REJECTED_PATH_LIMIT_BYTES {
+    Some(bounded_detail(tail))
+}
+
+/// The one bound every echoed detail is held to, so no rejection can grow the
+/// response past the budget however long the name it repeats is.
+fn bounded_detail(detail: &str) -> String {
+    let mut detail = detail.to_owned();
+    if detail.len() > REJECTED_PATH_LIMIT_BYTES {
         let mut boundary = REJECTED_PATH_LIMIT_BYTES;
-        while !path.is_char_boundary(boundary) {
+        while !detail.is_char_boundary(boundary) {
             boundary -= 1;
         }
-        path.truncate(boundary);
-        path.push_str("...");
+        detail.truncate(boundary);
+        detail.push_str("...");
     }
-    Some(path)
+    detail
+}
+
+/// A `--base` that names nothing the repository or its remote has. Nothing
+/// about waiting changes that, and the ref is echoed so the caller can see
+/// which spelling was refused.
+const BASE_REF_NOT_FOUND: &str = "BASE_REF_NOT_FOUND";
+
+fn base_error(error: impl std::fmt::Display, named: &str) -> EngineError {
+    let message = error.to_string();
+    if !message.contains(BASE_REF_NOT_FOUND) {
+        return subsystem_error(message);
+    }
+    let reference = rejected_path(&message, BASE_REF_NOT_FOUND)
+        .or_else(|| (!named.is_empty()).then(|| bounded_detail(named)))
+        .unwrap_or_else(|| "that ref".to_owned());
+    EngineError::domain(BASE_REF_NOT_FOUND, "never").next(format!(
+        "no ref named {reference}: pass a complete commit SHA or a branch this repository has"
+    ))
 }
 
 fn subsystem_error(error: impl std::fmt::Display) -> EngineError {
@@ -497,6 +532,11 @@ struct RepositoryHandle {
     record: RepositoryRecord,
     managed: ManagedRepository,
     remote: RemoteIdentity,
+    /// The checkout this request named, when it named one. It is the only
+    /// place an unpushed branch exists, so `--base` looks there first; a
+    /// registered id or a bare URL carries no such repository and resolves
+    /// against the remote alone.
+    local_source: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -1231,6 +1271,7 @@ impl Engine {
                 managed,
                 record,
                 remote,
+                local_source: None,
             });
         }
 
@@ -1244,7 +1285,11 @@ impl Engine {
                 (
                     local.canonical,
                     local.remote,
-                    Some((local.worktree, local.origin_configured)),
+                    Some((
+                        local.worktree,
+                        local.common_git_dir,
+                        local.origin_configured,
+                    )),
                 )
             }
             RepositoryLocator::Remote { url } => {
@@ -1258,12 +1303,16 @@ impl Engine {
         // first import. This keeps a record from becoming visible to another
         // opener in the small interval before the imported freshness proof is
         // installed below.
+        let local_source = local_path
+            .as_ref()
+            .map(|(_, common_git_dir, _)| common_git_dir.clone());
         let _guard = self.keyed_lock(format!("repository:{identity}")).await;
         if let Some(record) = self.database.repository_by_identity(&identity)? {
             return Ok(RepositoryHandle {
                 managed: ManagedRepository::new(record.bare_path.clone()),
                 record,
                 remote,
+                local_source,
             });
         }
         let digest = hex::encode(Sha256::digest(identity.as_bytes()));
@@ -1292,42 +1341,58 @@ impl Engine {
                 managed: ManagedRepository::new(destination),
                 record,
                 remote,
+                local_source,
             });
         }
         let mut imported_freshness = None;
-        let managed = if let Some((source, origin_configured)) = local_path {
-            let branch = match requested_base.and_then(simple_branch) {
-                Some(branch) => branch,
+        let managed = if let Some((source, _, origin_configured)) = local_path {
+            let head_branch = async {
+                self.git
+                    .run(Some(&source), ["symbolic-ref", "--short", "HEAD"])
+                    .await
+                    .map(|output| output.stdout)
+                    .map_err(|_| {
+                        EngineError::domain("LOCAL_IMPORT_BRANCH_REQUIRED", "never")
+                            .next("pass --base <branch> or attach the source HEAD to a branch")
+                    })
+            };
+            // The import has to name a branch to seed from, and the base it
+            // produces stands in for the resolution below only when it is the
+            // same base under the same name. A tag or a commit id still seeds
+            // from HEAD but proves nothing about what was asked for.
+            let (branch, recorded, cached_key) = match requested_base {
                 None => {
-                    self.git
-                        .run(Some(&source), ["symbolic-ref", "--short", "HEAD"])
-                        .await
-                        .map_err(|_| {
-                            EngineError::domain("LOCAL_IMPORT_BRANCH_REQUIRED", "never")
-                                .next("pass --base <branch> or attach the source HEAD to a branch")
-                        })?
-                        .stdout
+                    let branch = head_branch.await?;
+                    let recorded = format!("origin/{branch}");
+                    (branch, recorded, Some("remote-head".to_owned()))
                 }
+                Some(requested) => match simple_branch(requested) {
+                    Some(branch) if requested.starts_with("origin/") => {
+                        let key = format!("branch:{branch}");
+                        (branch.clone(), format!("origin/{branch}"), Some(key))
+                    }
+                    Some(branch) => {
+                        let recorded = format!("refs/heads/{branch}");
+                        let key = format!("local:{recorded}");
+                        (branch, recorded, Some(key))
+                    }
+                    None => {
+                        let branch = head_branch.await?;
+                        let recorded = format!("origin/{branch}");
+                        (branch, recorded, None)
+                    }
+                },
             };
             let (managed, revision) = self
                 .git
-                .import_managed_bare(&source, &destination, &branch, &remote)
+                .import_managed_bare(&source, &destination, &branch, &recorded, &remote)
                 .await
-                .map_err(subsystem_error)?;
+                .map_err(|error| base_error(error, &recorded))?;
             // A local-only repository is its own authoritative source, so the
             // strict import proves freshness for concurrent opens. A checkout
             // with origin is merely a seed and may be stale; never cache that
             // revision as proof of upstream freshness.
-            let specification_key = if origin_configured {
-                None
-            } else {
-                match requested_base {
-                    None => Some("remote-head".to_owned()),
-                    Some(requested) => {
-                        simple_branch(requested).map(|branch| format!("branch:{branch}"))
-                    }
-                }
-            };
+            let specification_key = if origin_configured { None } else { cached_key };
             imported_freshness = specification_key.map(|key| (key, revision));
             managed
         } else {
@@ -1357,6 +1422,7 @@ impl Engine {
             record,
             managed,
             remote,
+            local_source,
         })
     }
 
@@ -1375,11 +1441,52 @@ impl Engine {
         requested: Option<&str>,
         requested_at: Instant,
     ) -> Result<BaseRevision, EngineError> {
-        let specification = self.base_spec(&repository.managed, requested).await?;
+        let specification = self
+            .base_spec(
+                &repository.managed,
+                repository.local_source.as_deref(),
+                requested,
+            )
+            .await?;
+        match self
+            .resolve_cached_base(repository, specification, requested_at)
+            .await
+        {
+            // An `origin/<branch>` the remote has dropped can still be the ref
+            // the local repository is standing on, and that is a base Shade
+            // can serve. Only the remote's answer sends us to look.
+            Err(error) if error.code == BASE_REF_NOT_FOUND => {
+                let requested = requested.unwrap_or_default();
+                let Some(source) = repository.local_source.as_deref() else {
+                    return Err(error);
+                };
+                let Some(specification) = self.local_base_spec(source, requested).await? else {
+                    return Err(error);
+                };
+                self.resolve_cached_base(repository, specification, requested_at)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn resolve_cached_base(
+        &self,
+        repository: &RepositoryHandle,
+        specification: BaseSpec,
+        requested_at: Instant,
+    ) -> Result<BaseRevision, EngineError> {
         let specification_key = match &specification {
             BaseSpec::RemoteHead => "remote-head".to_owned(),
             BaseSpec::OriginBranch(branch) => format!("branch:{branch}"),
+            BaseSpec::LocalRevision { want, .. } => format!("local:{want}"),
+            BaseSpec::ImportedBase(recorded) => format!("imported:{recorded}"),
             BaseSpec::ExistingOid(oid) => format!("oid:{oid}"),
+        };
+        let named = match &specification {
+            BaseSpec::OriginBranch(branch) => branch.clone(),
+            BaseSpec::ImportedBase(recorded) => recorded.clone(),
+            _ => String::new(),
         };
         let key = format!("{}:{specification_key}", repository.record.id.0);
         let _guard = self.keyed_lock(format!("fetch:{key}")).await;
@@ -1392,7 +1499,7 @@ impl Engine {
             .git
             .resolve_base(&repository.managed, Some(&repository.remote), specification)
             .await
-            .map_err(subsystem_error)?;
+            .map_err(|error| base_error(error, &named))?;
         self.locks.fetch_cache.lock().await.insert(
             key,
             CachedBase {
@@ -1406,6 +1513,7 @@ impl Engine {
     async fn base_spec(
         &self,
         repository: &ManagedRepository,
+        local_source: Option<&Path>,
         requested: Option<&str>,
     ) -> Result<BaseSpec, EngineError> {
         let Some(requested) = requested else {
@@ -1414,6 +1522,12 @@ impl Engine {
         if requested.is_empty() || requested.starts_with('-') {
             return Err(EngineError::domain("BASE_INVALID", "never"));
         }
+        if requested.contains("..") {
+            return Err(EngineError::domain("BASE_INVALID", "never")
+                .next("use a simple branch name, origin/<branch>, or a complete local OID"));
+        }
+        // A complete object id the managed store already holds needs nothing
+        // fetched at all, whatever any repository calls it.
         if requested.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             let oid = Oid::new(requested).map_err(subsystem_error)?;
             if self
@@ -1425,12 +1539,78 @@ impl Engine {
                 return Ok(BaseSpec::ExistingOid(oid));
             }
         }
+        // `origin/<branch>` names the remote, and only a fetch can say what
+        // the remote holds now. Everything else is resolved against the
+        // repository being opened first: that is where an unpushed branch
+        // lives, and where the `git worktree add` Shade replaces would look.
+        if !requested.starts_with("origin/")
+            && let Some(source) = local_source
+            && let Some(specification) = self.local_base_spec(source, requested).await?
+        {
+            return Ok(specification);
+        }
         let branch = requested.strip_prefix("origin/").unwrap_or(requested);
-        if branch.starts_with("refs/") || branch.contains("..") {
-            return Err(EngineError::domain("BASE_INVALID", "never")
-                .next("use a simple branch name, origin/<branch>, or a complete local OID"));
+        if branch.starts_with("refs/") {
+            // A base recorded from the local repository, asked for again by a
+            // caller that is not holding it -- `sync` works from a workspace.
+            // The base already imported under `refs/shade/bases/` is the
+            // answer, and it is the exact commit the workspace was cut from.
+            return Ok(BaseSpec::ImportedBase(requested.to_owned()));
         }
         Ok(BaseSpec::OriginBranch(branch.to_owned()))
+    }
+
+    /// What the repository being opened from calls `requested`, if it calls it
+    /// anything. A branch and a tag keep their qualified name, because that is
+    /// what distinguishes them from the remote's branch of the same name; a
+    /// remote-tracking ref is recorded as `origin/<name>`, which is how it is
+    /// asked for again.
+    async fn local_base_spec(
+        &self,
+        source: &Path,
+        requested: &str,
+    ) -> Result<Option<BaseSpec>, EngineError> {
+        if let Some(commit) = self
+            .git
+            .local_commit_oid(source, requested)
+            .await
+            .map_err(subsystem_error)?
+        {
+            return Ok(Some(BaseSpec::LocalRevision {
+                source: source.to_owned(),
+                want: commit.to_string(),
+                recorded: None,
+            }));
+        }
+        let name = requested.strip_prefix("origin/").unwrap_or(requested);
+        let candidates = if requested.starts_with("refs/") {
+            vec![(requested.to_owned(), requested.to_owned())]
+        } else {
+            vec![
+                (format!("refs/heads/{name}"), format!("refs/heads/{name}")),
+                (format!("refs/tags/{name}"), format!("refs/tags/{name}")),
+                (
+                    format!("refs/remotes/origin/{name}"),
+                    format!("origin/{name}"),
+                ),
+            ]
+        };
+        for (want, recorded) in candidates {
+            if self
+                .git
+                .local_ref_oid(source, &want)
+                .await
+                .map_err(subsystem_error)?
+                .is_some()
+            {
+                return Ok(Some(BaseSpec::LocalRevision {
+                    source: source.to_owned(),
+                    want,
+                    recorded: Some(recorded),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     async fn ensure_base(
@@ -2295,6 +2475,7 @@ impl Engine {
             record,
             managed,
             remote,
+            local_source: None,
         };
         let original_base = Oid::new(parent.base_oid.0.clone()).map_err(subsystem_error)?;
         let requested = stored_base_request(&parent.base_ref);
@@ -2538,6 +2719,7 @@ impl Engine {
                         record,
                         managed: managed.clone(),
                         remote,
+                        local_source: None,
                     };
                     let base_root = self.ensure_base(&handle, &base_revision).await?;
                     self.clone_base_blocking(&base_root, &successor.path)
@@ -3097,6 +3279,7 @@ impl Engine {
             record,
             managed,
             remote,
+            local_source: None,
         };
         let original_base = Oid::new(parent.base_oid.0.clone()).map_err(subsystem_error)?;
         let expected = self

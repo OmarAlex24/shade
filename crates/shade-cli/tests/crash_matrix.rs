@@ -320,12 +320,20 @@ impl Fixture {
                     .map(str::to_owned)
                     .collect();
             assert_eq!(registered, paths, "orphan Git registration");
+            // A base imported from the local repository is anchored under
+            // `refs/shade/bases/` for as long as the repository is managed,
+            // exactly like the `refs/remotes/origin/*` an origin base leaves
+            // behind. It is durable state rather than per-checkpoint state, so
+            // the count that catches a leaked quarantine, operation or
+            // checkpoint ref excludes it.
             let refs = git(
                 Path::new(&bare),
                 &["for-each-ref", "--format=%(refname)", "refs/shade/"],
             );
             assert_eq!(
-                refs.lines().count() as i64,
+                refs.lines()
+                    .filter(|reference| !reference.starts_with("refs/shade/bases/"))
+                    .count() as i64,
                 count(&db, "SELECT count(*)*3 FROM checkpoints"),
                 "orphan checkpoint refs"
             );

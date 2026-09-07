@@ -22,6 +22,9 @@ use url::Url;
 
 const PRIVATE_REFS: &str = "refs/shade";
 const QUARANTINE_REF: &str = "refs/shade/quarantine/fetched-head";
+/// Bases taken from the local repository are anchored here so their objects
+/// stay reachable without claiming to be on the remote.
+const LOCAL_BASE_REFS: &str = "refs/shade/bases";
 const ORIGIN: &str = "origin";
 const LFS_POINTER_HEADER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 const CHECKPOINT_STABILITY_ATTEMPTS: usize = 4;
@@ -128,6 +131,20 @@ impl ManagedRepository {
 pub enum BaseSpec {
     RemoteHead,
     OriginBranch(String),
+    /// A revision taken from the repository the workspace is opened from.
+    /// `want` is what that repository is asked for -- a fully qualified ref or
+    /// a complete object id -- and `recorded` is the name the base keeps. A
+    /// local Git directory is just another remote URL, so this runs through
+    /// the same quarantine and checkout policy an origin fetch does.
+    LocalRevision {
+        source: PathBuf,
+        want: String,
+        recorded: Option<String>,
+    },
+    /// A local base already imported under `refs/shade/bases/`, resolved again
+    /// by the name it was recorded under. This is what `sync` works from: it
+    /// holds a workspace, not the checkout that workspace was cut from.
+    ImportedBase(String),
     ExistingOid(Oid),
 }
 
@@ -135,6 +152,10 @@ pub enum BaseSpec {
 pub struct BaseRevision {
     pub commit: Oid,
     pub tree: Oid,
+    /// How the base is recorded and asked for again: `origin/<branch>` for a
+    /// ref fetched from the repository's origin, `refs/heads/<branch>` or
+    /// `refs/tags/<name>` for one taken from the local repository, and `None`
+    /// for a base named only by its commit.
     pub source_ref: Option<String>,
 }
 
@@ -556,19 +577,21 @@ impl GitStore {
         Ok(ManagedRepository::new(fs::canonicalize(destination)?))
     }
 
+    /// Seed a managed bare from a local checkout. `recorded` is the name the
+    /// resulting base keeps, which is the caller's to choose: the same import
+    /// serves `--base <branch>`, which names the local branch, and a bare open,
+    /// which names the remote's head.
     pub async fn import_managed_bare(
         &self,
         source: &Path,
         destination: &Path,
         branch: &str,
+        recorded: &str,
         managed_origin: &RemoteIdentity,
     ) -> anyhow::Result<(ManagedRepository, BaseRevision)> {
         self.validate_branch(branch).await?;
         ensure!(!destination.exists(), "managed repository already exists");
         let local = self.canonicalize_local(source).await?;
-        let source_url = Url::from_file_path(&local.common_git_dir)
-            .map_err(|_| anyhow!("cannot express import source as a file URL"))?;
-        let remote = canonicalize_remote(source_url.as_str())?;
         let parent = destination
             .parent()
             .context("managed repository needs a parent directory")?;
@@ -597,7 +620,14 @@ impl GitStore {
             Some(object_format),
         )
         .await?;
-        let base = self.fetch_head(&staged_repository, &remote, branch).await?;
+        let base = self
+            .fetch_local(
+                &staged_repository,
+                &local.common_git_dir,
+                &format!("refs/heads/{branch}"),
+                Some(recorded),
+            )
+            .await?;
         self.assert_no_alternates(staging.path())?;
         crate::faults::hit(crate::faults::Point::RepositoryStaged);
         fs::rename(staging.path(), destination)?;
@@ -720,7 +750,72 @@ impl GitStore {
         let source_ref = format!("refs/heads/{branch}");
         let destination_ref = format!("refs/remotes/{ORIGIN}/{branch}");
         ensure!(!destination_ref.starts_with(PRIVATE_REFS));
+        match self
+            .fetch_quarantined(
+                repository,
+                &remote.fetch_url,
+                &source_ref,
+                &destination_ref,
+                Some(format!("{ORIGIN}/{branch}")),
+            )
+            .await
+        {
+            Ok(revision) => Ok(revision),
+            // A ref the remote does not carry is the caller's mistake, not a
+            // transport failure, and only the remote can tell the two apart.
+            // Asking costs a round trip on the failing path alone.
+            Err(error) => match self.remote_has_ref(remote, &source_ref).await {
+                Ok(false) => bail!("BASE_REF_NOT_FOUND: {branch}"),
+                _ => Err(error),
+            },
+        }
+    }
 
+    /// Take a base from the checkout Shade is opening from. `want` is a fully
+    /// qualified ref or a complete object id that repository already has, so
+    /// an unpushed branch is as ordinary a base as a pushed one.
+    pub async fn fetch_local(
+        &self,
+        repository: &ManagedRepository,
+        source: &Path,
+        want: &str,
+        recorded: Option<&str>,
+    ) -> anyhow::Result<BaseRevision> {
+        let destination_ref = local_base_ref(want)?;
+        self.validate_refname(&destination_ref).await?;
+        let url = Url::from_file_path(source)
+            .map_err(|_| anyhow!("cannot express the local repository as a file URL"))?;
+        let remote = canonicalize_remote(url.as_str())?;
+        match self
+            .fetch_quarantined(
+                repository,
+                &remote.fetch_url,
+                want,
+                &destination_ref,
+                recorded.map(str::to_owned),
+            )
+            .await
+        {
+            Ok(revision) => Ok(revision),
+            Err(error) => {
+                let present = match want.strip_prefix("refs/") {
+                    Some(_) => self.local_ref_oid(source, want).await?.is_some(),
+                    None => self.local_commit_oid(source, want).await?.is_some(),
+                };
+                ensure!(present, "BASE_REF_NOT_FOUND: {}", recorded.unwrap_or(want));
+                Err(error)
+            }
+        }
+    }
+
+    async fn fetch_quarantined(
+        &self,
+        repository: &ManagedRepository,
+        fetch_url: &str,
+        source_ref: &str,
+        destination_ref: &str,
+        recorded: Option<String>,
+    ) -> anyhow::Result<BaseRevision> {
         // A fetch may transfer objects before any checkout policy can inspect
         // them. Receive into a private, daemon-owned bare repository first so
         // a rejected history cannot contaminate the managed object database.
@@ -748,17 +843,13 @@ impl GitStore {
         }
         self.fetch_explicit(
             &quarantine_repository,
-            &remote.fetch_url,
-            &source_ref,
+            fetch_url,
+            source_ref,
             QUARANTINE_REF,
         )
         .await?;
         let quarantined = self
-            .resolve_existing(
-                &quarantine_repository,
-                QUARANTINE_REF,
-                Some(source_ref.clone()),
-            )
+            .resolve_existing(&quarantine_repository, QUARANTINE_REF, None)
             .await?;
         self.validate_reachable_checkout_policy(&quarantine_repository, &quarantined.commit)
             .await?;
@@ -770,12 +861,34 @@ impl GitStore {
             repository,
             quarantine_url.as_str(),
             QUARANTINE_REF,
-            &destination_ref,
+            destination_ref,
         )
         .await?;
         crate::faults::hit(crate::faults::Point::FetchPromoted);
-        self.resolve_existing(repository, &destination_ref, Some(source_ref))
+        self.resolve_existing(repository, destination_ref, recorded)
             .await
+    }
+
+    /// Does the remote still carry this ref? Asked only to tell an absent base
+    /// from a transport failure, never on the path that succeeded.
+    async fn remote_has_ref(
+        &self,
+        remote: &RemoteIdentity,
+        reference: &str,
+    ) -> anyhow::Result<bool> {
+        let args = vec![
+            OsString::from("ls-remote"),
+            OsString::from("--exit-code"),
+            OsString::from("--"),
+            OsString::from(&remote.fetch_url),
+            OsString::from(reference),
+        ];
+        let output = self.run_raw(None, &args, &[], None).await?;
+        if output.code == Some(2) {
+            return Ok(false);
+        }
+        self.require_success(&output)?;
+        Ok(true)
     }
 
     async fn fetch_explicit(
@@ -785,9 +898,12 @@ impl GitStore {
         source_ref: &str,
         destination_ref: &str,
     ) -> anyhow::Result<()> {
+        // A complete object id is the other thing a local repository can be
+        // asked for, and `Oid` admits nothing but hexadecimal, so neither form
+        // can smuggle a second refspec or a wildcard past this boundary.
         ensure!(
-            source_ref.starts_with("refs/"),
-            "fetch source ref is not qualified"
+            source_ref.starts_with("refs/") || Oid::new(source_ref).is_ok(),
+            "fetch source is neither a qualified ref nor an object id"
         );
         ensure!(
             destination_ref.starts_with("refs/"),
@@ -842,10 +958,86 @@ impl GitStore {
                 let remote = remote.context("origin/branch requires a remote")?;
                 self.fetch_head(repository, remote, &branch).await
             }
+            BaseSpec::LocalRevision {
+                source,
+                want,
+                recorded,
+            } => {
+                self.fetch_local(repository, &source, &want, recorded.as_deref())
+                    .await
+            }
+            BaseSpec::ImportedBase(recorded) => {
+                let reference = local_base_ref(&recorded)?;
+                ensure!(
+                    self.try_resolve_ref_oid(repository, &reference)
+                        .await?
+                        .is_some(),
+                    "BASE_REF_NOT_FOUND: {recorded}"
+                );
+                self.resolve_existing(repository, &reference, Some(recorded))
+                    .await
+            }
             BaseSpec::ExistingOid(oid) => {
                 self.resolve_existing(repository, oid.as_str(), None).await
             }
         }
+    }
+
+    /// Which refs does the repository Shade is opening from actually have?
+    /// Answered in one `for-each-ref`, so a `--base` that names a local branch
+    /// costs no network at all.
+    pub async fn local_ref_oid(
+        &self,
+        source: &Path,
+        reference: &str,
+    ) -> anyhow::Result<Option<Oid>> {
+        // A name Git will not accept as a ref is a name no repository has, and
+        // it must never reach a refspec, so it answers the same way an absent
+        // ref does rather than failing the open.
+        if self.validate_refname(reference).await.is_err() {
+            return Ok(None);
+        }
+        let args = vec![
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from("--end-of-options"),
+            OsString::from(format!("{reference}^{{commit}}")),
+        ];
+        let output = self.run_raw(Some(source), &args, &[], None).await?;
+        if !output.success {
+            return Ok(None);
+        }
+        parse_oid(&output.stdout).map(Some)
+    }
+
+    /// The complete commit this local repository knows by that object id, if
+    /// it knows one. An abbreviation resolves to a different string and is
+    /// refused here, the way an abbreviated `--base` always has been.
+    pub async fn local_commit_oid(
+        &self,
+        source: &Path,
+        candidate: &str,
+    ) -> anyhow::Result<Option<Oid>> {
+        let Ok(oid) = Oid::new(candidate) else {
+            return Ok(None);
+        };
+        let args = vec![
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from("--end-of-options"),
+            OsString::from(format!("{oid}^{{commit}}")),
+        ];
+        let output = self.run_raw(Some(source), &args, &[], None).await?;
+        if !output.success {
+            return Ok(None);
+        }
+        let resolved = parse_oid(&output.stdout)?;
+        Ok(resolved
+            .as_str()
+            .eq_ignore_ascii_case(oid.as_str())
+            .then_some(resolved))
     }
 
     async fn remote_head_branch(&self, remote: &RemoteIdentity) -> anyhow::Result<String> {
@@ -3648,6 +3840,19 @@ impl GitStore {
     ) -> anyhow::Result<bool> {
         Ok(self.registered_worktrees(repository).await?.contains(root))
     }
+}
+
+/// Where a base taken from the local repository is anchored in the managed
+/// store. Deliberately not `refs/remotes/origin/*`, which would claim a
+/// local-only branch is on the remote, and deliberately not `refs/heads/*`,
+/// which is the namespace a publish compare-and-swaps.
+fn local_base_ref(want: &str) -> anyhow::Result<String> {
+    if let Some(rest) = want.strip_prefix("refs/") {
+        ensure!(!rest.is_empty(), "local base ref is not qualified");
+        return Ok(format!("{LOCAL_BASE_REFS}/{rest}"));
+    }
+    let oid = Oid::new(want).context("local base is neither a qualified ref nor an object id")?;
+    Ok(format!("{LOCAL_BASE_REFS}/commits/{oid}"))
 }
 
 fn checkpoint_ref_prefix(workspace_key: &str, checkpoint_key: &str) -> String {
