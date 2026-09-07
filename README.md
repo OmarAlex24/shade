@@ -110,7 +110,7 @@ Version 0.1.0, release candidate. Honest limitations:
 
 - The distribution is not signed or notarized. Integrity is verified with SHA-256 checksums only.
 - The daemon is single-user and runs as your login user. It is **not** a same-UID process sandbox. A linked worktree exposes a writable Git object database, so the secret clean filter is an accidental-commit guardrail, not a boundary against a malicious local process. See [docs/SECURITY.md](docs/SECURITY.md) for the precise threat model.
-- The SQLite schema is version 1 and there are no migrations. A database written by a different schema version is rejected rather than upgraded.
+- The SQLite schema is version 1 and stays there. A database written by a different schema version is rejected rather than converted.
 - V1 rejects submodules, Git LFS, custom Git filters, tracked `.env*` files, missing dependency locks, source builds and executable package-manager configuration. Shade never installs a runtime or toolchain.
 - Sleep preserves tracked content, untracked files and gitignored private files, but not gitignored build output: `node_modules`, `.venv` and anything like them are excluded from the checkpoint and rebuilt on wake from the shared dependency fingerprint. A wake also changes the workspace id and cwd, so a host that cached either must read them from the wake result.
 

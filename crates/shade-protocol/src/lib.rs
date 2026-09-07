@@ -309,7 +309,7 @@ pub struct CompactContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_sha: Option<ObjectId>,
     pub changes: CompactChanges,
-    /// `live | expired | released`, kept for compatibility with v1 callers.
+    /// `live | expired | released`, kept because v1 callers read it.
     pub lease: String,
     /// `active | dormant | suspended | released`; absent means `active`.
     #[serde(
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn a_v1_context_without_a_lifecycle_field_reads_as_active() {
-        let legacy = serde_json::json!({
+        let elided = serde_json::json!({
             "workspace": "ws_1",
             "session": "session-1",
             "base_ref": "origin/main",
@@ -519,7 +519,7 @@ mod tests {
             "lease": "live",
             "dependencies": {"state": "ready"},
         });
-        let decoded: CompactContext = serde_json::from_value(legacy).unwrap();
+        let decoded: CompactContext = serde_json::from_value(elided).unwrap();
         assert_eq!(decoded.lifecycle, "active");
     }
 

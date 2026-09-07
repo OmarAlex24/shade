@@ -151,7 +151,7 @@ export interface CompactContext {
   head_sha: ObjectId;
   remote_sha?: ObjectId;
   changes: CompactChanges;
-  /** `live | expired | released`, kept for compatibility with v1 callers. */
+  /** `live | expired | released`, kept because v1 callers read it. */
   lease: string;
   /**
    * `active | dormant | suspended | released`. Absent means `active`: the

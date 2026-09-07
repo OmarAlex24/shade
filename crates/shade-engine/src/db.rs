@@ -3652,7 +3652,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(directory.path().join("state.sqlite")).unwrap();
         let repository = database
-            .upsert_repository("local:legacy", &directory.path().join("bare"), Some("main"))
+            .upsert_repository(
+                "local:retired-states",
+                &directory.path().join("bare"),
+                Some("main"),
+            )
             .unwrap();
         let workspace = WorkspaceRecord {
             id: WorkspaceId("ws_legacy".into()),
@@ -3668,7 +3672,7 @@ mod tests {
         };
         database.create_workspace(&workspace).unwrap();
         let session = SessionRecord {
-            id: SessionId("session-legacy".into()),
+            id: SessionId("session-retired".into()),
             repository_id: repository.id,
             workspace_id: workspace.id.clone(),
             intent: None,

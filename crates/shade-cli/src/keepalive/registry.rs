@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shade_engine::config::EngineConfig;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const RECORD_VERSION: u32 = 1;
@@ -52,10 +52,18 @@ pub fn log_path(config: &EngineConfig, session: &str) -> PathBuf {
 
 pub fn ensure_directory(config: &EngineConfig) -> io::Result<PathBuf> {
     let directory = directory(config);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&directory)?;
+    // `DirBuilder::mode` is a creation mode, so the caller's umask still
+    // subtracts from it: under a restrictive umask this makes a directory the
+    // owner cannot enter, and every later write into it fails with EACCES.
+    // Set the mode we actually require afterwards, the way the socket and the
+    // state file do, on the runtime root as well as on the leaf.
+    for path in [config.runtime_dir(), directory.clone()] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(directory)
 }
 
