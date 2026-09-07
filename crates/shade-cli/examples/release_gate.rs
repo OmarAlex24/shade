@@ -868,6 +868,16 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
             })),
         ),
         (
+            "sleep",
+            completed(json!({
+                "session": "host_01J7W3N7Y9AZ8T6G5F4E3D",
+                "workspace": "ws_01J7W3N7Y9AZ8T6G5F4E3D2C1B",
+                "checkpoint_id": "ckpt_01J7W3N7Y9AZ8T6G5F4E3D2C1B",
+                "suspended": true,
+                "reclaimed_bytes": 4_294_967_296_u64,
+            })),
+        ),
+        (
             "accepted",
             WireResponse {
                 v: shade_protocol::PROTOCOL_VERSION,
@@ -1325,7 +1335,7 @@ mod tests {
             evidence.max_bytes, COMMON_RESPONSE_LIMIT_BYTES, evidence.samples
         );
         assert!(evidence.max_bytes <= COMMON_RESPONSE_LIMIT_BYTES);
-        assert_eq!(evidence.samples.len(), 7);
+        assert_eq!(evidence.samples.len(), 8);
     }
 
     #[test]
