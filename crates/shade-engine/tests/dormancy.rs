@@ -11,9 +11,10 @@ use shade_engine::filesystem::CopyFilesystem;
 use shade_protocol::{
     Actor, ActorKind, CompactContext, ExecuteRequest, Intent, OpenSession, OpenedSession, Outcome,
     PROTOCOL_VERSION, Query, QueryRequest, RepositoryLocator, ResponseBody, SessionId,
-    SessionStatus, ShadeError, WorkspaceSelector,
+    SessionStatus, ShadeError, SleepResult, WorkspaceSelector,
 };
 use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -593,4 +594,509 @@ async fn secret_decisions_remain_actionable_while_dormant() {
         );
         assert_eq!(workspace_state(&engine, &opened), expected);
     }
+}
+
+// --- Phase 2: sleep and wake ------------------------------------------------
+
+/// A provider that materializes a fixture dependency layer, so a test can tell
+/// whether wake rebuilt one.
+struct FixtureDependencies;
+
+#[async_trait::async_trait]
+impl shade_engine::dependencies::DependencyProvider for FixtureDependencies {
+    fn name(&self) -> &'static str {
+        "fixture-js"
+    }
+    fn applies(&self, _root: &Path) -> bool {
+        true
+    }
+    async fn ensure_ready(
+        &self,
+        context: &shade_engine::dependencies::DependencyContext<'_>,
+    ) -> Result<
+        shade_engine::dependencies::DependencyReceipt,
+        shade_engine::dependencies::DependencyError,
+    > {
+        let path = context
+            .workspace_root
+            .join("node_modules/shade-fixture/index.js");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "module.exports = 1;\n").unwrap();
+        Ok(shade_engine::dependencies::DependencyReceipt {
+            provider: self.name().into(),
+            fingerprint: "fixture-layer".into(),
+            state: "ready".into(),
+            materialized_paths: vec!["node_modules".into()],
+            blocked_builds: vec![],
+            scripts: vec![],
+        })
+    }
+}
+
+struct FailingDependencies;
+
+#[async_trait::async_trait]
+impl shade_engine::dependencies::DependencyProvider for FailingDependencies {
+    fn name(&self) -> &'static str {
+        "failure-fixture"
+    }
+    fn applies(&self, _root: &Path) -> bool {
+        true
+    }
+    async fn ensure_ready(
+        &self,
+        _context: &shade_engine::dependencies::DependencyContext<'_>,
+    ) -> Result<
+        shade_engine::dependencies::DependencyReceipt,
+        shade_engine::dependencies::DependencyError,
+    > {
+        Err(shade_engine::dependencies::DependencyError::Failed(
+            "dependency provider is unavailable".into(),
+        ))
+    }
+}
+
+fn engine_with(
+    root: &Path,
+    providers: Vec<Box<dyn shade_engine::dependencies::DependencyProvider>>,
+) -> Engine {
+    Engine::with_components(
+        EngineConfig::at(root.join("state"))
+            .with_harness_lifecycle_timing(1, 0)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(providers)),
+    )
+    .unwrap()
+}
+
+async fn sleep_workspace(engine: &Engine, key: &str, opened: &OpenedSession) -> SleepResult {
+    completed(
+        engine
+            .execute(execute(
+                key,
+                Intent::WorkspaceSleep {
+                    selector: selector(opened),
+                },
+            ))
+            .await,
+    )
+}
+
+async fn wake(engine: &Engine, key: &str, session: &SessionId) -> shade_protocol::WireResponse {
+    engine
+        .execute(execute(
+            key,
+            Intent::SessionWake {
+                session_id: session.clone(),
+            },
+        ))
+        .await
+}
+
+fn registered_worktrees(engine: &Engine, opened: &OpenedSession) -> String {
+    let workspace = engine
+        .database()
+        .workspace(&opened.workspace)
+        .unwrap()
+        .unwrap();
+    let repository = engine
+        .database()
+        .repository_by_id(&workspace.repository_id)
+        .unwrap()
+        .unwrap();
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repository.bare_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Open one session and put its workspace to sleep. Returns the engine, the
+/// session as it was when Active, and the sleep result.
+async fn suspended_session(
+    root: &Path,
+    providers: Vec<Box<dyn shade_engine::dependencies::DependencyProvider>>,
+) -> (Engine, OpenedSession, SleepResult) {
+    let repository = fixture(root);
+    let engine = engine_with(root, providers);
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    let slept = sleep_workspace(&engine, "sleep", &opened).await;
+    (engine, opened, slept)
+}
+
+fn backdate(root: &Path, workspace: &shade_protocol::WorkspaceId, millis: i64) {
+    let connection =
+        rusqlite::Connection::open(EngineConfig::at(root.join("state")).database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE workspaces SET updated_at_ms=updated_at_ms-?2 WHERE id=?1",
+            rusqlite::params![workspace.0, millis],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sleep_checkpoints_dematerializes_and_preserves_every_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    let tree = PathBuf::from(&opened.cwd);
+    fs::write(tree.join("tracked.txt"), "edited before sleeping\n").unwrap();
+
+    let slept = sleep_workspace(&engine, "sleep", &opened).await;
+    assert!(slept.suspended);
+    assert_eq!(slept.session, opened.session);
+    assert_eq!(slept.workspace, opened.workspace);
+    assert!(
+        slept.reclaimed_bytes > 0,
+        "sleeping a materialized tree reclaims disk"
+    );
+
+    assert!(!tree.exists(), "the tree is what sleep gives up");
+    let worktrees = registered_worktrees(&engine, &opened);
+    assert!(
+        !worktrees.contains(&opened.cwd),
+        "the worktree registration goes with the tree: {worktrees}"
+    );
+
+    assert_eq!(workspace_state(&engine, &opened), "suspended");
+    assert_eq!(session_state(&engine, &opened.session), "suspended");
+    assert!(
+        engine
+            .database()
+            .active_lease_for_session(&opened.session)
+            .unwrap()
+            .is_none(),
+        "a suspended session holds no lease"
+    );
+
+    // Everything that is not the tree survives.
+    let checkpoints = engine
+        .database()
+        .checkpoints_for_workspace(&opened.workspace)
+        .unwrap();
+    assert!(
+        checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.id == slept.checkpoint_id
+                && checkpoint.reason == "sleep"
+                && checkpoint.state == "ready")
+    );
+    let suspension = engine
+        .database()
+        .suspension_checkpoint(&opened.workspace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(suspension.id, slept.checkpoint_id);
+    assert!(
+        directory
+            .path()
+            .join("state/secrets")
+            .join(&opened.workspace.0)
+            .is_dir(),
+        "the secret baseline outlives the tree"
+    );
+}
+
+#[tokio::test]
+async fn sleep_preserves_untracked_secret_files_without_requiring_a_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    fs::write(
+        Path::new(&opened.cwd).join(".env.local"),
+        "TOKEN=suspension-fixture\n",
+    )
+    .unwrap();
+
+    // Sleep preserves private files instead of deleting them, so unlike
+    // release it never has a decision to ask a human for.
+    let response = engine
+        .execute(execute(
+            "sleep-with-secret",
+            Intent::WorkspaceSleep {
+                selector: selector(&opened),
+            },
+        ))
+        .await;
+    assert!(
+        matches!(
+            response.body,
+            ResponseBody::Ok {
+                outcome: Outcome::Completed(_)
+            }
+        ),
+        "sleep must not require a secret review: {response:?}"
+    );
+
+    let vault = directory
+        .path()
+        .join("state/secrets")
+        .join(&opened.workspace.0)
+        .join("suspended");
+    let file = vault.join("files/.env.local");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "TOKEN=suspension-fixture\n"
+    );
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&vault).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[tokio::test]
+async fn wake_restores_content_from_the_sleep_checkpoint_and_the_shared_dependency_layer() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_with(directory.path(), vec![Box::new(FixtureDependencies)]);
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    let tree = PathBuf::from(&opened.cwd);
+    assert!(tree.join("node_modules/shade-fixture/index.js").is_file());
+
+    fs::remove_file(tree.join("tracked.txt")).unwrap();
+    fs::write(tree.join("added.txt"), "written by the agent\n").unwrap();
+    fs::write(tree.join("script.sh"), "#!/bin/sh\necho shade\n").unwrap();
+    fs::set_permissions(tree.join("script.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("added.txt", tree.join("link.txt")).unwrap();
+    fs::write(tree.join(".env.local"), "TOKEN=woken\n").unwrap();
+
+    let slept = sleep_workspace(&engine, "sleep", &opened).await;
+    let woken: OpenedSession = completed(wake(&engine, "wake", &opened.session).await);
+
+    assert_eq!(woken.session, opened.session, "the session id is stable");
+    assert_ne!(
+        woken.workspace, opened.workspace,
+        "wake produces a successor, like restore"
+    );
+    assert_ne!(woken.cwd, opened.cwd);
+    assert_eq!(woken.env["SHADE_SESSION"], opened.session.0);
+    assert_eq!(woken.env["SHADE_WORKSPACE"], woken.workspace.0);
+    assert_eq!(woken.compact_context.lifecycle, "active");
+
+    let successor = PathBuf::from(&woken.cwd);
+    assert!(
+        !successor.join("tracked.txt").exists(),
+        "a file the agent deleted stays deleted"
+    );
+    assert_eq!(
+        fs::read_to_string(successor.join("added.txt")).unwrap(),
+        "written by the agent\n"
+    );
+    assert_eq!(
+        fs::metadata(successor.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111,
+        "an executable bit survives the round trip"
+    );
+    assert_eq!(
+        fs::read_link(successor.join("link.txt")).unwrap(),
+        Path::new("added.txt")
+    );
+    assert_eq!(
+        fs::read_to_string(successor.join(".env.local")).unwrap(),
+        "TOKEN=woken\n",
+        "the suspension vault is restored into the successor"
+    );
+    assert!(
+        successor
+            .join("node_modules/shade-fixture/index.js")
+            .is_file(),
+        "the dependency layer is rebuilt from its recorded fingerprint"
+    );
+
+    // The predecessor is released in the same transaction that binds the
+    // successor, so exactly one workspace owns the session.
+    assert_eq!(workspace_state(&engine, &opened), "released");
+    assert_eq!(session_state(&engine, &opened.session), "active");
+    let successor_record = engine
+        .database()
+        .workspace(&woken.workspace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(successor_record.state, "ready");
+    assert_eq!(successor_record.session_id, Some(opened.session.clone()));
+    assert_eq!(successor_record.predecessor_id, Some(opened.workspace));
+    assert!(!slept.checkpoint_id.0.is_empty());
+}
+
+#[tokio::test]
+async fn wake_failure_leaves_the_workspace_suspended() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+    drop(engine);
+
+    let broken = engine_with(directory.path(), vec![Box::new(FailingDependencies)]);
+    let error = failed(wake(&broken, "wake-broken", &opened.session).await);
+    assert_ne!(error.code, "");
+    assert_eq!(
+        workspace_state(&broken, &opened),
+        "suspended",
+        "a failed wake never touches the suspension it was building from"
+    );
+    assert_eq!(session_state(&broken, &opened.session), "suspended");
+    drop(broken);
+
+    let engine = engine_with(directory.path(), Vec::new());
+    let woken: OpenedSession = completed(wake(&engine, "wake-retry", &opened.session).await);
+    assert_eq!(woken.session, opened.session);
+    assert!(PathBuf::from(&woken.cwd).join("tracked.txt").is_file());
+    assert_eq!(workspace_state(&engine, &opened), "released");
+}
+
+#[tokio::test]
+async fn suspended_workspace_survives_startup_reconciliation() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+    drop(engine);
+
+    // This is the regression test for the reconciliation skip: without it the
+    // missing directory reads as corruption and every suspended workspace is
+    // marked `failed` and handed to the collector on the next daemon start.
+    let restarted = engine_with(directory.path(), Vec::new());
+    let reconciled: serde_json::Value = completed(
+        restarted
+            .execute(system("reconcile", Intent::Reconcile))
+            .await,
+    );
+    assert_eq!(reconciled["invalid_workspaces"], 0);
+    assert_eq!(workspace_state(&restarted, &opened), "suspended");
+    assert_eq!(session_state(&restarted, &opened.session), "suspended");
+
+    let collected = collect(&restarted, "gc-after-restart").await;
+    assert_eq!(collected["deleted"], 0);
+    let woken: OpenedSession =
+        completed(wake(&restarted, "wake-after-restart", &opened.session).await);
+    assert!(PathBuf::from(&woken.cwd).join("tracked.txt").is_file());
+}
+
+#[tokio::test]
+async fn suspended_workspace_is_not_a_gc_candidate_and_released_one_is() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+
+    let collected = collect(&engine, "gc-suspended").await;
+    assert_eq!(collected["eligible"], 0);
+    assert_eq!(collected["deleted"], 0);
+    assert_eq!(workspace_state(&engine, &opened), "suspended");
+
+    // Release is still the only door to deletion, and it works without a tree.
+    let released: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "release-suspended",
+                Intent::WorkspaceRelease {
+                    selector: selector(&opened),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(released["released"], true);
+    assert_eq!(workspace_state(&engine, &opened), "released");
+
+    let collected = collect(&engine, "gc-released").await;
+    assert_eq!(collected["deleted"], 1);
+    assert!(
+        engine
+            .database()
+            .workspace(&opened.workspace)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !directory
+            .path()
+            .join("state/secrets")
+            .join(&opened.workspace.0)
+            .exists(),
+        "collecting the record reclaims the suspension vault with it"
+    );
+}
+
+#[tokio::test]
+async fn auto_sleep_and_suspended_retention_are_off_by_default_and_fire_when_configured() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened) = dormant_session(directory.path()).await;
+
+    let swept: serde_json::Value = completed(
+        engine
+            .execute(system("sweep-default", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["auto_slept"], 0);
+    assert_eq!(swept["retention_released"], 0);
+    assert_eq!(workspace_state(&engine, &opened), "dormant");
+    drop(engine);
+
+    let sleeper = Engine::with_components(
+        EngineConfig::at(directory.path().join("state"))
+            .with_harness_lifecycle_timing(1, 0)
+            .unwrap()
+            .with_auto_sleep_after_secs(3600)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap();
+    backdate(directory.path(), &opened.workspace, 7_200_000);
+    let swept: serde_json::Value = completed(
+        sleeper
+            .execute(system("sweep-auto-sleep", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["auto_slept"], 1);
+    assert_eq!(workspace_state(&sleeper, &opened), "suspended");
+    assert!(!PathBuf::from(&opened.cwd).exists());
+    drop(sleeper);
+
+    let retirer = Engine::with_components(
+        EngineConfig::at(directory.path().join("state"))
+            .with_harness_lifecycle_timing(1, 0)
+            .unwrap()
+            .with_suspended_retention_secs(3600)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap();
+    backdate(directory.path(), &opened.workspace, 7_200_000);
+    let swept: serde_json::Value = completed(
+        retirer
+            .execute(system("sweep-retention", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["retention_released"], 1);
+    assert_eq!(
+        workspace_state(&retirer, &opened),
+        "released",
+        "retention releases; only GC ever deletes"
+    );
 }
