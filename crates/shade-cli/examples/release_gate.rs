@@ -953,6 +953,34 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse,
             COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
+            // A repository rejection names the offending path, so the widest
+            // one a caller can see is the daemon's 120-byte path bound plus
+            // its truncation marker. It is measured here because that is the
+            // response that grew: everything else is a fixed word.
+            "rejected_repository_path",
+            WireResponse {
+                v: shade_protocol::PROTOCOL_VERSION,
+                request_id: request_id.into(),
+                body: ResponseBody::Error {
+                    error: ShadeError {
+                        code: "TRACKED_SECRET_FILE".into(),
+                        retry: "never".into(),
+                        operation: Some(OperationId("op_01J7W3N7Y9AZ8T6G5F4E3D2C1B".into())),
+                        next: Some(format!(
+                            "untrack {}..., then retry",
+                            "apps/web/nested/"
+                                .repeat(7)
+                                .chars()
+                                .take(120)
+                                .collect::<String>()
+                        )),
+                        diagnostics_id: None,
+                    },
+                },
+            },
+            COMMON_RESPONSE_LIMIT_BYTES,
+        ),
+        (
             "structured_error",
             WireResponse {
                 v: shade_protocol::PROTOCOL_VERSION,
@@ -1407,7 +1435,17 @@ mod tests {
             evidence.max_bytes, COMMON_RESPONSE_LIMIT_BYTES, evidence.samples
         );
         assert!(evidence.max_bytes <= COMMON_RESPONSE_LIMIT_BYTES);
-        assert_eq!(evidence.samples.len(), 11);
+        assert_eq!(evidence.samples.len(), 12);
+
+        // A rejection that names its path is the widest error a caller sees,
+        // so it is held to the same budget as every other response.
+        let rejection = evidence
+            .samples
+            .iter()
+            .find(|sample| sample.name == "rejected_repository_path")
+            .unwrap();
+        assert_eq!(rejection.limit_bytes, COMMON_RESPONSE_LIMIT_BYTES);
+        assert!(rejection.bytes <= COMMON_RESPONSE_LIMIT_BYTES);
 
         // The three lifecycle contexts are measured, not exempted: they are
         // held to the common budget plus the bounded suffix, and the suffix is
