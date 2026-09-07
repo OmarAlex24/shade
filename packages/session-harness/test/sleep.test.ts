@@ -147,6 +147,44 @@ test("wake is safe to call on a session that never slept", async () => {
 });
 
 /**
+ * The terminal set was read in one place: the heartbeat catch. A host that had
+ * its session slept from somewhere else learned about it from its next ordinary
+ * call -- and then went on holding a handle that reported itself live, with a
+ * timer beating into the same refusal until the interval next came round. The
+ * heartbeat here is an hour away, so nothing but the call itself can end it.
+ */
+test("a terminal answer from any call retires the handle immediately", async () => {
+  daemon = new FakeShadeDaemon(60_000);
+  await daemon.start();
+  const client = new ShadeClient({
+    socket: daemon.socket,
+    actor: { kind: "agent", id: "terminal-any-call" },
+    heartbeat_interval_ms: 3_600_000,
+  });
+
+  const session = await client.sessions.open({
+    session_id: "chat-terminal-any-call",
+    repository: { kind: "local", path: "/repo" },
+  });
+  const beats = daemon.heartbeat_count;
+  await wireSleep(daemon.socket, session.workspace, session.cwd);
+
+  await expect(session.checkpoint("after the sleep")).rejects.toMatchObject({
+    code: "SESSION_SUSPENDED",
+  });
+  expect(daemon.heartbeat_count).toBe(beats);
+  // Retired by that answer, and the refusal says which answer did it.
+  await expect(session.context()).rejects.toMatchObject({
+    code: "SESSION_HANDLE_RETIRED",
+    next: "the daemon answered SESSION_SUSPENDED",
+  });
+
+  const woken = await client.sessions.wake("chat-terminal-any-call");
+  expect(woken).not.toBe(session);
+  await woken.release();
+});
+
+/**
  * The harness is a contract, so every refusal it invents is a refusal a host
  * learns to handle and the daemon never sends -- and every refusal it misses is
  * one a host meets for the first time in production. These are the lifecycle

@@ -47,14 +47,22 @@ const refreshHandle = Symbol("shade.refreshHandle");
  * that is gone, superseded, or asleep. `SESSION_SUSPENDED` belongs here too: a
  * sleeping workspace has no tree to heartbeat for, and only an explicit
  * `wake()` brings it back.
+ *
+ * Every entry is a code the daemon actually sends. `WORKSPACE_RELEASED` was in
+ * this set and in the Rust one and in the protocol document, and no engine path
+ * has ever emitted it: a released workspace answers `WORKSPACE_ALREADY_RELEASED`,
+ * or `LEASE_EXPIRED` if the lease went first. `WORKSPACE_NOT_LEASED` and
+ * `WORKSPACE_NOT_FOUND` went the other way: both are sent, both are
+ * `retry: never`, and neither was here.
  */
 const TERMINAL_LEASE_ERRORS = new Set([
   "LEASE_EXPIRED",
   "LEASE_FENCED",
-  "WORKSPACE_RELEASED",
   "WORKSPACE_ALREADY_RELEASED",
   "WORKSPACE_NOT_MATERIALIZED",
   "WORKSPACE_NOT_ATTACHABLE",
+  "WORKSPACE_NOT_LEASED",
+  "WORKSPACE_NOT_FOUND",
   "SESSION_ALREADY_RELEASED",
   "SESSION_NOT_FOUND",
   "SESSION_SUSPENDED",
@@ -146,7 +154,7 @@ interface SessionBridge {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<T>>;
   session(payload: OpenedSessionPayload): ShadeSession;
-  retire(session: ShadeSession): void;
+  retire(session: ShadeSession, reason?: string): void;
   heartbeat(session_id: SessionId, lease_id: LeaseId): Promise<HeartbeatResult>;
   reattach(session_id: SessionId): Promise<ShadeSession>;
   heartbeat_interval_ms: number;
@@ -194,7 +202,8 @@ export class ShadeClient {
       executeAndWait: <T>(intent: Intent, call?: MutationOptions) =>
         this.executeMutationAndWait<T>(intent, call),
       session: (payload: OpenedSessionPayload) => this.hydrateSession(payload),
-      retire: (session: ShadeSession) => this.retireSession(session),
+      retire: (session: ShadeSession, reason?: string) =>
+        this.retireSession(session, reason),
       heartbeat: (session_id: SessionId, lease_id: LeaseId) =>
         this.heartbeat(session_id, lease_id),
       reattach: (session_id: SessionId) => this.reattachSession(session_id),
@@ -362,11 +371,11 @@ export class ShadeClient {
     return session;
   }
 
-  private retireSession(session: ShadeSession): void {
+  private retireSession(session: ShadeSession, reason?: string): void {
     if (this.liveSessions.get(session.session) === session) {
       this.liveSessions.delete(session.session);
     }
-    session[retireHandle]();
+    session[retireHandle](reason);
   }
 
   private retireWorkspace(workspace: WorkspaceId): void {
@@ -725,6 +734,7 @@ export class ShadeSession {
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   private heartbeatInFlight = false;
   private retired = false;
+  private retiredReason: string | undefined;
 
   /** @internal Sessions are created by ShadeClient.sessions.open or session.fork. */
   constructor(bridge: SessionBridge, payload: OpenedSessionPayload) {
@@ -753,9 +763,11 @@ export class ShadeSession {
 
   async context(options?: CallOptions): Promise<CompactContext> {
     this.assertLive();
-    const outcome = await this.bridge.queryAndWait<CompactContext>(
-      { kind: "context", selector: this.selector() },
-      options,
+    const outcome = await this.observe(
+      this.bridge.queryAndWait<CompactContext>(
+        { kind: "context", selector: this.selector() },
+        options,
+      ),
     );
     this.compactContext = completed(outcome, "CONTEXT_INCOMPLETE");
     return this.compactContext;
@@ -766,31 +778,37 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<CheckpointResult>> {
     this.assertLive();
-    return await this.bridge.executeAndWait<CheckpointResult>(
-      { kind: "workspace_checkpoint", selector: this.selector(), reason },
-      options,
+    return await this.observe(
+      this.bridge.executeAndWait<CheckpointResult>(
+        { kind: "workspace_checkpoint", selector: this.selector(), reason },
+        options,
+      ),
     );
   }
 
   async fork(input: ForkInput, options?: MutationOptions): Promise<ShadeSession> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<OpenedSessionPayload>(
-      {
-        kind: "workspace_fork",
-        selector: this.selector(),
-        child_session_id: input.child_session_id,
-        ...(input.intent === undefined ? {} : { intent: input.intent }),
-      },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<OpenedSessionPayload>(
+        {
+          kind: "workspace_fork",
+          selector: this.selector(),
+          child_session_id: input.child_session_id,
+          ...(input.intent === undefined ? {} : { intent: input.intent }),
+        },
+        options,
+      ),
     );
     return this.bridge.session(completed(outcome, "SESSION_FORK_INCOMPLETE"));
   }
 
   async sync(options?: MutationOptions): Promise<TerminalOutcome<ShadeSession>> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<OpenedSessionPayload>(
-      { kind: "workspace_sync", selector: this.selector() },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<OpenedSessionPayload>(
+        { kind: "workspace_sync", selector: this.selector() },
+        options,
+      ),
     );
     return this.successor(outcome);
   }
@@ -800,13 +818,15 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<ShadeSession>> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<OpenedSessionPayload>(
-      {
-        kind: "workspace_restore",
-        selector: this.selector(),
-        checkpoint_id,
-      },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<OpenedSessionPayload>(
+        {
+          kind: "workspace_restore",
+          selector: this.selector(),
+          checkpoint_id,
+        },
+        options,
+      ),
     );
     return this.successor(outcome);
   }
@@ -815,9 +835,11 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<ShadeSession>> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<OpenedSessionPayload>(
-      { kind: "dependencies_refresh", selector: this.selector() },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<OpenedSessionPayload>(
+        { kind: "dependencies_refresh", selector: this.selector() },
+        options,
+      ),
     );
     return this.successor(outcome);
   }
@@ -825,9 +847,11 @@ export class ShadeSession {
   async dependencyScripts(options?: CallOptions): Promise<DependencyScriptsResult> {
     this.assertLive();
     return completed(
-      await this.bridge.queryAndWait<DependencyScriptsResult>(
-        { kind: "dependency_scripts", selector: this.selector() },
-        options,
+      await this.observe(
+        this.bridge.queryAndWait<DependencyScriptsResult>(
+          { kind: "dependency_scripts", selector: this.selector() },
+          options,
+        ),
       ),
       "DEPENDENCY_SCRIPTS_INCOMPLETE",
     );
@@ -838,9 +862,11 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<ScriptDecisionResult>> {
     this.assertLive();
-    return this.bridge.executeAndWait<ScriptDecisionResult>(
-      { kind: "dependency_script_decision", selector: this.selector(), approval, allow: true },
-      options,
+    return this.observe(
+      this.bridge.executeAndWait<ScriptDecisionResult>(
+        { kind: "dependency_script_decision", selector: this.selector(), approval, allow: true },
+        options,
+      ),
     );
   }
 
@@ -849,9 +875,11 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<ScriptDecisionResult>> {
     this.assertLive();
-    return this.bridge.executeAndWait<ScriptDecisionResult>(
-      { kind: "dependency_script_decision", selector: this.selector(), approval, allow: false },
-      options,
+    return this.observe(
+      this.bridge.executeAndWait<ScriptDecisionResult>(
+        { kind: "dependency_script_decision", selector: this.selector(), approval, allow: false },
+        options,
+      ),
     );
   }
 
@@ -860,15 +888,17 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<PublishResult>> {
     this.assertLive();
-    return await this.bridge.executeAndWait<PublishResult>(
-      {
-        kind: "workspace_publish",
-        selector: this.selector(),
-        branch: input.branch,
-        message: input.message,
-        ...(input.push === undefined ? {} : { push: input.push }),
-      },
-      options,
+    return await this.observe(
+      this.bridge.executeAndWait<PublishResult>(
+        {
+          kind: "workspace_publish",
+          selector: this.selector(),
+          branch: input.branch,
+          message: input.message,
+          ...(input.push === undefined ? {} : { push: input.push }),
+        },
+        options,
+      ),
     );
   }
 
@@ -882,21 +912,25 @@ export class ShadeSession {
     options?: MutationOptions,
   ): Promise<TerminalOutcome<ShadeSession>> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<OpenedSessionPayload>(
-      {
-        kind: "resolution_complete",
-        selector: { workspace_id: conflict.workspace },
-      },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<OpenedSessionPayload>(
+        {
+          kind: "resolution_complete",
+          selector: { workspace_id: conflict.workspace },
+        },
+        options,
+      ),
     );
     return this.successor(outcome);
   }
 
   async release(options?: MutationOptions): Promise<TerminalOutcome<ReleaseResult>> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<ReleaseResult>(
-      { kind: "workspace_release", selector: this.selector() },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<ReleaseResult>(
+        { kind: "workspace_release", selector: this.selector() },
+        options,
+      ),
     );
     if (outcome.state === "completed") this.bridge.retire(this);
     return outcome;
@@ -909,9 +943,11 @@ export class ShadeSession {
    */
   async sleep(options?: MutationOptions): Promise<SleepResult> {
     this.assertLive();
-    const outcome = await this.bridge.executeAndWait<SleepResult>(
-      { kind: "workspace_sleep", selector: this.selector() },
-      options,
+    const outcome = await this.observe(
+      this.bridge.executeAndWait<SleepResult>(
+        { kind: "workspace_sleep", selector: this.selector() },
+        options,
+      ),
     );
     const result = completed(outcome, "WORKSPACE_SLEEP_INCOMPLETE");
     this.bridge.retire(this);
@@ -953,7 +989,7 @@ export class ShadeSession {
       const code = asShadeError(error).code;
       if (code === "LEASE_EXPIRED" && (await this.reattachOnce())) return;
       if (TERMINAL_LEASE_ERRORS.has(code)) {
-        this.bridge.retire(this);
+        this.bridge.retire(this, code);
       }
     } finally {
       this.heartbeatInFlight = false;
@@ -980,8 +1016,32 @@ export class ShadeSession {
       throw new ShadeError({
         code: "SESSION_HANDLE_RETIRED",
         retry: "never",
-        next: "use the completed successor session",
+        next:
+          this.retiredReason === undefined
+            ? "use the completed successor session"
+            : `the daemon answered ${this.retiredReason}`,
       });
+    }
+  }
+
+  /**
+   * Retire the handle when the daemon's answer says this session is over.
+   *
+   * The heartbeat was the only caller that read the terminal set, so a host
+   * that slept a session from somewhere else, or lost the workspace to a
+   * successor, learned about it from its next `checkpoint()` -- and then kept a
+   * handle reporting `active` and a timer beating into the same refusal until
+   * the interval happened to come round. Every session call goes through here
+   * instead, so the first terminal answer from any of them ends the handle and
+   * records why.
+   */
+  private async observe<T>(work: Promise<T>): Promise<T> {
+    try {
+      return await work;
+    } catch (error) {
+      const code = asShadeError(error).code;
+      if (TERMINAL_LEASE_ERRORS.has(code)) this.bridge.retire(this, code);
+      throw error;
     }
   }
 
@@ -991,9 +1051,14 @@ export class ShadeSession {
     this.compactContext = payload.compact_context;
   }
 
-  [retireHandle](): void {
+  [retireHandle](reason?: string): void {
     if (this.retired) return;
     this.retired = true;
+    // The first answer wins: later calls on a retired handle produce their own
+    // errors, and overwriting would replace the cause with a consequence.
+    if (reason !== undefined && this.retiredReason === undefined) {
+      this.retiredReason = reason;
+    }
     if (this.heartbeatTimer !== undefined) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;

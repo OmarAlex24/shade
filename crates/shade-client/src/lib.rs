@@ -672,11 +672,33 @@ struct SessionLifecycle {
     /// a caller who re-reads `SHADE_LEASE` after a dormancy must get the lease
     /// the daemon is actually renewing, not the one the handle was born with.
     opened: Mutex<OpenedSession>,
+    /// The daemon's own answer for why this handle stopped, when there was
+    /// one. A handle that retires because the caller released or slept it has
+    /// no reason to give; one that retires because the session was suspended
+    /// or superseded does, and the host needs it to decide between `wake` and
+    /// starting over.
+    reason: Mutex<Option<String>>,
 }
 
 impl SessionLifecycle {
     fn retire(&self) {
         let _ = self.stop.send(true);
+    }
+
+    /// Retire and record the code that ended it. The first answer wins: later
+    /// calls on a retired handle produce their own errors, and overwriting
+    /// would replace the cause with a consequence.
+    fn retire_because(&self, code: &str) {
+        let mut reason = self.reason.lock().expect("session mutex poisoned");
+        if reason.is_none() {
+            *reason = Some(code.to_owned());
+        }
+        drop(reason);
+        self.retire();
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.lock().expect("session mutex poisoned").clone()
     }
 
     fn is_active(&self) -> bool {
@@ -727,6 +749,7 @@ impl Session {
             lifecycle: Arc::new(SessionLifecycle {
                 stop,
                 opened: Mutex::new(opened),
+                reason: Mutex::new(None),
             }),
         };
         session.spawn_heartbeat(client, stop_receiver);
@@ -774,9 +797,14 @@ impl Session {
                                     break;
                                 }
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 if let Some(lifecycle) = lifecycle.upgrade() {
-                                    lifecycle.retire();
+                                    match error {
+                                        ClientError::Domain(error) => {
+                                            lifecycle.retire_because(&error.code)
+                                        }
+                                        _ => lifecycle.retire_because("LEASE_EXPIRED"),
+                                    }
                                 }
                                 break;
                             }
@@ -784,7 +812,7 @@ impl Session {
                     }
                     Err(ClientError::Domain(error)) if terminal_lease_error(&error.code) => {
                         if let Some(lifecycle) = lifecycle.upgrade() {
-                            lifecycle.retire();
+                            lifecycle.retire_because(&error.code);
                         }
                         break;
                     }
@@ -796,6 +824,13 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.lifecycle.is_active()
+    }
+
+    /// Why the daemon ended this handle, when it was the daemon that did.
+    /// `None` for a handle that is still live, or one the caller retired
+    /// itself by releasing, sleeping or superseding the session.
+    pub fn retired_because(&self) -> Option<String> {
+        self.lifecycle.reason()
     }
 
     /// What the daemon last told us about this session: the workspace, the
@@ -818,7 +853,7 @@ impl Session {
 
     pub async fn context(&self) -> ClientResult<CompactContext> {
         self.require_active()?;
-        let response = self.client.context(self.selector.clone()).await?;
+        let response = self.observe(self.client.context(self.selector.clone()).await)?;
         completed_only(terminal(response)?, "context")
     }
 
@@ -827,12 +862,14 @@ impl Session {
         reason: impl Into<String>,
     ) -> ClientResult<TerminalOutcome<CheckpointResult>> {
         self.require_active()?;
-        self.client
-            .execute_typed(Intent::WorkspaceCheckpoint {
-                selector: self.selector.clone(),
-                reason: reason.into(),
-            })
-            .await
+        self.observe(
+            self.client
+                .execute_typed(Intent::WorkspaceCheckpoint {
+                    selector: self.selector.clone(),
+                    reason: reason.into(),
+                })
+                .await,
+        )
     }
 
     pub async fn fork(
@@ -841,14 +878,15 @@ impl Session {
         intent: Option<String>,
     ) -> ClientResult<TerminalOutcome<Session>> {
         self.require_active()?;
-        let outcome = self
-            .client
-            .execute_typed::<OpenedSession>(Intent::WorkspaceFork {
-                selector: self.selector.clone(),
-                child_session_id,
-                intent,
-            })
-            .await?;
+        let outcome = self.observe(
+            self.client
+                .execute_typed::<OpenedSession>(Intent::WorkspaceFork {
+                    selector: self.selector.clone(),
+                    child_session_id,
+                    intent,
+                })
+                .await,
+        )?;
         Ok(outcome.map(|opened| Session::new(self.client.clone(), opened)))
     }
 
@@ -883,11 +921,13 @@ impl Session {
         self.require_active()?;
         completed_only(
             terminal(
-                self.client
-                    .query(Query::DependencyScripts {
-                        selector: self.selector.clone(),
-                    })
-                    .await?,
+                self.observe(
+                    self.client
+                        .query(Query::DependencyScripts {
+                            selector: self.selector.clone(),
+                        })
+                        .await,
+                )?,
             )?,
             "dependency scripts",
         )
@@ -900,13 +940,15 @@ impl Session {
         approval: shade_protocol::ScriptApproval,
     ) -> ClientResult<TerminalOutcome<shade_protocol::ScriptDecisionResult>> {
         self.require_active()?;
-        self.client
-            .execute_typed(Intent::DependencyScriptDecision {
-                selector: self.selector.clone(),
-                approval,
-                allow: true,
-            })
-            .await
+        self.observe(
+            self.client
+                .execute_typed(Intent::DependencyScriptDecision {
+                    selector: self.selector.clone(),
+                    approval,
+                    allow: true,
+                })
+                .await,
+        )
     }
 
     pub async fn revoke_script(
@@ -914,13 +956,15 @@ impl Session {
         approval: shade_protocol::ScriptApproval,
     ) -> ClientResult<TerminalOutcome<shade_protocol::ScriptDecisionResult>> {
         self.require_active()?;
-        self.client
-            .execute_typed(Intent::DependencyScriptDecision {
-                selector: self.selector.clone(),
-                approval,
-                allow: false,
-            })
-            .await
+        self.observe(
+            self.client
+                .execute_typed(Intent::DependencyScriptDecision {
+                    selector: self.selector.clone(),
+                    approval,
+                    allow: false,
+                })
+                .await,
+        )
     }
 
     pub async fn publish(
@@ -930,14 +974,16 @@ impl Session {
         push: bool,
     ) -> ClientResult<TerminalOutcome<PublishResult>> {
         self.require_active()?;
-        self.client
-            .execute_typed(Intent::WorkspacePublish {
-                selector: self.selector.clone(),
-                branch: branch.into(),
-                message: message.into(),
-                push,
-            })
-            .await
+        self.observe(
+            self.client
+                .execute_typed(Intent::WorkspacePublish {
+                    selector: self.selector.clone(),
+                    branch: branch.into(),
+                    message: message.into(),
+                    push,
+                })
+                .await,
+        )
     }
 
     /// Finish a `conflict` outcome. Fix the conflict inside the resolution
@@ -958,12 +1004,13 @@ impl Session {
 
     pub async fn release(&self) -> ClientResult<TerminalOutcome<ReleaseResult>> {
         self.require_active()?;
-        let outcome = self
-            .client
-            .execute_typed(Intent::WorkspaceRelease {
-                selector: self.selector.clone(),
-            })
-            .await?;
+        let outcome = self.observe(
+            self.client
+                .execute_typed(Intent::WorkspaceRelease {
+                    selector: self.selector.clone(),
+                })
+                .await,
+        )?;
         if matches!(outcome, TerminalOutcome::Completed(_)) {
             self.retire();
         }
@@ -975,12 +1022,13 @@ impl Session {
     /// heartbeat. `sessions.wake(session_id)` brings the work back.
     pub async fn sleep(&self) -> ClientResult<SleepResult> {
         self.require_active()?;
-        let outcome = self
-            .client
-            .execute_typed(Intent::WorkspaceSleep {
-                selector: self.selector.clone(),
-            })
-            .await?;
+        let outcome = self.observe(
+            self.client
+                .execute_typed(Intent::WorkspaceSleep {
+                    selector: self.selector.clone(),
+                })
+                .await,
+        )?;
         let result = completed_only(outcome, "workspace sleep")?;
         self.retire();
         Ok(result)
@@ -988,14 +1036,16 @@ impl Session {
 
     pub async fn heartbeat(&self) -> ClientResult<HeartbeatResult> {
         self.require_active()?;
-        self.client
-            .heartbeat_lease(self.session_id.clone(), self.lease())
-            .await
+        self.observe(
+            self.client
+                .heartbeat_lease(self.session_id.clone(), self.lease())
+                .await,
+        )
     }
 
     async fn successor(&self, intent: Intent) -> ClientResult<TerminalOutcome<Session>> {
         self.require_active()?;
-        let outcome = self.client.execute_typed::<OpenedSession>(intent).await?;
+        let outcome = self.observe(self.client.execute_typed::<OpenedSession>(intent).await)?;
         Ok(match outcome {
             TerminalOutcome::Completed(opened) => {
                 let successor = Session::new(self.client.clone(), opened);
@@ -1013,6 +1063,24 @@ impl Session {
         } else {
             Err(ClientError::UnexpectedOutcome("session handle is retired"))
         }
+    }
+
+    /// Retire the handle when the daemon's answer says this session is over.
+    ///
+    /// The heartbeat was the only caller that read the terminal set, so a host
+    /// that slept a session from somewhere else, or lost the workspace to a
+    /// successor, learned about it from its next `checkpoint` -- and then kept
+    /// a handle reporting `is_active()` and a heartbeat beating into the same
+    /// refusal until the interval happened to come round. Every call the
+    /// session makes goes through here instead, so the first terminal answer
+    /// from any of them ends the handle and records why.
+    fn observe<T>(&self, result: ClientResult<T>) -> ClientResult<T> {
+        if let Err(ClientError::Domain(error)) = &result
+            && terminal_lease_error(&error.code)
+        {
+            self.lifecycle.retire_because(&error.code);
+        }
+        result
     }
 }
 
@@ -1210,15 +1278,26 @@ fn completed_only<T>(outcome: TerminalOutcome<T>, operation: &'static str) -> Cl
 /// that is gone, superseded, or asleep. `SESSION_SUSPENDED` belongs here too:
 /// a sleeping workspace has no tree to heartbeat for, and only `session_wake`
 /// -- an explicit call the host has to make -- brings it back.
+///
+/// Every entry is a code the daemon actually sends. `WORKSPACE_RELEASED` was
+/// in this list and in the TypeScript one and in the protocol document, and no
+/// engine path has ever emitted it: a released workspace answers
+/// `WORKSPACE_ALREADY_RELEASED`, or `LEASE_EXPIRED` if the lease went first. A
+/// code the daemon never sends is a branch no host can reach and a promise the
+/// documentation cannot keep, so it is gone. `WORKSPACE_NOT_LEASED` and
+/// `WORKSPACE_NOT_FOUND` went the other way: both are sent, both are
+/// `retry: never`, and neither was here, so a handle kept heartbeating into an
+/// answer that will never change.
 fn terminal_lease_error(code: &str) -> bool {
     matches!(
         code,
         "LEASE_EXPIRED"
             | "LEASE_FENCED"
-            | "WORKSPACE_RELEASED"
             | "WORKSPACE_ALREADY_RELEASED"
             | "WORKSPACE_NOT_MATERIALIZED"
             | "WORKSPACE_NOT_ATTACHABLE"
+            | "WORKSPACE_NOT_LEASED"
+            | "WORKSPACE_NOT_FOUND"
             | "SESSION_ALREADY_RELEASED"
             | "SESSION_NOT_FOUND"
             | "SESSION_SUSPENDED"
@@ -1702,6 +1781,122 @@ mod tests {
         let after_drop = heartbeats.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(35)).await;
         assert_eq!(heartbeats.load(Ordering::SeqCst), after_drop);
+        server.abort();
+    }
+
+    /// The terminal set was read in exactly one place: the heartbeat catch. A
+    /// host that slept a session from another process, or lost the workspace to
+    /// a successor, found out from its next ordinary call -- and then went on
+    /// holding a handle that reported `is_active()` and a heartbeat beating
+    /// into the same refusal until the interval next came round. Every call
+    /// answers for the handle now.
+    #[tokio::test]
+    async fn a_terminal_answer_from_any_call_retires_the_handle_and_says_why() {
+        // `SESSION_SUSPENDED` was already terminal; `WORKSPACE_NOT_LEASED` is
+        // sent by seven engine paths with `retry: never` and was in neither
+        // SDK's set, so a handle kept heartbeating into an answer that will
+        // never change.
+        for code in ["SESSION_SUSPENDED", "WORKSPACE_NOT_LEASED"] {
+            terminal_answer_retires_the_handle(code).await;
+        }
+    }
+
+    async fn terminal_answer_retires_the_handle(code: &'static str) {
+        let Some((temp, listener)) = test_listener() else {
+            return;
+        };
+        let socket = temp.path().join("shade.sock");
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let counted = heartbeats.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut frame = Vec::new();
+                    if reader.read_until(b'\n', &mut frame).await.is_err() {
+                        return;
+                    }
+                    let Some(newline) = frame.iter().position(|byte| *byte == b'\n') else {
+                        return;
+                    };
+                    let request: WireRequest = serde_json::from_slice(&frame[..newline]).unwrap();
+                    let request_id = wire_request_id(&request).to_owned();
+                    // The heartbeat stays healthy throughout, so nothing but
+                    // the checkpoint's own answer can retire this handle.
+                    let body = match request {
+                        WireRequest::Execute(ExecuteRequest {
+                            intent: Intent::LeaseHeartbeat { lease_id, .. },
+                            ..
+                        }) => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            ResponseBody::Ok {
+                                outcome: Outcome::Completed(
+                                    json!({"lease": lease_id, "expires_at_ms": 1}),
+                                ),
+                            }
+                        }
+                        WireRequest::Execute(ExecuteRequest {
+                            intent: Intent::WorkspaceCheckpoint { .. },
+                            ..
+                        }) => ResponseBody::Error {
+                            error: ShadeError {
+                                code: code.into(),
+                                retry: "never".into(),
+                                operation: None,
+                                next: Some("shade wake --session <id>".into()),
+                                diagnostics_id: None,
+                            },
+                        },
+                        _ => return,
+                    };
+                    let mut encoded = serde_json::to_vec(&WireResponse {
+                        v: PROTOCOL_VERSION,
+                        request_id,
+                        body,
+                    })
+                    .unwrap();
+                    encoded.push(b'\n');
+                    let _ = writer.write_all(&encoded).await;
+                });
+            }
+        });
+        let client = ShadeClient::with_options(
+            &socket,
+            Actor {
+                kind: ActorKind::Agent,
+                id: "terminal-test".into(),
+            },
+            ShadeClientOptions {
+                request_timeout: Duration::from_millis(200),
+                operation_timeout: Duration::from_millis(200),
+                heartbeat_interval: Duration::from_millis(10),
+                ..ShadeClientOptions::default()
+            },
+        )
+        .unwrap();
+        let session = Session::new(client, opened("lease-test"));
+        assert!(session.is_active());
+        assert_eq!(session.retired_because(), None);
+
+        let error = session.checkpoint("manual").await.unwrap_err();
+        assert!(
+            matches!(&error, ClientError::Domain(error) if error.code == code),
+            "{error:?}"
+        );
+        assert!(!session.is_active(), "{code} ends this handle");
+        assert_eq!(session.retired_because().as_deref(), Some(code));
+
+        // And the heartbeat stops with it, rather than running until the next
+        // interval discovers the same answer for itself.
+        let after = heartbeats.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(heartbeats.load(Ordering::SeqCst), after);
+        assert!(session.checkpoint("again").await.is_err());
         server.abort();
     }
 
