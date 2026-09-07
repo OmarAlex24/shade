@@ -3796,7 +3796,15 @@ impl Engine {
             .map(|id| self.database.workspace(id))
             .transpose()?
             .flatten();
-        let parent_path = parent.as_ref().map(|parent| parent.path.as_path());
+        // A predecessor that was slept has no tree left to read: the
+        // suspension vault holds everything it had, and the wake that
+        // materialized this workspace handed it that vault as its own
+        // baseline. Reading the absent tree would fail the whole command, and
+        // release is the only door to deletion.
+        let parent_path = parent
+            .as_ref()
+            .map(|parent| parent.path.as_path())
+            .filter(|path| path.exists());
         let mut stale = false;
         if let Some(review) = self.database.latest_secret_review(&workspace.id)? {
             let current = self

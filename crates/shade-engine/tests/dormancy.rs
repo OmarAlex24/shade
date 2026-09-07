@@ -2212,3 +2212,58 @@ async fn reattach_reports_the_dependency_state_the_workspace_actually_has() {
     );
     assert_eq!(context.dependencies.state, "blocked");
 }
+
+/// A woken workspace can still be released even though it holds secrets.
+///
+/// Sleep takes the predecessor's tree away once its vault holds everything it
+/// had, and wake hands the successor that vault. Release then previews the
+/// successor's secrets, and a preview that insisted on reading the
+/// predecessor's tree turned the one door to deletion into an INTERNAL.
+#[tokio::test]
+async fn a_woken_workspace_with_secrets_is_still_releasable() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    let cwd = engine
+        .database()
+        .workspace(&opened.workspace)
+        .unwrap()
+        .unwrap()
+        .path;
+    fs::write(cwd.join(".env"), "FOO=bar\n").unwrap();
+
+    let _: SleepResult = sleep_workspace(&engine, "sleep", &opened).await;
+    let woken: OpenedSession = completed(wake(&engine, "wake", &opened.session).await);
+    assert_ne!(woken.workspace, opened.workspace);
+    let successor = engine
+        .database()
+        .workspace(&woken.workspace)
+        .unwrap()
+        .unwrap()
+        .path;
+    assert_eq!(
+        fs::read_to_string(successor.join(".env")).unwrap(),
+        "FOO=bar\n"
+    );
+    assert!(!cwd.exists(), "sleep left the predecessor materialized");
+
+    let released: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "release",
+                Intent::WorkspaceRelease {
+                    selector: WorkspaceSelector {
+                        workspace_id: Some(woken.workspace.clone()),
+                        cwd: None,
+                    },
+                },
+            ))
+            .await,
+    );
+    assert_eq!(released["released"], serde_json::json!(true));
+}
