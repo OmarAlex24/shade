@@ -25,7 +25,9 @@ import {
   ShadeClient,
   type CheckpointResult,
   type EventEnvelope,
+  type OpenedSessionPayload,
   type ShadeSession,
+  type SleepResult,
   type TerminalOutcome,
 } from "../../sdk-typescript/src/index.ts";
 
@@ -63,6 +65,12 @@ export interface RealHarnessReport {
   published: true;
   daemon_restarts: 1;
   sqlite_inode_preserved: true;
+  keepalive: {
+    spawned: true;
+    detached: true;
+    stopped_on_owner_exit: true;
+  };
+  suspended_and_woken: true;
   heartbeat_leases: number;
   events: number;
   event_reconnects: 1;
@@ -79,8 +87,22 @@ interface DoctorResult {
   sessions: number;
   workspaces: number;
   operations: number;
+  sessions_dormant: number;
+  sessions_suspended: number;
+  workspaces_suspended: number;
+  suspended_without_checkpoint: number;
   protocol: number;
   root: string;
+}
+
+/** The CLI's private keepalive pidfile, as written by `keepalive::registry`. */
+interface KeepaliveRecord {
+  v: number;
+  session: string;
+  lease: string;
+  keepalive_pid: number;
+  owner_pid: number;
+  owner_name: string;
 }
 
 interface GcResult {
@@ -303,6 +325,148 @@ export async function runRealSessionHarness(
     assert.equal(postRestartDoctor.sessions, CHAT_COUNT);
     await Promise.all(sessions.map((session) => session.context()));
 
+    // A twenty-first session, opened through the CLI, which is the case the
+    // SDK cannot cover: a command that exits leaves nothing behind to hold its
+    // lease. The production TTL is two minutes, so nothing here waits for
+    // dormancy -- the keepalive is proven by the heartbeats it sends on its
+    // own and by the pidfile disappearing the moment its owner dies.
+    let gcRounds = 0;
+    const keepaliveSession = `real-keepalive-${runId}`;
+    const owner = spawn("/bin/sleep", ["600"], { stdio: "ignore" });
+    const ownerPid = owner.pid;
+    assert.ok(typeof ownerPid === "number", "fake owner process has no pid");
+    const opened = await runShadeOperation<OpenedSessionPayload>(
+      shadeBin,
+      stateRoot,
+      socket,
+      client,
+      [
+        "--idempotency-key",
+        `open:${keepaliveSession}`,
+        "open",
+        repository,
+        "--session",
+        keepaliveSession,
+        "--base",
+        "main",
+        "--owner-pid",
+        String(ownerPid),
+        "--interval-secs",
+        "1",
+      ],
+    );
+    assert.equal(opened.session, keepaliveSession);
+    assert.equal(opened.keepalive?.state, "started");
+    assert.equal(opened.keepalive?.owner_pid, ownerPid);
+
+    const pidfile = join(
+      stateRoot,
+      "runtime",
+      "keepalive",
+      `${createHash("sha256").update(keepaliveSession).digest("hex")}.json`,
+    );
+    assert.equal((await lstat(pidfile)).mode & 0o777, 0o600);
+    const keepaliveRecord = JSON.parse(await readFile(pidfile, "utf8")) as KeepaliveRecord;
+    assert.equal(keepaliveRecord.session, keepaliveSession);
+    assert.equal(keepaliveRecord.lease, opened.lease);
+    assert.equal(keepaliveRecord.owner_pid, ownerPid);
+    assert.equal(keepaliveRecord.keepalive_pid, opened.keepalive?.pid);
+    // It is still running after the `shade open` that spawned it returned.
+    assert.equal(processIsAlive(keepaliveRecord.keepalive_pid), true);
+    await waitUntil(
+      () => received.filter(
+        (event) => event.event === "lease.heartbeat" && event.resource === opened.lease,
+      ).length >= 2,
+      15_000,
+      "the detached keepalive heartbeats without the harness asking it to",
+    );
+
+    owner.kill("SIGKILL");
+    assert.equal(await waitForExit(owner, 5_000), true);
+    await waitUntil(
+      async () => !(await pathExists(pidfile)),
+      5_000,
+      "the keepalive retires its pidfile when its owner exits",
+    );
+    await waitUntil(
+      () => !processIsAlive(keepaliveRecord.keepalive_pid),
+      5_000,
+      "the keepalive exits with the owner it was watching",
+    );
+
+    await writeFile(join(opened.cwd, "keepalive-only.txt"), "written before sleeping\n");
+    const slept = await runShadeOperation<SleepResult>(shadeBin, stateRoot, socket, client, [
+      "--idempotency-key",
+      `sleep:${keepaliveSession}`,
+      "sleep",
+      "--workspace",
+      opened.workspace,
+    ]);
+    assert.equal(slept.suspended, true);
+    assert.equal(slept.workspace, opened.workspace);
+    assert.ok(slept.reclaimed_bytes > 0, "sleeping a materialized tree reclaims disk");
+    assert.equal(await pathExists(opened.cwd), false, "sleep gives up the tree");
+    let suspendedDoctor = await runDoctor(shadeBin, stateRoot, socket);
+    assert.equal(suspendedDoctor.workspaces_suspended, 1);
+    assert.equal(suspendedDoctor.sessions_suspended, 1);
+    assert.equal(suspendedDoctor.suspended_without_checkpoint, 0);
+    assert.equal(suspendedDoctor.sessions, CHAT_COUNT);
+
+    const suspendedGc = await runGc(shadeBin, stateRoot, socket, client, `gc:${runId}:suspended`);
+    gcRounds += 1;
+    assert.equal(suspendedGc.deleted, 0, "a suspended workspace is never a collector candidate");
+    suspendedDoctor = await runDoctor(shadeBin, stateRoot, socket);
+    assert.equal(suspendedDoctor.workspaces_suspended, 1);
+
+    const woken = await runShadeOperation<OpenedSessionPayload>(
+      shadeBin,
+      stateRoot,
+      socket,
+      client,
+      [
+        "--idempotency-key",
+        `wake:${keepaliveSession}`,
+        "wake",
+        "--session",
+        keepaliveSession,
+        "--no-keepalive",
+      ],
+    );
+    assert.equal(woken.session, keepaliveSession);
+    assert.notEqual(woken.workspace, opened.workspace);
+    assert.notEqual(woken.cwd, opened.cwd);
+    assert.equal(await pathExists(woken.cwd), true);
+    assert.equal(
+      await readFile(join(woken.cwd, "keepalive-only.txt"), "utf8"),
+      "written before sleeping\n",
+      "a file Git never tracked survives the round trip",
+    );
+    assert.equal(await readFile(join(woken.cwd, "README.md"), "utf8"), "# real Shade harness\n");
+    assert.equal(
+      await readFile(join(woken.cwd, "node_modules", "shade-fixture", "index.js"), "utf8"),
+      "export const shadeFixture = true;\n",
+      "the dependency layer is rebuilt from its recorded fingerprint, not reinstalled",
+    );
+    const wokenDoctor = await runDoctor(shadeBin, stateRoot, socket);
+    assert.equal(wokenDoctor.workspaces_suspended, 0);
+    assert.equal(wokenDoctor.sessions, CHAT_COUNT + 1);
+
+    const releasedKeepalive = await runShadeOperation<{ released: boolean }>(
+      shadeBin,
+      stateRoot,
+      socket,
+      client,
+      [
+        "--idempotency-key",
+        `release:${keepaliveSession}`,
+        "release",
+        "--workspace",
+        woken.workspace,
+      ],
+    );
+    assert.equal(releasedKeepalive.released, true);
+    assert.equal((await runDoctor(shadeBin, stateRoot, socket)).sessions, CHAT_COUNT);
+
     const checkpointOutcomes = await Promise.all(
       sessions.map((session, index) =>
         session.checkpoint("real-harness", {
@@ -381,7 +545,6 @@ export async function runRealSessionHarness(
     assert.equal(doctor.sessions, 0);
     assert.equal((await databaseInventory(stateRoot)).active_leases, 0);
 
-    let gcRounds = 0;
     await runGc(shadeBin, stateRoot, socket, client, `gc:${runId}:initial`);
     gcRounds += 1;
     doctor = await runDoctor(shadeBin, stateRoot, socket);
@@ -477,6 +640,8 @@ export async function runRealSessionHarness(
       published: true,
       daemon_restarts: 1,
       sqlite_inode_preserved: true,
+      keepalive: { spawned: true, detached: true, stopped_on_owner_exit: true },
+      suspended_and_woken: true,
       heartbeat_leases: uniqueHeartbeatLeases(received),
       events: received.length,
       event_reconnects: 1,
@@ -626,15 +791,30 @@ export async function runGc(
   client: ShadeClient,
   idempotencyKey: string,
 ): Promise<GcResult> {
-  const envelope = await runShade(binary, root, socket, [
+  return await runShadeOperation<GcResult>(binary, root, socket, client, [
     "--idempotency-key",
     idempotencyKey,
     "gc",
   ]);
+}
+
+/**
+ * Run one CLI command that carries an operation, and return its completed
+ * result however the daemon chose to answer: inline, as an accepted handle, or
+ * as the exit-75 recovery envelope that still names the durable operation.
+ */
+async function runShadeOperation<T>(
+  binary: string,
+  root: string,
+  socket: string,
+  client: ShadeClient,
+  args: string[],
+): Promise<T> {
+  const envelope = await runShade(binary, root, socket, args);
   if (envelope.status === "error" && isObject(envelope.error)
     && envelope.error.code === "CLIENT_TIMEOUT" && typeof envelope.error.operation === "string") {
     return expectCompleted(
-      await client.operations.wait<GcResult>(envelope.error.operation, {
+      await client.operations.wait<T>(envelope.error.operation, {
         timeout_ms: COMMAND_TIMEOUT_MS,
       }),
     );
@@ -643,16 +823,14 @@ export async function runGc(
   if (outcome.state === "accepted") {
     const operationId = outcome.result.operation_id;
     if (typeof operationId !== "string") {
-      throw new Error("accepted GC has no operation_id");
+      throw new Error("accepted CLI operation has no operation_id");
     }
     return expectCompleted(
-      await client.operations.wait<GcResult>(operationId, {
-        timeout_ms: COMMAND_TIMEOUT_MS,
-      }),
+      await client.operations.wait<T>(operationId, { timeout_ms: COMMAND_TIMEOUT_MS }),
     );
   }
-  assert.equal(outcome.state, "completed", "GC returned a non-completed domain outcome");
-  return outcome.result as unknown as GcResult;
+  assert.equal(outcome.state, "completed", "CLI returned a non-completed domain outcome");
+  return outcome.result as unknown as T;
 }
 
 async function runShade(
@@ -951,6 +1129,16 @@ async function socketAcceptsConnections(path: string): Promise<boolean> {
     socket.once("connect", () => done(true));
     socket.once("error", () => done(false));
   });
+}
+
+/** Whether a pid still names a running process this user may signal. */
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
