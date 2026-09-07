@@ -1,6 +1,8 @@
+mod keepalive;
+
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use serde_json::json;
+use serde_json::{Value, json};
 use shade_client::{ClientError, ShadeClient};
 use shade_engine::Engine;
 use shade_engine::config::EngineConfig;
@@ -33,6 +35,18 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Open(OpenArgs),
+    /// Resume a session that went dormant, on the workspace it already owns.
+    Attach {
+        #[arg(long, env = "SHADE_SESSION")]
+        session: String,
+        #[command(flatten)]
+        keepalive: KeepaliveArgs,
+    },
+    /// The lifecycle of one session, answerable without a live lease.
+    Status {
+        #[arg(long, env = "SHADE_SESSION")]
+        session: String,
+    },
     Context(SelectorArgs),
     Heartbeat {
         #[arg(long, env = "SHADE_SESSION")]
@@ -99,8 +113,74 @@ enum Command {
     },
     Gc,
     Install(InstallArgs),
+    /// Private: the detached child that keeps a lease alive. Not part of the
+    /// machine contract, and never invoked by a host directly.
+    #[command(hide = true)]
+    Keepalive {
+        #[command(subcommand)]
+        command: KeepaliveCommand,
+    },
     #[command(hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum KeepaliveCommand {
+    Run(KeepaliveRunArgs),
+    Stop {
+        #[arg(long)]
+        session: String,
+    },
+    Status {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+/// Every field is passed explicitly by `keepalive::start`; none reads the
+/// environment, because the child deliberately does not inherit the caller's
+/// session identity.
+#[derive(Debug, Args)]
+struct KeepaliveRunArgs {
+    #[arg(long)]
+    session: String,
+    #[arg(long)]
+    lease: String,
+    #[arg(long)]
+    owner_pid: u32,
+    #[arg(long)]
+    owner_start_tvsec: u64,
+    #[arg(long)]
+    owner_start_tvusec: u64,
+    #[arg(long, default_value_t = keepalive::DEFAULT_INTERVAL_SECS)]
+    interval_secs: u64,
+}
+
+#[derive(Debug, Args, Clone, Default)]
+struct KeepaliveArgs {
+    /// Do not start a keepalive; the lease then expires on its own schedule.
+    #[arg(long, default_value_t = false)]
+    no_keepalive: bool,
+    /// The process whose exit ends the lease. Defaults to the nearest
+    /// recognised agent ancestor of this command.
+    #[arg(long)]
+    owner_pid: Option<u32>,
+    /// Additional process names to recognise as the owning agent. Repeatable.
+    #[arg(long = "owner-name")]
+    owner_name: Vec<String>,
+    #[arg(long, hide = true)]
+    interval_secs: Option<u64>,
+}
+
+impl KeepaliveArgs {
+    fn options(&self) -> keepalive::KeepaliveOptions {
+        keepalive::KeepaliveOptions {
+            disabled: self.no_keepalive,
+            owner_pid: self.owner_pid,
+            owner_names: self.owner_name.clone(),
+            interval_secs: self.interval_secs,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +267,8 @@ struct OpenArgs {
     base: Option<String>,
     #[arg(long)]
     intent: Option<String>,
+    #[command(flatten)]
+    keepalive: KeepaliveArgs,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -327,7 +409,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let config = EngineConfig::discover()?;
     let socket = cli.socket.unwrap_or_else(|| config.socket.clone());
-    let client = ShadeClient::cli(socket);
+    let client = ShadeClient::cli(socket.clone());
     let idempotency_key = cli
         .idempotency_key
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -336,19 +418,53 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let session_id = args
                 .session
                 .unwrap_or_else(|| format!("session_{}", ulid::Ulid::new()));
-            emit(
-                &client
-                    .execute_wait_idempotent(
-                        Intent::SessionOpen(OpenSession {
-                            session_id: SessionId(session_id),
-                            repository: locator(&args.repository, args.repository_id)?,
-                            base: args.base,
-                            intent: args.intent,
-                        }),
-                        idempotency_key,
-                    )
-                    .await?,
-            );
+            let response = client
+                .execute_wait_idempotent(
+                    Intent::SessionOpen(OpenSession {
+                        session_id: SessionId(session_id),
+                        repository: locator(&args.repository, args.repository_id)?,
+                        base: args.base,
+                        intent: args.intent,
+                    }),
+                    idempotency_key,
+                )
+                .await?;
+            // A CLI agent has no event loop, so the lease outlives the command
+            // only if something else holds it. The keepalive can never fail the
+            // open: every problem is reported inside the same response.
+            emit(&keepalive::annotate(
+                &config,
+                &socket,
+                &args.keepalive.options(),
+                response,
+            ));
+        }
+        Command::Attach {
+            session,
+            keepalive: options,
+        } => {
+            let response = client
+                .execute_wait_idempotent(
+                    Intent::SessionReattach {
+                        session_id: SessionId(session),
+                    },
+                    idempotency_key,
+                )
+                .await?;
+            emit(&keepalive::annotate(
+                &config,
+                &socket,
+                &options.options(),
+                response,
+            ));
+        }
+        Command::Status { session } => {
+            let response = client
+                .query(Query::Session {
+                    session_id: SessionId(session.clone()),
+                })
+                .await?;
+            emit(&with_local_keepalive(&config, &session, response));
         }
         Command::Context(selector) => emit(&client.context(selector.selector()?).await?),
         Command::Heartbeat { session, lease } => emit(
@@ -490,16 +606,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 )
                 .await?,
         ),
-        Command::Release(selector) => emit(
-            &client
+        Command::Release(selector) => {
+            let response = client
                 .execute_wait_idempotent(
                     Intent::WorkspaceRelease {
                         selector: selector.selector()?,
                     },
                     idempotency_key,
                 )
-                .await?,
-        ),
+                .await?;
+            // A released session has nothing left to keep alive. A
+            // `review_required` release has released nothing, and
+            // `stop_for_release` deliberately leaves its keepalive running.
+            keepalive::stop_for_release(&config, &response);
+            emit(&response);
+        }
         Command::Events {
             after,
             follow,
@@ -563,6 +684,32 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .execute_wait_idempotent(Intent::GarbageCollect, idempotency_key)
                 .await?,
         ),
+        Command::Keepalive { command } => match command {
+            KeepaliveCommand::Run(args) => {
+                // The one command that prints nothing: this child outlives the
+                // invocation that spawned it, and the contract of exactly one
+                // JSON value per invocation belongs to that parent.
+                let _ = keepalive::run(
+                    &config,
+                    &client,
+                    keepalive::RunArgs {
+                        session: args.session,
+                        lease: args.lease,
+                        owner_pid: args.owner_pid,
+                        owner_start_tvsec: args.owner_start_tvsec,
+                        owner_start_tvusec: args.owner_start_tvusec,
+                        interval_secs: args.interval_secs,
+                    },
+                )
+                .await;
+            }
+            KeepaliveCommand::Stop { session } => {
+                emit(&local_completed(keepalive::stop(&config, &session)))
+            }
+            KeepaliveCommand::Status { session } => {
+                emit(&local_completed(keepalive::status(&config, &session)))
+            }
+        },
         Command::Install(_) | Command::Daemon(_) => unreachable!(),
     }
     Ok(())
@@ -1072,13 +1219,31 @@ fn local_completed(value: serde_json::Value) -> WireResponse {
     }
 }
 
+/// `status` answers one question with two sources: the daemon owns the
+/// lifecycle, and the keepalive is client-side state the daemon cannot see.
+/// They are merged so the command still prints exactly one JSON value.
+fn with_local_keepalive(
+    config: &EngineConfig,
+    session: &str,
+    mut response: WireResponse,
+) -> WireResponse {
+    if let ResponseBody::Ok {
+        outcome: Outcome::Completed(ref mut value),
+    } = response.body
+        && let Value::Object(object) = value
+    {
+        object.insert("keepalive".into(), keepalive::status(config, session));
+    }
+    response
+}
+
 fn help_contract() -> serde_json::Value {
     json!({
         "name": "shade",
         "version": env!("CARGO_PKG_VERSION"),
         "commands": [
-            "open", "context", "heartbeat", "checkpoint", "fork", "sync", "restore",
-            "deps refresh", "publish", "resolve", "release", "events",
+            "open", "attach", "status", "context", "heartbeat", "checkpoint", "fork",
+            "sync", "restore", "deps refresh", "publish", "resolve", "release", "events",
             "warm", "review resolve", "doctor", "doctor --diagnostics <id>", "gc", "install"
         ]
     })
@@ -1558,6 +1723,20 @@ mod tests {
     fn parses_machine_contract_verbs() {
         let cases = [
             vec!["shade", "open", ".", "--session", "chat-1"],
+            vec![
+                "shade",
+                "open",
+                ".",
+                "--session",
+                "chat-1",
+                "--owner-pid",
+                "4242",
+                "--owner-name",
+                "zumith",
+                "--no-keepalive",
+            ],
+            vec!["shade", "attach", "--session", "chat-1"],
+            vec!["shade", "status", "--session", "chat-1"],
             vec!["shade", "context", "--workspace", "ws-1"],
             vec![
                 "shade",
@@ -1601,6 +1780,91 @@ mod tests {
         for arguments in cases {
             Cli::try_parse_from(arguments).unwrap();
         }
+    }
+
+    #[test]
+    fn the_machine_contract_lists_every_public_verb_and_hides_the_keepalive() {
+        let contract = help_contract();
+        let commands = contract["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        for verb in ["open", "attach", "status", "release"] {
+            assert!(commands.contains(&verb), "{verb} belongs to the contract");
+        }
+        assert!(
+            !commands.iter().any(|verb| verb.starts_with("keepalive")),
+            "the keepalive is a private child process, not a host verb"
+        );
+
+        // Hidden is not absent: the parent spawns itself with these arguments.
+        let parsed = Cli::try_parse_from([
+            "shade",
+            "keepalive",
+            "run",
+            "--session",
+            "chat-1",
+            "--lease",
+            "lease-1",
+            "--owner-pid",
+            "4242",
+            "--owner-start-tvsec",
+            "1",
+            "--owner-start-tvusec",
+            "2",
+            "--interval-secs",
+            "5",
+        ])
+        .unwrap();
+        let Command::Keepalive {
+            command: KeepaliveCommand::Run(args),
+        } = parsed.command
+        else {
+            panic!("expected a keepalive run command");
+        };
+        assert_eq!(args.owner_pid, 4242);
+        assert_eq!(args.interval_secs, 5);
+        Cli::try_parse_from(["shade", "keepalive", "stop", "--session", "chat-1"]).unwrap();
+        Cli::try_parse_from(["shade", "keepalive", "status", "--session", "chat-1"]).unwrap();
+
+        let help = Cli::try_parse_from(["shade", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(!help.contains("keepalive"));
+        assert!(help.contains("attach"));
+    }
+
+    #[test]
+    fn keepalive_flags_default_to_an_enabled_keepalive_with_a_detected_owner() {
+        let parsed = Cli::try_parse_from(["shade", "open", ".", "--session", "chat-1"]).unwrap();
+        let Command::Open(args) = parsed.command else {
+            panic!("expected an open command");
+        };
+        let options = args.keepalive.options();
+        assert!(!options.disabled);
+        assert_eq!(options.owner_pid, None);
+        assert!(options.owner_names.is_empty());
+        assert_eq!(options.interval_secs, None);
+
+        let parsed = Cli::try_parse_from([
+            "shade",
+            "open",
+            ".",
+            "--no-keepalive",
+            "--owner-name",
+            "zumith",
+            "--owner-name",
+            "orca",
+        ])
+        .unwrap();
+        let Command::Open(args) = parsed.command else {
+            panic!("expected an open command");
+        };
+        let options = args.keepalive.options();
+        assert!(options.disabled);
+        assert_eq!(options.owner_names, vec!["zumith", "orca"]);
     }
 
     #[test]
