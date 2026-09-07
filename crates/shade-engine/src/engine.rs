@@ -3968,7 +3968,8 @@ impl Engine {
             .cleanup_staging(&self.config.root)
             .map_err(dependency_error)?;
         removed += cleanup_directory_entries(&self.config.secrets_dir(), |name| {
-            name.starts_with('.') && name.ends_with(".staging")
+            name.starts_with('.')
+                && (name.ends_with(".staging") || name.ends_with(".suspend-staging"))
         })?;
         Ok(removed)
     }

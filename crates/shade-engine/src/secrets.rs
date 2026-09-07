@@ -141,6 +141,87 @@ impl SecretStore {
         Ok(paths)
     }
 
+    /// Vaults the private files of a workspace that is about to lose its tree.
+    ///
+    /// Unlike [`SecretStore::capture`], which keeps the first baseline it ever
+    /// saw, this replaces any previous vault: the agent may have edited
+    /// `.env.local` long after `open`, and sleep must preserve what is on disk
+    /// right now. The review baseline is deliberately untouched, so
+    /// `secret_cleanup_review` semantics are unchanged.
+    pub fn capture_suspension(
+        &self,
+        workspace_id: &WorkspaceId,
+        workspace: &Path,
+    ) -> Result<SecretManifest, SecretError> {
+        let workspace_root = self.workspace_root(workspace_id);
+        fs::create_dir_all(&workspace_root)?;
+        fs::set_permissions(&workspace_root, fs::Permissions::from_mode(0o700))?;
+
+        let staging = self
+            .root
+            .join(format!(".{}.suspend-staging", workspace_id.0));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        fs::create_dir(&staging)?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+
+        let mut files = Vec::new();
+        for relative in discover_secret_paths(workspace)? {
+            let source = secure_workspace_path(workspace, &relative, false)?;
+            let target = staging.join("files").join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            }
+            write_private(&target, &fs::read(source)?)?;
+            files.push(relative);
+        }
+        files.sort();
+        write_private(
+            &staging.join("manifest.json"),
+            &serde_json::to_vec(&BaselineManifest {
+                files: files.clone(),
+            })
+            .map_err(std::io::Error::other)?,
+        )?;
+
+        let destination = self.suspension_root(workspace_id);
+        if destination.exists() {
+            fs::remove_dir_all(&destination)?;
+        }
+        fs::rename(staging, destination)?;
+        Ok(SecretManifest {
+            workspace_id: workspace_id.clone(),
+            files,
+        })
+    }
+
+    /// Writes a suspension vault back into a freshly materialized tree.
+    ///
+    /// The suspended workspace has no tree left, so the wake path cannot use
+    /// [`SecretStore::copy_workspace_secrets`], which reads from the source
+    /// working copy.
+    pub fn restore_suspension(
+        &self,
+        source_workspace: &WorkspaceId,
+        destination: &Path,
+    ) -> Result<Vec<String>, SecretError> {
+        let vault = self.suspension_root(source_workspace);
+        if !vault.exists() {
+            return Ok(Vec::new());
+        }
+        let encoded = fs::read(vault.join("manifest.json"))?;
+        let manifest: BaselineManifest =
+            serde_json::from_slice(&encoded).map_err(std::io::Error::other)?;
+        for relative in &manifest.files {
+            let source = vault.join("files").join(relative);
+            let target = secure_workspace_path(destination, relative, true)?;
+            write_private(&target, &fs::read(source)?)?;
+        }
+        Ok(manifest.files)
+    }
+
     pub fn preview_current(
         &self,
         baseline_id: &WorkspaceId,
@@ -453,6 +534,10 @@ impl SecretStore {
 
     fn workspace_root(&self, workspace_id: &WorkspaceId) -> PathBuf {
         self.root.join(&workspace_id.0)
+    }
+
+    fn suspension_root(&self, workspace_id: &WorkspaceId) -> PathBuf {
+        self.workspace_root(workspace_id).join("suspended")
     }
 }
 
