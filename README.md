@@ -126,6 +126,7 @@ See [docs/STATUS.md](docs/STATUS.md) for the current acceptance evidence.
 - `packages/sdk-typescript`: the `@shade/sdk` TypeScript client.
 - `packages/session-harness`: deterministic 20-session integration harness.
 - `skills/shade-workspaces`: compact agent operating skill.
+- `skills/shade-migrate-worktree`: agent skill for converting one `git worktree` into a Shade workspace.
 
 ## Development
 
@@ -155,6 +156,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go through [SECURITY.md
 
 - [Product requirements](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Migrating existing worktrees](docs/MIGRATING.md)
 - [Protocol v1](docs/PROTOCOL.md)
 - [Security model](docs/SECURITY.md)
 - [Installation](docs/INSTALLATION.md)
