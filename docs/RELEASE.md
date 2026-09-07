@@ -130,8 +130,14 @@ handoff. `SHADE_CRASH_GROUP=resolved-publication` selects those cases.
 first kills an operation and then kills its recovering daemon, preserving the same
 SQLite inode through both restarts. The report records the seed point and actual
 kill count. A lease-expiry case uses a one-second harness lease and elapsed time;
-it never changes SQLite rows to manufacture expiry. These group filters are
-diagnostic acceptance scopes and do not replace the final complete matrix.
+it never changes SQLite rows to manufacture expiry. It then proves the opposite
+of collection: a garbage-collection round leaves the dormant workspace alone, and
+only an explicit release reaches it. `SHADE_CRASH_GROUP=lifecycle` selects the six
+suspension boundaries -- a sleep cut at each of its four commits and a wake at
+both of its two -- each of which either retries the sleep from an intact tree,
+finishes it from its checkpoint, or removes the orphan successor of an
+interrupted wake. These group filters are diagnostic acceptance scopes and do
+not replace the final complete matrix.
 Inspect the reported failure before retrying, then remove that exact diagnostic
 directory after the problem is resolved. Successful cases remove their fixtures.
 
