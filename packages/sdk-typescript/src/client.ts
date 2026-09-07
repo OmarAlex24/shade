@@ -27,6 +27,7 @@ import {
   type ReviewId,
   type ReviewResolutionResult,
   type SessionId,
+  type SessionStatus,
   type ScriptApproval,
   type ScriptDecisionResult,
   type TerminalOutcome,
@@ -46,6 +47,8 @@ export interface ShadeClientOptions {
   event_reconnect_ms?: number;
   heartbeat_interval_ms?: number;
   max_frame_bytes?: number;
+  /** Reattach a dormant session when its lease expires. Defaults to true. */
+  reattach_on_expiry?: boolean;
 }
 
 export interface CallOptions {
@@ -74,6 +77,9 @@ export interface PublishInput {
 
 export interface SessionsApi {
   open(input: OpenSessionInput, options?: MutationOptions): Promise<ShadeSession>;
+  /** Renews the lease of a dormant session and returns its live handle. */
+  reattach(session_id: SessionId, options?: MutationOptions): Promise<ShadeSession>;
+  status(session_id: SessionId, options?: CallOptions): Promise<SessionStatus>;
 }
 
 export interface OperationsApi {
@@ -115,7 +121,9 @@ interface SessionBridge {
   session(payload: OpenedSessionPayload): ShadeSession;
   retire(session: ShadeSession): void;
   heartbeat(session_id: SessionId, lease_id: LeaseId): Promise<HeartbeatResult>;
+  reattach(session_id: SessionId): Promise<ShadeSession>;
   heartbeat_interval_ms: number;
+  reattach_on_expiry: boolean;
 }
 
 export class ShadeClient {
@@ -128,6 +136,7 @@ export class ShadeClient {
   readonly operation_poll_ms: number;
   readonly event_reconnect_ms: number;
   readonly heartbeat_interval_ms: number;
+  readonly reattach_on_expiry: boolean;
 
   private readonly transport: NdjsonUnixTransport;
   private readonly sessionBridge: SessionBridge;
@@ -139,6 +148,7 @@ export class ShadeClient {
     this.operation_poll_ms = options.operation_poll_ms ?? 25;
     this.event_reconnect_ms = options.event_reconnect_ms ?? 100;
     this.heartbeat_interval_ms = options.heartbeat_interval_ms ?? 30_000;
+    this.reattach_on_expiry = options.reattach_on_expiry ?? true;
     if (!Number.isSafeInteger(this.heartbeat_interval_ms) || this.heartbeat_interval_ms <= 0) {
       throw new ShadeError({
         code: "CLIENT_INVALID_HEARTBEAT_INTERVAL",
@@ -160,12 +170,18 @@ export class ShadeClient {
       retire: (session: ShadeSession) => this.retireSession(session),
       heartbeat: (session_id: SessionId, lease_id: LeaseId) =>
         this.heartbeat(session_id, lease_id),
+      reattach: (session_id: SessionId) => this.reattachSession(session_id),
       heartbeat_interval_ms: this.heartbeat_interval_ms,
+      reattach_on_expiry: this.reattach_on_expiry,
     };
 
     this.sessions = Object.freeze({
       open: (input: OpenSessionInput, call?: MutationOptions) =>
         this.openSession(input, call),
+      reattach: (session_id: SessionId, call?: MutationOptions) =>
+        this.reattachSession(session_id, call),
+      status: (session_id: SessionId, call?: CallOptions) =>
+        this.sessionStatus(session_id, call),
     });
     this.operations = Object.freeze({
       get: <T = unknown>(id: OperationId, call?: CallOptions) =>
@@ -259,6 +275,30 @@ export class ShadeClient {
     return this.sessionBridge.session(payload);
   }
 
+  private async reattachSession(
+    session_id: SessionId,
+    options?: MutationOptions,
+  ): Promise<ShadeSession> {
+    const outcome = await this.executeAndWait<OpenedSessionPayload>(
+      { kind: "session_reattach", session_id },
+      this.deadline(options),
+      this.idempotencyKey(options),
+    );
+    return this.sessionBridge.session(
+      completed(outcome, "SESSION_REATTACH_INCOMPLETE"),
+    );
+  }
+
+  private async sessionStatus(
+    session_id: SessionId,
+    options?: CallOptions,
+  ): Promise<SessionStatus> {
+    return completed(
+      await this.queryAndWait<SessionStatus>({ kind: "session", session_id }, options),
+      "SESSION_STATUS_INCOMPLETE",
+    );
+  }
+
   private hydrateSession(payload: OpenedSessionPayload): ShadeSession {
     if (!isOpenedSessionPayload(payload)) {
       throw protocolError(
@@ -267,11 +307,9 @@ export class ShadeClient {
       );
     }
     const existing = this.liveSessions.get(payload.session);
-    if (
-      existing !== undefined &&
-      existing.workspace === payload.workspace &&
-      existing.lease === payload.lease
-    ) {
+    // A reattach hands back the same workspace under a fresh lease; the caller
+    // keeps the handle it already has and the new lease is adopted in place.
+    if (existing !== undefined && existing.workspace === payload.workspace) {
       existing[refreshHandle](payload);
       return existing;
     }
@@ -635,10 +673,10 @@ export class ShadeClient {
 export class ShadeSession {
   readonly session: SessionId;
   readonly workspace: WorkspaceId;
-  readonly lease: LeaseId;
   readonly cwd: string;
-  readonly env: Readonly<Record<string, string>>;
 
+  private leaseId: LeaseId;
+  private envValues: Readonly<Record<string, string>>;
   private compactContext: CompactContext;
   private readonly bridge: SessionBridge;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -650,11 +688,20 @@ export class ShadeSession {
     this.bridge = bridge;
     this.session = payload.session;
     this.workspace = payload.workspace;
-    this.lease = payload.lease;
     this.cwd = payload.cwd;
-    this.env = Object.freeze({ ...payload.env });
+    this.leaseId = payload.lease;
+    this.envValues = Object.freeze({ ...payload.env });
     this.compactContext = payload.compact_context;
     this.startHeartbeat();
+  }
+
+  /** Rotates when a dormant session is reattached; the handle stays the same. */
+  get lease(): LeaseId {
+    return this.leaseId;
+  }
+
+  get env(): Readonly<Record<string, string>> {
+    return this.envValues;
   }
 
   get compact_context(): CompactContext {
@@ -842,9 +889,10 @@ export class ShadeSession {
     if (this.retired || this.heartbeatInFlight) return;
     this.heartbeatInFlight = true;
     try {
-      await this.bridge.heartbeat(this.session, this.lease);
+      await this.bridge.heartbeat(this.session, this.leaseId);
     } catch (error) {
       const code = asShadeError(error).code;
+      if (code === "LEASE_EXPIRED" && (await this.reattachOnce())) return;
       if (
         code === "LEASE_EXPIRED" ||
         code === "LEASE_FENCED" ||
@@ -855,6 +903,21 @@ export class ShadeSession {
       }
     } finally {
       this.heartbeatInFlight = false;
+    }
+  }
+
+  /**
+   * A lease that expired means the session went dormant, not that it died: the
+   * workspace and its checkpoints are still there. Take one reattach attempt and
+   * carry on with the new lease; anything else retires the handle as before.
+   */
+  private async reattachOnce(): Promise<boolean> {
+    if (!this.bridge.reattach_on_expiry || this.retired) return false;
+    try {
+      await this.bridge.reattach(this.session);
+      return !this.retired;
+    } catch {
+      return false;
     }
   }
 
@@ -869,6 +932,8 @@ export class ShadeSession {
   }
 
   [refreshHandle](payload: OpenedSessionPayload): void {
+    this.leaseId = payload.lease;
+    this.envValues = Object.freeze({ ...payload.env });
     this.compactContext = payload.compact_context;
   }
 

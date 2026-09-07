@@ -4,10 +4,11 @@ use shade_protocol::{
     Actor, ActorKind, CheckpointId, CompactContext, ConflictOutcome, ExecuteRequest, Intent,
     LeaseId, ObjectId, OpenSession, OpenedSession, OperationId, Outcome, PROTOCOL_VERSION,
     PendingHandoff, Query, QueryRequest, ResponseBody, ReviewAction, ReviewId, ReviewRequired,
-    SessionId, ShadeError, WireRequest, WireResponse, WorkspaceId, WorkspaceSelector,
+    SessionId, SessionStatus, ShadeError, WireRequest, WireResponse, WorkspaceId,
+    WorkspaceSelector,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -85,6 +86,12 @@ pub struct ShadeClientOptions {
     pub operation_poll_interval: Duration,
     pub heartbeat_interval: Duration,
     pub max_response_frame_bytes: usize,
+    /// Recover a session whose lease expired instead of retiring the handle.
+    ///
+    /// A lease expiry means the workspace went dormant, not that the work is
+    /// gone, so the default is to reattach once and carry on. Turn it off to
+    /// have the handle retire on the first expiry, as it did before.
+    pub reattach_on_expiry: bool,
 }
 
 impl Default for ShadeClientOptions {
@@ -95,6 +102,7 @@ impl Default for ShadeClientOptions {
             operation_poll_interval: DEFAULT_OPERATION_POLL_INTERVAL,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             max_response_frame_bytes: DEFAULT_MAX_RESPONSE_FRAME_BYTES,
+            reattach_on_expiry: true,
         }
     }
 }
@@ -545,6 +553,13 @@ impl ShadeClient {
             .await?;
         completed_only(outcome, "lease heartbeat")
     }
+
+    async fn reattach_session(&self, session_id: SessionId) -> ClientResult<OpenedSession> {
+        let outcome = self
+            .execute_typed::<OpenedSession>(Intent::SessionReattach { session_id })
+            .await?;
+        completed_only(outcome, "session reattach")
+    }
 }
 
 #[derive(Debug)]
@@ -609,10 +624,27 @@ impl Sessions {
         let opened = completed_only(outcome, "session open")?;
         Ok(Session::new(self.client.clone(), opened))
     }
+
+    /// Resume a dormant session on the workspace it already owns, with the
+    /// same in-process heartbeat `open` starts.
+    pub async fn reattach(&self, session_id: SessionId) -> ClientResult<Session> {
+        let opened = self.client.reattach_session(session_id).await?;
+        Ok(Session::new(self.client.clone(), opened))
+    }
+
+    /// The lifecycle of a session, answerable without holding a lease on it.
+    pub async fn status(&self, session_id: SessionId) -> ClientResult<SessionStatus> {
+        let response = self.client.query(Query::Session { session_id }).await?;
+        completed_only(terminal(response)?, "session status")
+    }
 }
 
 struct SessionLifecycle {
     stop: watch::Sender<bool>,
+    /// The lease this session is currently renewing. It is not
+    /// `opened.lease`: a reattach rotates the lease under a handle the caller
+    /// already holds, and that handle must keep working.
+    lease: Mutex<LeaseId>,
 }
 
 impl SessionLifecycle {
@@ -622,6 +654,14 @@ impl SessionLifecycle {
 
     fn is_active(&self) -> bool {
         !*self.stop.borrow()
+    }
+
+    fn lease(&self) -> LeaseId {
+        self.lease.lock().expect("lease mutex poisoned").clone()
+    }
+
+    fn adopt(&self, lease: LeaseId) {
+        *self.lease.lock().expect("lease mutex poisoned") = lease;
     }
 }
 
@@ -653,7 +693,10 @@ impl Session {
         let (stop, stop_receiver) = watch::channel(false);
         let session = Self {
             client: client.clone(),
-            lifecycle: Arc::new(SessionLifecycle { stop }),
+            lifecycle: Arc::new(SessionLifecycle {
+                stop,
+                lease: Mutex::new(opened.lease.clone()),
+            }),
             session_id: opened.session.clone(),
             selector: WorkspaceSelector {
                 workspace_id: Some(opened.workspace.clone()),
@@ -667,9 +710,10 @@ impl Session {
 
     fn spawn_heartbeat(&self, client: ShadeClient, mut stop: watch::Receiver<bool>) {
         let session_id = self.session_id.clone();
-        let lease_id = self.opened.lease.clone();
+        let mut lease_id = self.opened.lease.clone();
         let lifecycle = Arc::downgrade(&self.lifecycle);
         let heartbeat_interval = client.options.heartbeat_interval;
+        let reattach_on_expiry = client.options.reattach_on_expiry;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
@@ -689,6 +733,30 @@ impl Session {
                     .await
                 {
                     Ok(_) => {}
+                    // An expiry means the workspace went dormant, which is
+                    // recoverable; every other terminal lease error means this
+                    // handle is genuinely finished. One attempt, never a retry
+                    // loop: if the reattach itself fails the session retires.
+                    Err(ClientError::Domain(error))
+                        if reattach_on_expiry && error.code == "LEASE_EXPIRED" =>
+                    {
+                        match client.reattach_session(session_id.clone()).await {
+                            Ok(opened) => {
+                                lease_id = opened.lease.clone();
+                                if let Some(lifecycle) = lifecycle.upgrade() {
+                                    lifecycle.adopt(opened.lease);
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(lifecycle) = lifecycle.upgrade() {
+                                    lifecycle.retire();
+                                }
+                                break;
+                            }
+                        }
+                    }
                     Err(ClientError::Domain(error)) if terminal_lease_error(&error.code) => {
                         if let Some(lifecycle) = lifecycle.upgrade() {
                             lifecycle.retire();
@@ -703,6 +771,12 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.lifecycle.is_active()
+    }
+
+    /// The lease currently held. `opened.lease` records the lease this handle
+    /// was created with; a reattach replaces it, and this follows.
+    pub fn lease(&self) -> LeaseId {
+        self.lifecycle.lease()
     }
 
     /// Stop automatic heartbeats for this handle and every clone.
@@ -867,7 +941,7 @@ impl Session {
     pub async fn heartbeat(&self) -> ClientResult<HeartbeatResult> {
         self.require_active()?;
         self.client
-            .heartbeat_lease(self.session_id.clone(), self.opened.lease.clone())
+            .heartbeat_lease(self.session_id.clone(), self.lease())
             .await
     }
 
@@ -1566,6 +1640,204 @@ mod tests {
         let after_drop = heartbeats.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(35)).await;
         assert_eq!(heartbeats.load(Ordering::SeqCst), after_drop);
+        server.abort();
+    }
+
+    /// An expired lease is a dormancy, not an ending: the handle must survive
+    /// it, adopt the new lease and keep heartbeating.
+    #[tokio::test]
+    async fn an_expired_lease_is_reattached_once_and_the_handle_keeps_its_new_lease() {
+        let Some((temp, listener)) = test_listener() else {
+            return;
+        };
+        let socket = temp.path().join("shade.sock");
+        let leases = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reattachments = Arc::new(AtomicUsize::new(0));
+        let observed = leases.clone();
+        let counted = reattachments.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let observed = observed.clone();
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut frame = Vec::new();
+                    if reader.read_until(b'\n', &mut frame).await.is_err() {
+                        return;
+                    }
+                    let Some(newline) = frame.iter().position(|byte| *byte == b'\n') else {
+                        return;
+                    };
+                    let request: WireRequest = serde_json::from_slice(&frame[..newline]).unwrap();
+                    let request_id = wire_request_id(&request).to_owned();
+                    let body = match request {
+                        WireRequest::Execute(ExecuteRequest {
+                            intent: Intent::LeaseHeartbeat { lease_id, .. },
+                            ..
+                        }) => {
+                            observed.lock().unwrap().push(lease_id.0.clone());
+                            if lease_id.0 == "lease-first" {
+                                ResponseBody::Error {
+                                    error: ShadeError {
+                                        code: "LEASE_EXPIRED".into(),
+                                        retry: "never".into(),
+                                        operation: None,
+                                        next: None,
+                                        diagnostics_id: None,
+                                    },
+                                }
+                            } else {
+                                ResponseBody::Ok {
+                                    outcome: Outcome::Completed(
+                                        json!({"lease": lease_id, "expires_at_ms": 1}),
+                                    ),
+                                }
+                            }
+                        }
+                        WireRequest::Execute(ExecuteRequest {
+                            intent: Intent::SessionReattach { session_id },
+                            ..
+                        }) => {
+                            assert_eq!(session_id.0, "session-test");
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            ResponseBody::Ok {
+                                outcome: Outcome::Completed(
+                                    serde_json::to_value(opened("lease-second")).unwrap(),
+                                ),
+                            }
+                        }
+                        _ => return,
+                    };
+                    let mut encoded = serde_json::to_vec(&WireResponse {
+                        v: PROTOCOL_VERSION,
+                        request_id,
+                        body,
+                    })
+                    .unwrap();
+                    encoded.push(b'\n');
+                    let _ = writer.write_all(&encoded).await;
+                });
+            }
+        });
+        let client = ShadeClient::with_options(
+            &socket,
+            Actor {
+                kind: ActorKind::Agent,
+                id: "reattach-test".into(),
+            },
+            ShadeClientOptions {
+                request_timeout: Duration::from_millis(200),
+                operation_timeout: Duration::from_millis(200),
+                heartbeat_interval: Duration::from_millis(10),
+                ..ShadeClientOptions::default()
+            },
+        )
+        .unwrap();
+        let session = Session::new(client, opened("lease-first"));
+        for _ in 0..200 {
+            if session.lease().0 == "lease-second" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(session.is_active(), "a dormancy must not retire the handle");
+        assert_eq!(session.lease().0, "lease-second");
+        assert_eq!(
+            session.opened.lease.0, "lease-first",
+            "`opened` still records the lease the handle was created with"
+        );
+        assert_eq!(reattachments.load(Ordering::SeqCst), 1);
+        let renewed = leases
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|lease| *lease == "lease-second")
+            .count();
+        assert!(renewed >= 1, "the new lease must be the one being renewed");
+        session.retire();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reattach_can_be_turned_off_and_the_handle_retires_on_expiry() {
+        let Some((temp, listener)) = test_listener() else {
+            return;
+        };
+        let socket = temp.path().join("shade.sock");
+        let reattachments = Arc::new(AtomicUsize::new(0));
+        let counted = reattachments.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut frame = Vec::new();
+                    if reader.read_until(b'\n', &mut frame).await.is_err() {
+                        return;
+                    }
+                    let Some(newline) = frame.iter().position(|byte| *byte == b'\n') else {
+                        return;
+                    };
+                    let request: WireRequest = serde_json::from_slice(&frame[..newline]).unwrap();
+                    let request_id = wire_request_id(&request).to_owned();
+                    if let WireRequest::Execute(ExecuteRequest {
+                        intent: Intent::SessionReattach { .. },
+                        ..
+                    }) = request
+                    {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let mut encoded = serde_json::to_vec(&WireResponse {
+                        v: PROTOCOL_VERSION,
+                        request_id,
+                        body: ResponseBody::Error {
+                            error: ShadeError {
+                                code: "LEASE_EXPIRED".into(),
+                                retry: "never".into(),
+                                operation: None,
+                                next: None,
+                                diagnostics_id: None,
+                            },
+                        },
+                    })
+                    .unwrap();
+                    encoded.push(b'\n');
+                    let _ = writer.write_all(&encoded).await;
+                });
+            }
+        });
+        let client = ShadeClient::with_options(
+            &socket,
+            Actor {
+                kind: ActorKind::Agent,
+                id: "no-reattach-test".into(),
+            },
+            ShadeClientOptions {
+                request_timeout: Duration::from_millis(200),
+                operation_timeout: Duration::from_millis(200),
+                heartbeat_interval: Duration::from_millis(10),
+                reattach_on_expiry: false,
+                ..ShadeClientOptions::default()
+            },
+        )
+        .unwrap();
+        let session = Session::new(client, opened("lease-first"));
+        for _ in 0..200 {
+            if !session.is_active() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!session.is_active());
+        assert_eq!(reattachments.load(Ordering::SeqCst), 0);
         server.abort();
     }
 

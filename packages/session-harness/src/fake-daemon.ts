@@ -24,6 +24,7 @@ import {
   type PendingHandoffPayload,
   type Query,
   type ReviewAction,
+  type SessionStatus,
   type ReviewId,
   type ShadeErrorBody,
   type WireRequest,
@@ -104,6 +105,16 @@ export class FakeShadeDaemon {
     );
     this.socket = join(this.root, "d.sock");
     this.lease_ttl_ms = leaseTtlMs;
+  }
+
+  /**
+   * Expires a lease on demand so a test can reach dormancy without waiting out
+   * a TTL. The session survives: only its lease is gone.
+   */
+  expire(session_id: string): void {
+    const session = this.sessions.get(session_id);
+    if (session === undefined) throw new Error(`no session ${session_id}`);
+    session.expires_at_ms = 0;
   }
 
   get active_leases(): number {
@@ -264,6 +275,35 @@ export class FakeShadeDaemon {
         }
         const opened = this.createSession(intent.session_id, intent.base);
         this.emit("session_opened", opened.workspace, {
+          session: opened.session,
+          lease: opened.lease,
+        });
+        this.completeOperation(
+          socket,
+          requestId,
+          { state: "completed", result: opened },
+          intent.kind,
+          idempotencyKey,
+          actor.id,
+        );
+        return;
+      }
+      case "session_reattach": {
+        const session = this.sessions.get(intent.session_id);
+        if (session === undefined) {
+          throw new FakeRequestError({
+            code: "SESSION_NOT_FOUND",
+            retry: "never",
+          });
+        }
+        if (session.released) {
+          throw new FakeRequestError({
+            code: "SESSION_ALREADY_RELEASED",
+            retry: "never",
+          });
+        }
+        const opened = this.renewLease(session);
+        this.emit("session_reattached", opened.workspace, {
           session: opened.session,
           lease: opened.lease,
         });
@@ -597,8 +637,9 @@ export class FakeShadeDaemon {
         if (session.opened.lease !== intent.lease_id) {
           throw new FakeRequestError({ code: "LEASE_FENCED", retry: "never" });
         }
+        // An expired lease leaves the session dormant, not released: the
+        // workspace survives and a `session_reattach` brings it back.
         if (session.expires_at_ms < Date.now()) {
-          session.released = true;
           throw new FakeRequestError({ code: "LEASE_EXPIRED", retry: "never" });
         }
         session.expires_at_ms = Date.now() + this.lease_ttl_ms;
@@ -716,6 +757,20 @@ export class FakeShadeDaemon {
         });
         return;
       }
+      case "session": {
+        const session = this.sessions.get(query.session_id);
+        if (session === undefined) {
+          throw new FakeRequestError({
+            code: "SESSION_NOT_FOUND",
+            retry: "never",
+          });
+        }
+        this.respond(socket, requestId, {
+          state: "completed",
+          result: this.describeSession(session),
+        });
+        return;
+      }
       case "doctor":
         this.respond(socket, requestId, {
           state: "completed",
@@ -736,6 +791,40 @@ export class FakeShadeDaemon {
       secret_review: false,
     });
     return opened;
+  }
+
+  /**
+   * A reattach keeps the workspace and its cwd and hands back a fresh lease,
+   * exactly as the engine's `reattach_session` transaction does.
+   */
+  private renewLease(session: FakeSession): OpenedSessionPayload {
+    const lease = this.next("lease", ++this.lease_sequence);
+    const opened: OpenedSessionPayload = {
+      ...session.opened,
+      lease,
+      env: { ...session.opened.env, SHADE_LEASE: lease },
+      compact_context: { ...session.opened.compact_context, lifecycle: "active" },
+    };
+    session.opened = opened;
+    session.expires_at_ms = Date.now() + this.lease_ttl_ms;
+    return opened;
+  }
+
+  private describeSession(session: FakeSession): SessionStatus {
+    const live = !session.released && session.expires_at_ms >= Date.now();
+    return {
+      session: session.opened.session,
+      lifecycle: session.released ? "released" : live ? "active" : "dormant",
+      workspace: session.opened.workspace,
+      ...(live
+        ? {
+            lease: session.opened.lease,
+            lease_expires_at_ms: session.expires_at_ms,
+          }
+        : {}),
+      cwd: session.opened.cwd,
+      materialized: existsSync(session.opened.cwd),
+    };
   }
 
   private buildSession(

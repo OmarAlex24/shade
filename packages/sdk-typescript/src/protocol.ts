@@ -96,6 +96,7 @@ export type Intent =
     }
   | { kind: "resolution_complete"; selector: WorkspaceSelector }
   | { kind: "workspace_release"; selector: WorkspaceSelector }
+  | { kind: "session_reattach"; session_id: SessionId }
   | { kind: "review_resolve"; review_id: ReviewId; action: ReviewAction }
   | { kind: "successor_adopt"; handoff_id: HandoffId }
   | { kind: "garbage_collect" }
@@ -113,6 +114,7 @@ export type Query =
       idempotency_key: string;
     }
   | { kind: "events"; after_cursor: number; limit: number }
+  | { kind: "session"; session_id: SessionId }
   | { kind: "doctor" }
   | { kind: "diagnostics"; diagnostics_id: string };
 
@@ -147,8 +149,40 @@ export interface CompactContext {
   head_sha: ObjectId;
   remote_sha?: ObjectId;
   changes: CompactChanges;
+  /** `live | expired | released`, kept for compatibility with v1 callers. */
   lease: string;
+  /**
+   * `active | dormant | suspended | released`. Absent means `active`: the
+   * daemon elides the healthy case to stay inside the response budget.
+   */
+  lifecycle?: Lifecycle;
   dependencies: DependencyContext;
+}
+
+export type Lifecycle = "active" | "dormant" | "suspended" | "released";
+
+/** The lifecycle of a session, answerable without holding a lease on it. */
+export interface SessionStatus {
+  session: SessionId;
+  lifecycle: Lifecycle;
+  workspace: WorkspaceId;
+  lease?: LeaseId;
+  lease_expires_at_ms?: number;
+  /** Absent when the workspace holds no materialized tree. */
+  cwd?: string;
+  materialized: boolean;
+}
+
+/**
+ * Reported by the CLI for the detached child it spawned. The daemon never
+ * populates this: an SDK host heartbeats in-process and needs no keepalive.
+ */
+export interface KeepaliveStatus {
+  state: "started" | "skipped" | "failed" | "stopped";
+  pid?: number;
+  owner_pid?: number;
+  owner?: string;
+  reason?: string;
 }
 
 export interface OpenedSessionPayload {
@@ -158,6 +192,7 @@ export interface OpenedSessionPayload {
   cwd: string;
   env: Record<string, string>;
   compact_context: CompactContext;
+  keepalive?: KeepaliveStatus;
 }
 
 export interface PendingHandoffPayload {
