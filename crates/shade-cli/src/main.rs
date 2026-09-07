@@ -458,12 +458,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // A CLI agent has no event loop, so the lease outlives the command
             // only if something else holds it. The keepalive can never fail the
             // open: every problem is reported inside the same response.
-            emit(&keepalive::annotate(
-                &config,
-                &socket,
-                &args.keepalive.options(),
-                response,
-            ));
+            emit(&keepalive::annotate(&config, &socket, &args.keepalive.options(), response).await);
         }
         Command::Attach {
             session,
@@ -477,12 +472,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     idempotency_key,
                 )
                 .await?;
-            emit(&keepalive::annotate(
-                &config,
-                &socket,
-                &options.options(),
-                response,
-            ));
+            emit(&keepalive::annotate(&config, &socket, &options.options(), response).await);
         }
         Command::Sleep(selector) => {
             let response = client
@@ -496,7 +486,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // A suspended session has no lease to keep alive, and the
             // keepalive would exit on its own the next time it asked. Stopping
             // it here makes `sleep` reclaim the process too, not just the disk.
-            keepalive::stop_for_sleep(&config, &response);
+            keepalive::stop_for_sleep(&config, &response).await;
             emit(&response);
         }
         Command::Wake {
@@ -511,12 +501,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     idempotency_key,
                 )
                 .await?;
-            emit(&keepalive::annotate(
-                &config,
-                &socket,
-                &options.options(),
-                response,
-            ));
+            emit(&keepalive::annotate(&config, &socket, &options.options(), response).await);
         }
         Command::Status { session } => {
             let response = client
@@ -678,7 +663,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // A released session has nothing left to keep alive. A
             // `review_required` release has released nothing, and
             // `stop_for_release` deliberately leaves its keepalive running.
-            keepalive::stop_for_release(&config, &response);
+            keepalive::stop_for_release(&config, &response).await;
             emit(&response);
         }
         Command::Events {
@@ -732,7 +717,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     idempotency_key,
                 )
                 .await?;
-            keepalive::stop_for_review(&config, &response);
+            keepalive::stop_for_review(&config, &response).await;
             emit(&response);
         }
         Command::Doctor { diagnostics: None } => emit(&client.query(Query::Doctor).await?),
@@ -764,7 +749,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await;
             }
             KeepaliveCommand::Stop { session } => {
-                emit(&local_completed(keepalive::stop(&config, &session)))
+                emit(&local_completed(keepalive::stop(&config, &session).await))
             }
             KeepaliveCommand::Status { session } => {
                 emit(&local_completed(keepalive::status(&config, &session)))

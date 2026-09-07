@@ -65,7 +65,7 @@ pub struct RunArgs {
 /// This can never fail an `open`: every problem is reported inside the
 /// returned status and the session keeps working exactly as it does today,
 /// because a session without a keepalive merely goes dormant.
-pub fn start(
+pub async fn start(
     config: &EngineConfig,
     socket: &Path,
     session: &str,
@@ -90,7 +90,7 @@ pub fn start(
     };
     // Exactly one keepalive may observe a session; replace any predecessor
     // before spawning so two children never heartbeat the same lease.
-    let _ = stop_registered(config, session);
+    let _ = stop_registered(config, session).await;
     match spawn(
         config,
         socket,
@@ -110,8 +110,8 @@ pub fn start(
     }
 }
 
-pub fn stop(config: &EngineConfig, session: &str) -> Value {
-    match stop_registered(config, session) {
+pub async fn stop(config: &EngineConfig, session: &str) -> Value {
+    match stop_registered(config, session).await {
         Some(pid) => json!({"session": session, "stopped": true, "pid": pid}),
         None => json!({"session": session, "stopped": false, "reason": "not_running"}),
     }
@@ -134,7 +134,7 @@ pub fn status(config: &EngineConfig, session: &str) -> Value {
 
 /// Attach a keepalive to a completed `open`/`attach` response and report the
 /// outcome inside that same response.
-pub fn annotate(
+pub async fn annotate(
     config: &EngineConfig,
     socket: &Path,
     options: &KeepaliveOptions,
@@ -149,7 +149,7 @@ pub fn annotate(
     let Ok(opened) = serde_json::from_value::<OpenedSession>(value.clone()) else {
         return response;
     };
-    let status = start(config, socket, &opened.session.0, &opened.lease.0, options);
+    let status = start(config, socket, &opened.session.0, &opened.lease.0, options).await;
     if let Value::Object(object) = value
         && let Ok(encoded) = serde_json::to_value(status)
     {
@@ -160,15 +160,15 @@ pub fn annotate(
 
 /// Stop the keepalive belonging to a completed `release` outcome. A
 /// `review_required` release has not released anything, so it keeps its lease.
-pub fn stop_for_release(config: &EngineConfig, response: &WireResponse) {
-    stop_for_completed(config, response, "released");
+pub async fn stop_for_release(config: &EngineConfig, response: &WireResponse) {
+    stop_for_completed(config, response, "released").await;
 }
 
 /// Stop the keepalive belonging to a completed `sleep`. The child would exit
 /// by itself the next time it asked after the session, but leaving it running
 /// would make `sleep` reclaim only the disk and not the process.
-pub fn stop_for_sleep(config: &EngineConfig, response: &WireResponse) {
-    stop_for_completed(config, response, "suspended");
+pub async fn stop_for_sleep(config: &EngineConfig, response: &WireResponse) {
+    stop_for_completed(config, response, "suspended").await;
 }
 
 /// Stop the keepalive belonging to a resolved secret review. Keep and discard
@@ -176,7 +176,7 @@ pub fn stop_for_sleep(config: &EngineConfig, response: &WireResponse) {
 /// a human, `released` does not, and neither leaves a lease to renew -- so both
 /// end the child. A merge does not: it hands off to a successor the session
 /// keeps living in.
-pub fn stop_for_review(config: &EngineConfig, response: &WireResponse) {
+pub async fn stop_for_review(config: &EngineConfig, response: &WireResponse) {
     let ResponseBody::Ok {
         outcome: Outcome::Completed(ref value),
     } = response.body
@@ -190,11 +190,11 @@ pub fn stop_for_review(config: &EngineConfig, response: &WireResponse) {
         return;
     }
     if let Some(session) = value.get("session").and_then(Value::as_str) {
-        let _ = stop_registered(config, session);
+        let _ = stop_registered(config, session).await;
     }
 }
 
-fn stop_for_completed(config: &EngineConfig, response: &WireResponse, flag: &str) {
+async fn stop_for_completed(config: &EngineConfig, response: &WireResponse, flag: &str) {
     let ResponseBody::Ok {
         outcome: Outcome::Completed(ref value),
     } = response.body
@@ -205,7 +205,7 @@ fn stop_for_completed(config: &EngineConfig, response: &WireResponse, flag: &str
         return;
     }
     if let Some(session) = value.get("session").and_then(Value::as_str) {
-        let _ = stop_registered(config, session);
+        let _ = stop_registered(config, session).await;
     }
 }
 
@@ -364,7 +364,13 @@ pub async fn run(config: &EngineConfig, client: &ShadeClient, args: RunArgs) -> 
 ///
 /// Async because it runs on the child's runtime, before the heartbeat loop
 /// starts: a `std::thread::sleep` here parks the whole reactor, and the child
-/// has a signal handler and a socket client on it.
+/// has a socket client and a `spawn_blocking` owner watch on it.
+///
+/// The child installs no signal handler: `SIGTERM` kills it at its default
+/// disposition, which is the prompt exit `stop_registered` is asking for, and
+/// the pidfile is removed by the parent once it has watched the process go.
+/// A handler would only add a way for the child to be mid-something when the
+/// stop arrives.
 async fn await_pidfile(config: &EngineConfig, session: &str) -> Option<registry::KeepaliveRecord> {
     let deadline = Instant::now() + PIDFILE_WAIT;
     loop {
@@ -488,7 +494,12 @@ fn spawn(
 
 /// A missing or stale pidfile is a success: the keepalive exits on its own
 /// when the session reports `released` or `suspended`.
-fn stop_registered(config: &EngineConfig, session: &str) -> Option<u32> {
+/// Async because every caller is: `shade open`, `shade release` and `shade
+/// sleep` all run inside the CLI's current-thread runtime, and the two waits
+/// below can take the whole `STOP_GRACE` twice over. A `std::thread::sleep`
+/// there parks the reactor, which is the same socket the command is about to
+/// answer on.
+async fn stop_registered(config: &EngineConfig, session: &str) -> Option<u32> {
     let record = registry::read(config, session)?;
     if !registry::is_live(&record) {
         let _ = registry::remove(config, session);
@@ -502,14 +513,14 @@ fn stop_registered(config: &EngineConfig, session: &str) -> Option<u32> {
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let deadline = Instant::now() + STOP_GRACE;
     while Instant::now() < deadline && registry::is_live(&record) {
-        std::thread::sleep(STOP_POLL);
+        tokio::time::sleep(STOP_POLL).await;
     }
     if registry::is_live(&record) {
         // SAFETY: as above; the identity check still holds.
         unsafe { libc::kill(pid, libc::SIGKILL) };
         let deadline = Instant::now() + STOP_GRACE;
         while Instant::now() < deadline && registry::is_live(&record) {
-            std::thread::sleep(STOP_POLL);
+            tokio::time::sleep(STOP_POLL).await;
         }
     }
     let _ = registry::remove(config, session);
@@ -648,8 +659,8 @@ mod tests {
         assert_eq!(clamp_interval(10_000), MAX_INTERVAL_SECS);
     }
 
-    #[test]
-    fn an_explicit_opt_out_reports_a_skipped_keepalive_and_never_spawns() {
+    #[tokio::test]
+    async fn an_explicit_opt_out_reports_a_skipped_keepalive_and_never_spawns() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
         let options = KeepaliveOptions {
@@ -662,15 +673,16 @@ mod tests {
             "session-1",
             "lease-1",
             &options,
-        );
+        )
+        .await;
         assert_eq!(status.state, "skipped");
         assert_eq!(status.reason.as_deref(), Some("disabled"));
         assert!(status.pid.is_none());
         assert!(registry::read(&config, "session-1").is_none());
     }
 
-    #[test]
-    fn an_absent_owner_pid_is_reported_without_failing_the_command() {
+    #[tokio::test]
+    async fn an_absent_owner_pid_is_reported_without_failing_the_command() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
         let options = KeepaliveOptions {
@@ -683,23 +695,24 @@ mod tests {
             "session-2",
             "lease-2",
             &options,
-        );
+        )
+        .await;
         assert_eq!(status.state, "skipped");
         assert_eq!(status.reason.as_deref(), Some("owner_not_found"));
     }
 
-    #[test]
-    fn stopping_an_unknown_session_is_a_success() {
+    #[tokio::test]
+    async fn stopping_an_unknown_session_is_a_success() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
-        let stopped = stop(&config, "never-started");
+        let stopped = stop(&config, "never-started").await;
         assert_eq!(stopped["stopped"], false);
         assert_eq!(stopped["reason"], "not_running");
         assert_eq!(status(&config, "never-started")["running"], false);
     }
 
-    #[test]
-    fn a_non_completed_response_is_returned_untouched() {
+    #[tokio::test]
+    async fn a_non_completed_response_is_returned_untouched() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
         let response = WireResponse {
@@ -720,12 +733,13 @@ mod tests {
             &temporary.path().join("s.sock"),
             &KeepaliveOptions::default(),
             response,
-        );
+        )
+        .await;
         assert!(matches!(annotated.body, ResponseBody::Error { .. }));
     }
 
-    #[test]
-    fn a_disabled_keepalive_still_annotates_the_opened_session() {
+    #[tokio::test]
+    async fn a_disabled_keepalive_still_annotates_the_opened_session() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
         let opened = json!({
@@ -754,7 +768,8 @@ mod tests {
                 ..KeepaliveOptions::default()
             },
             completed(opened),
-        );
+        )
+        .await;
         let ResponseBody::Ok {
             outcome: Outcome::Completed(value),
         } = annotated.body
@@ -764,17 +779,18 @@ mod tests {
         assert_eq!(value["keepalive"]["state"], "skipped");
     }
 
-    #[test]
-    fn a_release_review_keeps_its_keepalive() {
+    #[tokio::test]
+    async fn a_release_review_keeps_its_keepalive() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
         // No pidfile exists, so this only asserts the guards do not panic and
         // that a non-released result is ignored.
-        stop_for_release(&config, &completed(json!({"session": "s1"})));
+        stop_for_release(&config, &completed(json!({"session": "s1"}))).await;
         stop_for_release(
             &config,
             &completed(json!({"session": "s1", "released": true})),
-        );
+        )
+        .await;
     }
 
     /// A stale pidfile is the observable half of a stop: `stop_registered`
@@ -805,8 +821,8 @@ mod tests {
     /// Keep and discard both release the reviewed workspace's session, so both
     /// have to end its keepalive. Only `release` was wired, which left a child
     /// heartbeating a lease nothing held until its owner exited.
-    #[test]
-    fn keep_and_discard_stop_the_keepalive_and_merge_does_not() {
+    #[tokio::test]
+    async fn keep_and_discard_stop_the_keepalive_and_merge_does_not() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
 
@@ -819,7 +835,8 @@ mod tests {
                     "resolution": resolution,
                     "session": "s1",
                 })),
-            );
+            )
+            .await;
             assert!(
                 registry::read(&config, "s1").is_none(),
                 "{resolution} closes the session, so it closes the keepalive"
@@ -838,7 +855,8 @@ mod tests {
                 "predecessor": "ws_1",
                 "successor": "ws_2",
             })),
-        );
+        )
+        .await;
         assert!(registry::read(&config, "s1").is_some());
 
         // And a resolution the engine could not attribute to a session leaves
@@ -850,8 +868,75 @@ mod tests {
                 "resolution": "kept",
                 "session": Value::Null,
             })),
-        );
+        )
+        .await;
         assert!(registry::read(&config, "s1").is_some());
+    }
+
+    /// Stopping a keepalive that will not go quietly must not park the
+    /// runtime it is stopping from. `shade release` and `shade sleep` both
+    /// call this from inside the CLI's current-thread runtime, and both wait
+    /// up to `STOP_GRACE` twice: with a blocking sleep in the loop, nothing
+    /// else on that runtime -- the daemon connection the command still has to
+    /// answer on -- runs for the whole of it.
+    #[tokio::test]
+    async fn stopping_a_stubborn_keepalive_leaves_the_runtime_running() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EngineConfig::at(temporary.path());
+        // Ignores SIGTERM, so the stop spends its whole grace before the kill.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = owner::identity(child.id()).unwrap();
+        registry::write(
+            &config,
+            &registry::KeepaliveRecord {
+                v: registry::RECORD_VERSION,
+                session: "stubborn".into(),
+                lease: "lease_1".into(),
+                socket: "/tmp/shade.sock".into(),
+                root: config.root.to_string_lossy().into_owned(),
+                keepalive_pid: child.id(),
+                keepalive_start_tvsec: identity.start_tvsec,
+                keepalive_start_tvusec: identity.start_tvusec,
+                owner_pid: std::process::id(),
+                owner_start_tvsec: 3,
+                owner_start_tvusec: 4,
+                owner_name: "claude".into(),
+                created_at_ms: shade_engine::db::now_ms(),
+            },
+        )
+        .unwrap();
+
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticking = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticking.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        assert_eq!(
+            stop_registered(&config, "stubborn").await,
+            Some(child.id()),
+            "the stop reports the pid it signalled"
+        );
+        ticker.abort();
+        let _ = child.wait();
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) > 20,
+            "the rest of the runtime kept running while the stop waited"
+        );
+        assert!(
+            registry::read(&config, "stubborn").is_none(),
+            "and the pidfile is gone once the child is"
+        );
     }
 
     fn refused(code: &str, retry: &str) -> ShadeError {
