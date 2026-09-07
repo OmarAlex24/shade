@@ -54,7 +54,12 @@ impl SecretStore {
         workspace: &Path,
     ) -> Result<SecretManifest, SecretError> {
         let destination = self.workspace_root(workspace_id);
-        if destination.exists() {
+        // The manifest is what makes a baseline, not the directory around it.
+        // `capture_suspension` creates that directory to put a vault in,
+        // whether or not a baseline was ever taken, so keying the early return
+        // on the directory made a later `capture` claim a baseline it then
+        // could not read.
+        if destination.join("manifest.json").is_file() {
             return self.manifest(workspace_id);
         }
         let staging = self.root.join(format!(".{}.staging", workspace_id.0));
@@ -82,7 +87,7 @@ impl SecretStore {
             })
             .map_err(std::io::Error::other)?,
         )?;
-        fs::rename(staging, destination)?;
+        publish_baseline(&staging, &destination)?;
         Ok(SecretManifest {
             workspace_id: workspace_id.clone(),
             files,
@@ -522,7 +527,11 @@ impl SecretStore {
     }
 
     fn manifest_or_empty(&self, workspace_id: &WorkspaceId) -> Result<SecretManifest, SecretError> {
-        if !self.workspace_root(workspace_id).exists() {
+        if !self
+            .workspace_root(workspace_id)
+            .join("manifest.json")
+            .is_file()
+        {
             // An interrupted open may not have captured its first baseline.
             // Treat every current secret as newly added, never as disposable.
             return Ok(SecretManifest {
@@ -641,6 +650,35 @@ fn relative(root: &Path, path: &Path) -> Result<String, SecretError> {
         .to_str()
         .map(str::to_owned)
         .ok_or_else(|| SecretError::UnsafePath("secret path is not UTF-8".into()))
+}
+
+/// Move a freshly staged baseline into the workspace's secret directory.
+///
+/// One rename of the whole staging directory is the simple version and it
+/// needs the destination not to exist. It can: a workspace that has been slept
+/// has a vault inside that same directory, so the baseline is moved in entry
+/// by entry instead, with the manifest last. That order is what makes
+/// `manifest.json` an honest answer to "is there a baseline here" -- it is the
+/// last thing to arrive, whichever path put it there.
+fn publish_baseline(staging: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    if !destination.exists() {
+        return fs::rename(staging, destination);
+    }
+    let files = staging.join("files");
+    if files.exists() {
+        let target = destination.join("files");
+        if target.exists() {
+            // No manifest names them, so they are the debris of a capture that
+            // did not finish.
+            fs::remove_dir_all(&target)?;
+        }
+        fs::rename(&files, &target)?;
+    }
+    fs::rename(
+        staging.join("manifest.json"),
+        destination.join("manifest.json"),
+    )?;
+    fs::remove_dir_all(staging)
 }
 
 /// Put `staging` where `destination` is, without a moment in between where
@@ -1218,6 +1256,46 @@ fn merge_structured(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A baseline is a manifest, not a directory. `capture_suspension` makes
+    /// the workspace's secret directory to hold a vault, and `capture` used to
+    /// read that directory as "a baseline was already taken here" and then
+    /// hand back a manifest that was not there.
+    #[test]
+    fn a_baseline_is_still_taken_when_a_suspension_vault_got_there_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(directory.path().join("private")).unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join(".env.local"), "TOKEN=first\n").unwrap();
+        let workspace_id = WorkspaceId("ws_vault_first".into());
+
+        store.capture_suspension(&workspace_id, &workspace).unwrap();
+        let captured = store.capture(&workspace_id, &workspace).unwrap();
+        assert_eq!(captured.files, vec![".env.local".to_owned()]);
+        assert_eq!(
+            store.manifest(&workspace_id).unwrap().files,
+            vec![".env.local".to_owned()],
+            "and it is readable back, which is what the early return promised"
+        );
+        assert_eq!(
+            fs::read_to_string(store.baseline_path(&workspace_id, ".env.local")).unwrap(),
+            "TOKEN=first\n"
+        );
+        assert!(
+            store.has_suspension_vault(&workspace_id),
+            "without disturbing the vault that was already there"
+        );
+
+        // And the early return still holds: a second capture keeps the first
+        // baseline rather than following the file as it changes.
+        fs::write(workspace.join(".env.local"), "TOKEN=second\n").unwrap();
+        store.capture(&workspace_id, &workspace).unwrap();
+        assert_eq!(
+            fs::read_to_string(store.baseline_path(&workspace_id, ".env.local")).unwrap(),
+            "TOKEN=first\n"
+        );
+    }
 
     /// Replacing a vault must never leave the workspace with none. The old
     /// sequence removed the vault and then renamed the new one in, so any
