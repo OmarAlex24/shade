@@ -3460,6 +3460,22 @@ impl Engine {
                 .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_LEASED", "never"))?;
             self.database.release_session(&session_id, &workspace.id)?;
             crate::faults::hit(crate::faults::Point::ReleaseRecorded);
+            // The branch is reached by any workspace whose `.git` pointer is
+            // gone, not only by one reconciliation marked `failed`, and what it
+            // skips is worth a record: no status check, no release checkpoint,
+            // and no secret review. A caller reading `checkpoint_id: null`
+            // cannot tell a clean release apart from a tree that vanished, so
+            // the event says which it was.
+            let _ = self.database.record_event(
+                "workspace.released_without_tree",
+                &workspace.id.0,
+                &json!({
+                    "workspace": workspace.id,
+                    "session": session_id,
+                    "checkpoint_id": Value::Null,
+                    "reason": "workspace_not_materialized",
+                }),
+            );
             return Ok(Outcome::Completed(json!({
                 "session": session_id,
                 "workspace": workspace.id,

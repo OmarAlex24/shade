@@ -696,6 +696,31 @@ async fn a_failed_workspace_that_lost_its_tree_is_still_releasable() {
     );
     assert_eq!(workspace_state(&engine, &opened), "released");
 
+    // `checkpoint_id: null` on its own cannot tell a clean release apart from
+    // a tree that vanished before anything could be checkpointed or reviewed,
+    // so the release says which it was.
+    let events: serde_json::Value = completed(
+        engine
+            .query(query(Query::Events {
+                after_cursor: 0,
+                limit: 1000,
+            }))
+            .await,
+    );
+    let without_tree = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|event| event["event"] == "workspace.released_without_tree")
+        .expect("the release names what it skipped");
+    assert_eq!(without_tree["payload"]["workspace"], opened.workspace.0);
+    assert_eq!(without_tree["payload"]["session"], opened.session.0);
+    assert!(without_tree["payload"]["checkpoint_id"].is_null());
+    assert_eq!(
+        without_tree["payload"]["reason"], "workspace_not_materialized",
+        "no status check, no release checkpoint and no secret review happened"
+    );
+
     let collected = collect(&engine, "gc-failed-release").await;
     assert_eq!(collected["deleted"], 1);
 }

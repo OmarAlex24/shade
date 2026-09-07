@@ -2394,6 +2394,23 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Append one event for a decision that no state transition of its own
+    /// records. Not part of the transaction that preceded it: a crash in
+    /// between loses the note and keeps the release, which is the right way
+    /// round for something whose only job is to be readable afterwards.
+    pub fn record_event(
+        &self,
+        event: &str,
+        resource: &str,
+        payload: &Value,
+    ) -> Result<(), DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        append_event(&transaction, event, resource, payload)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn events(&self, after_cursor: i64, limit: u32) -> Result<Vec<EventEnvelope>, DbError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(

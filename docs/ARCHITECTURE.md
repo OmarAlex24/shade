@@ -104,6 +104,18 @@ reused here: adoption requires a live lease on the predecessor, and a suspension
 has none, so the predecessor is released and the successor bound in one
 transaction that also writes the operation journal.
 
+`release` is the only door to deletion, so a workspace with no tree left must
+still be able to walk through it. When the `.git` pointer is gone -- a
+suspension, a workspace reconciliation marked `failed`, or a tree something
+outside Shade removed -- release skips the status check, the release checkpoint
+and the secret review, because none of them can read a tree that is not there,
+and goes straight to the release transaction. The trade is deliberate and it is
+wider than the case that motivated it: any workspace whose pointer has gone
+takes that path, and whatever its working tree held that was never checkpointed
+is not recoverable afterwards. `checkpoint_id` comes back `null`, which on its
+own does not distinguish this from a clean release with nothing to checkpoint,
+so the release also emits `workspace.released_without_tree` naming the reason.
+
 Two optional sweeps, both off by default, automate the ends of the lifecycle.
 `SHADE_AUTO_SLEEP_DAYS` sleeps a workspace that has been dormant that long, and
 `SHADE_SUSPENDED_RETENTION_DAYS` releases a suspension that old. Both run
