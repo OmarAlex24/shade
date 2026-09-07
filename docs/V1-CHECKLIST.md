@@ -26,7 +26,7 @@ The user's original V1 plan is the acceptance scope. Passing the APFS benchmark 
 ## Secret policy
 
 - [x] `.env*` rejection at Git ingress/retention; private baselines, three-way previews, keep/discard/merge and predecessor preservation.
-- [x] Detect secret content outside `.env*` at history ingress, Git add and checkpoint retention. A required persistent Git filter withholds rejected bytes; private JSON/TOML merges and opaque/binary reviews preserve originals.
+- [x] Detect secret content outside `.env*` at Git add and checkpoint retention, so nothing new enters Git. A required persistent Git filter withholds rejected bytes on the clean side; what a base commit already tracks is surveyed and reported instead of refused; private JSON/TOML merges and opaque/binary reviews preserve originals.
 - [x] Bind each review to an immutable private snapshot of parent/child bytes. Stale pending choices return a new review, and later edits invalidate completed cleanup decisions. SIGKILL coverage includes snapshot staging and publication.
 
 ## Dependency readiness

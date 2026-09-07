@@ -78,12 +78,13 @@ In outline, for a worktree at `$WT` on branch `$BR` belonging to `$REPO`:
    commit, so anything uncommitted does not come across. If you do not want a
    commit, `git stash -u` — the stash lives in `$REPO`, and you are done with
    Shade for that tree.
-2. Move private `.env` files and any other secret out of the tree, into your
-   secret manager or a path outside the repository. Shade rejects a tracked
-   `.env` or `.env.local`; a tracked template -- `.env.example`, `.env.sample`,
-   `.env.template`, `.env.dist`, `.env.defaults` -- stays where it is and needs
-   nothing from you. Untracked secrets are simply absent from the new
-   workspace, so copy them into the new cwd afterwards.
+2. Move private `.env` files out of the tree, into your secret manager or a
+   path outside the repository. Shade rejects a tracked `.env` or `.env.local`;
+   a tracked template -- `.env.example`, `.env.sample`, `.env.template`,
+   `.env.dist`, `.env.defaults` -- stays where it is and needs nothing from
+   you, and so does any other tracked file, whatever it contains. Untracked
+   secrets are simply absent from the new workspace, so copy them into the new
+   cwd afterwards.
 3. If it is a JavaScript repository, make sure exactly one lockfile is
    committed.
 4. `shade open $REPO --base $BR --session <id>` from the main repository, then
@@ -129,7 +130,8 @@ repository instead of the whole afternoon.
 | --- | --- | --- |
 | Two JS lockfiles in one repository | `multiple JavaScript lockfiles are present; keep exactly one` | Keep one of `bun.lock`, `pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, delete the rest, pin `packageManager` in `package.json`, commit. A binary `bun.lockb` must be regenerated as a text `bun.lock`. |
 | No lockfile at all | dependency lock is missing | Commit one. Shade never resolves an unpinned tree, and it never installs a runtime or toolchain for you. |
-| Tracked private `.env` file | the open is rejected before checkout | `git rm --cached` the file, add it to `.gitignore`, keep the values in your secret manager, and copy them into the new cwd after `shade open`. A tracked `.env.example`, `.env.sample`, `.env.template`, `.env.dist` or `.env.defaults` is not a blocker and needs no change. |
+| Tracked private `.env` file in the base commit | the open is rejected before checkout, and `next` names the path (`untrack apps/web/.env.production, then retry`) | `git rm --cached` the file, add it to `.gitignore`, keep the values in your secret manager, and copy them into the new cwd after `shade open`. A tracked `.env.example`, `.env.sample`, `.env.template`, `.env.dist` or `.env.defaults` is not a blocker and needs no change, and neither is an `.env` that only an ancestor commit contained. |
+| A credential committed in ordinary tracked content | none -- the open succeeds | Not a blocker. A private-key header in a redaction test, a credential-shaped URL in `.env.example` or a CI file is counted as `tracked_secret_matches` in `shade doctor` and left alone. If it is a live credential, rotate it; Shade cannot remove it from a commit anyone can already clone. |
 | Uncommitted state in the worktree | work silently missing from the new workspace | Commit it or `git stash -u` before you convert. There is no third option: Shade materializes commits. |
 | A plain shell or a CI job | the lease expires after 120 s and the session goes `dormant` | The keepalive only attaches to a recognised agent ancestor (`claude`, `codex`, `cursor`, `cursor-agent`, `kimi`, `zumith`). From anything else, pass `--owner-pid <pid>` or `--owner-name <name>` to `shade open`, or run `shade heartbeat` on a timer. A dormant session is not lost: `shade attach --session <id>` takes a fresh lease. |
-| Submodules, Git LFS, custom Git filters | the repository is rejected | Not supported in V1. Those repositories stay on `git worktree`. |
+| Submodules, Git LFS, custom Git filters | the repository is rejected, anywhere in reachable history, and `next` names the path | Not supported in V1. Those repositories stay on `git worktree`. |
