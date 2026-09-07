@@ -92,6 +92,10 @@ def accepted_payload(repo, binary):
         or not performance["context"]["latency"]["p95_ms"] < 200
         or not performance["cli_ipc"]["latency"]["p95_ms"] < 10
         or not performance["common_response_budget"]["max_bytes"] <= 512
+        # A context for a session that is not `active` carries the `lifecycle`
+        # field the common case elides, so it is held to the same budget plus
+        # that bounded suffix rather than being left unmeasured.
+        or not performance["common_response_budget"]["max_lifecycle_bytes"] <= 544
         or performance["space"]["within_threshold"] is not True
     ):
         raise ValueError("The recorded APFS release gate does not certify this binary")

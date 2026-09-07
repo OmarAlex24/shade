@@ -41,6 +41,13 @@ const CONTEXT_P95_LIMIT_US: u128 = 200_000;
 const CLI_IPC_P95_LIMIT_US: u128 = 10_000;
 const SPACE_RATIO_MINIMUM: u64 = 5;
 const COMMON_RESPONSE_LIMIT_BYTES: usize = 512;
+/// A compact context for a session that is not `active` carries a `lifecycle`
+/// field the common case elides, and a wider `lease` word with it. That suffix
+/// is bounded -- the widest pair is `"lifecycle":"suspended"` with
+/// `"lease":"released"`, 28 bytes over the elided form -- so the dormant,
+/// suspended and released contexts are held to the common budget plus this,
+/// rather than being left unmeasured because they do not fit 512.
+const LIFECYCLE_SUFFIX_LIMIT_BYTES: usize = 32;
 const GATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const GATE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -251,6 +258,11 @@ struct ResponseSizeSample {
     name: &'static str,
     source: &'static str,
     bytes: usize,
+    /// What this particular sample is held to. Every response a caller sees on
+    /// every operation is held to `COMMON_RESPONSE_LIMIT_BYTES`; a context
+    /// carrying a non-active `lifecycle` is held to that plus the bounded
+    /// suffix, and is reported separately so the common budget stays 512.
+    limit_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,6 +270,8 @@ struct ResponseBudgetEvidence {
     method: &'static str,
     limit_bytes: usize,
     max_bytes: usize,
+    lifecycle_limit_bytes: usize,
+    max_lifecycle_bytes: usize,
     samples: Vec<ResponseSizeSample>,
     within_threshold: bool,
 }
@@ -732,11 +746,13 @@ async fn latency_evidence(
                 name: "observed_context",
                 source: "real_daemon",
                 bytes: max_context_response_bytes,
+                limit_bytes: COMMON_RESPONSE_LIMIT_BYTES,
             },
             ResponseSizeSample {
                 name: "observed_doctor",
                 source: "real_cli",
                 bytes: max_doctor_response_bytes,
+                limit_bytes: COMMON_RESPONSE_LIMIT_BYTES,
             },
         ],
     ))
@@ -775,26 +791,45 @@ fn common_response_budget(
 ) -> anyhow::Result<ResponseBudgetEvidence> {
     let mut samples = common_response_fixtures()?
         .into_iter()
-        .map(|(name, response)| {
+        .map(|(name, response, limit_bytes)| {
             Ok(ResponseSizeSample {
                 name,
                 source: "deterministic_fixture",
                 bytes: serde_json::to_vec(&response)?.len(),
+                limit_bytes,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     samples.extend(observed);
-    let max_bytes = samples.iter().map(|sample| sample.bytes).max().unwrap_or(0);
+    let widest = |limit: usize| {
+        samples
+            .iter()
+            .filter(|sample| sample.limit_bytes == limit)
+            .map(|sample| sample.bytes)
+            .max()
+            .unwrap_or(0)
+    };
+    let max_bytes = widest(COMMON_RESPONSE_LIMIT_BYTES);
+    let lifecycle_limit_bytes = COMMON_RESPONSE_LIMIT_BYTES + LIFECYCLE_SUFFIX_LIMIT_BYTES;
+    let max_lifecycle_bytes = widest(lifecycle_limit_bytes);
     Ok(ResponseBudgetEvidence {
         method: "serde_json_minified_payload_bytes_without_jsonl_delimiter",
         limit_bytes: COMMON_RESPONSE_LIMIT_BYTES,
         max_bytes,
+        lifecycle_limit_bytes,
+        max_lifecycle_bytes,
+        within_threshold: samples
+            .iter()
+            .all(|sample| sample.bytes <= sample.limit_bytes),
         samples,
-        within_threshold: max_bytes <= COMMON_RESPONSE_LIMIT_BYTES,
     })
 }
 
-fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)>> {
+/// Every response a caller sees on a common operation, with the budget each is
+/// held to. The tuple carries its own limit because the lifecycle-bearing
+/// contexts are deliberately allowed the bounded suffix above the 512 bytes
+/// every other response has to fit.
+fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse, usize)>> {
     let request_id = "01J7W3N7Y9AZ8T6G5F4E3D2C1B";
     let sha256_a = ObjectId("0123456789abcdef".repeat(4));
     let sha256_b = ObjectId("fedcba9876543210".repeat(4));
@@ -806,7 +841,10 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
         },
     };
 
-    let context = CompactContext {
+    // One context shape in four lifecycles: `active` elides the field and is
+    // the common case the 512-byte budget is about, and the other three are
+    // the same payload plus the suffix that elision buys.
+    let context = |lifecycle: &str, lease: &str| CompactContext {
         workspace: WorkspaceId("ws_01J7W3N7Y9AZ8T6G5F4E3D2C1B".into()),
         session: SessionId("host_01J7W3N7Y9AZ8T6G5F4E3D".into()),
         base_ref: "origin/feature/shade-agent".into(),
@@ -818,19 +856,36 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
             unstaged: 1,
             untracked: 3,
         },
-        lifecycle: "active".into(),
-        lease: "live".into(),
+        lifecycle: lifecycle.into(),
+        lease: lease.into(),
         dependencies: DependencyContext {
             state: "ready".into(),
             providers: vec!["pnpm".into(), "uv".into()],
             blocked_builds: Vec::new(),
         },
     };
+    let lifecycle_limit = COMMON_RESPONSE_LIMIT_BYTES + LIFECYCLE_SUFFIX_LIMIT_BYTES;
 
     Ok(vec![
         (
             "context_sha256_polyglot_deps",
-            completed(serde_json::to_value(context)?),
+            completed(serde_json::to_value(context("active", "live"))?),
+            COMMON_RESPONSE_LIMIT_BYTES,
+        ),
+        (
+            "context_dormant",
+            completed(serde_json::to_value(context("dormant", "expired"))?),
+            lifecycle_limit,
+        ),
+        (
+            "context_suspended",
+            completed(serde_json::to_value(context("suspended", "released"))?),
+            lifecycle_limit,
+        ),
+        (
+            "context_released",
+            completed(serde_json::to_value(context("released", "released"))?),
+            lifecycle_limit,
         ),
         (
             "checkpoint_sha256",
@@ -840,6 +895,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                 "index_tree": sha256_b,
                 "working_tree": "89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
             })),
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
             "heartbeat",
@@ -847,6 +903,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                 "lease": "lease_01J7W3N7Y9AZ8T6G5F4E3D2C1B",
                 "expires_at_ms": 1_808_000_000_000_i64,
             })),
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
             "publish_sha256",
@@ -857,6 +914,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                 "previous_remote": "56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234",
                 "pushed": true,
             })),
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
             "release",
@@ -866,6 +924,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                 "checkpoint_id": "ckpt_01J7W3N7Y9AZ8T6G5F4E3D2C1B",
                 "released": true,
             })),
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
             "sleep",
@@ -876,6 +935,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                 "suspended": true,
                 "reclaimed_bytes": 4_294_967_296_u64,
             })),
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
             "accepted",
@@ -888,6 +948,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                     },
                 },
             },
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
         (
             "structured_error",
@@ -904,6 +965,7 @@ fn common_response_fixtures() -> anyhow::Result<Vec<(&'static str, WireResponse)
                     },
                 },
             },
+            COMMON_RESPONSE_LIMIT_BYTES,
         ),
     ])
 }
@@ -1031,12 +1093,20 @@ fn threshold_failures(
             required: ">=5 using private/reclaimable bytes",
         });
     }
-    if !common_response_budget.within_threshold {
+    if common_response_budget.max_bytes > COMMON_RESPONSE_LIMIT_BYTES {
         failures.push(GateFailure {
             code: "COMMON_RESPONSE_BUDGET_EXCEEDED",
             metric: "common_response_budget.max_bytes",
             observed: common_response_budget.max_bytes.to_string(),
             required: "<=512 minified JSON bytes",
+        });
+    }
+    if common_response_budget.max_lifecycle_bytes > common_response_budget.lifecycle_limit_bytes {
+        failures.push(GateFailure {
+            code: "LIFECYCLE_CONTEXT_BUDGET_EXCEEDED",
+            metric: "common_response_budget.max_lifecycle_bytes",
+            observed: common_response_budget.max_lifecycle_bytes.to_string(),
+            required: "<=544 minified JSON bytes (512 plus the 32-byte lifecycle suffix)",
         });
     }
     failures
@@ -1335,15 +1405,48 @@ mod tests {
             evidence.max_bytes, COMMON_RESPONSE_LIMIT_BYTES, evidence.samples
         );
         assert!(evidence.max_bytes <= COMMON_RESPONSE_LIMIT_BYTES);
-        assert_eq!(evidence.samples.len(), 8);
+        assert_eq!(evidence.samples.len(), 11);
+
+        // The three lifecycle contexts are measured, not exempted: they are
+        // held to the common budget plus the bounded suffix, and the suffix is
+        // what elision buys the common case.
+        let active = evidence
+            .samples
+            .iter()
+            .find(|sample| sample.name == "context_sha256_polyglot_deps")
+            .unwrap();
+        let lifecycles: Vec<_> = evidence
+            .samples
+            .iter()
+            .filter(|sample| sample.limit_bytes == evidence.lifecycle_limit_bytes)
+            .collect();
+        assert_eq!(lifecycles.len(), 3, "dormant, suspended and released");
+        for sample in &lifecycles {
+            assert!(
+                sample.bytes > active.bytes,
+                "{} must be the active payload plus a suffix",
+                sample.name
+            );
+            assert!(
+                sample.bytes - active.bytes <= LIFECYCLE_SUFFIX_LIMIT_BYTES,
+                "{} overruns the {LIFECYCLE_SUFFIX_LIMIT_BYTES}-byte suffix by {}",
+                sample.name,
+                sample.bytes - active.bytes - LIFECYCLE_SUFFIX_LIMIT_BYTES
+            );
+        }
+        assert_eq!(
+            evidence.max_lifecycle_bytes,
+            lifecycles.iter().map(|sample| sample.bytes).max().unwrap()
+        );
+        assert!(evidence.max_lifecycle_bytes <= evidence.lifecycle_limit_bytes);
     }
 
     #[test]
     fn context_fixture_covers_sha256_oids_and_dependencies() {
         let fixtures = common_response_fixtures().unwrap();
-        let (_, context) = fixtures
+        let (_, context, _) = fixtures
             .iter()
-            .find(|(name, _)| *name == "context_sha256_polyglot_deps")
+            .find(|(name, _, _)| *name == "context_sha256_polyglot_deps")
             .unwrap();
         let context = serde_json::to_value(context).unwrap();
         assert_eq!(

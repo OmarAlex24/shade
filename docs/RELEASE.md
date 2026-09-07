@@ -199,11 +199,23 @@ operation ID when available; a cleanup failure also reports the exact retained
 pool path.
 
 The common-response budget serializes deterministic, minified wire fixtures for
-context, checkpoint, heartbeat, publish, release, accepted and structured-error
-outcomes, then adds the largest real context and doctor responses observed in
-the run. The context fixture deliberately uses two opaque 64-character SHA-256
-OIDs and a polyglot pnpm/uv dependency state. The measured byte count excludes
-only the JSONL record delimiter; every sample must be at most 512 bytes.
+context, checkpoint, heartbeat, publish, release, sleep, accepted and
+structured-error outcomes, then adds the largest real context and doctor
+responses observed in the run. The context fixture deliberately uses two opaque
+64-character SHA-256 OIDs and a polyglot pnpm/uv dependency state. The measured
+byte count excludes only the JSONL record delimiter.
+
+The 512-byte limit is the budget for the active case, which is the response a
+caller actually sees on every operation. A session that is not active carries
+the `lifecycle` field the active case elides, plus a wider `lease` word with it,
+and that suffix is bounded: `"lifecycle":"suspended"` with `"lease":"released"`
+is the widest at 28 bytes. The gate therefore measures the dormant, suspended
+and released contexts as their own fixtures and holds them to 512 plus a
+32-byte suffix, reported as `max_lifecycle_bytes` against
+`lifecycle_limit_bytes`; every other sample, real ones included, is held to 512.
+The alternative was to leave the three lifecycles unmeasured, which is how a
+532-byte response ships unnoticed.
+
 Bootstrap `open`, event pages and review previews have variable payloads and are
 not represented as common fixed-size responses.
 
@@ -243,7 +255,7 @@ The automated gate is necessary but not sufficient. Attach one artifact per row;
 | Malicious dependency fixtures | JS scripts, `.pnpmfile`, PEP 517, `.pth`, `build.rs`, proc macros and Go project code never execute. Cold fill replays offline; corrupt layers rebuild. |
 | Session harness | The deterministic protocol suite passes, then the real TypeScript SDK opens twenty sessions against the release binary, survives a SIGKILL restart with the same SQLite file, resumes events, checkpoints/forks/syncs/publishes, and uses an explicit zero-grace harness daemon to finish with zero active leases, worktrees, private refs, dependency staging entries or mutable artifact layers. |
 | Operational installation | The distribution binary installs atomically, answers before installation succeeds, finds host npm/Node under launchd, recovers after SIGKILL with the same SQLite file/workspace, rejects acceptance-label collisions and unloads cleanly. |
-| Output budgets | Every deterministic common-response fixture and every real context/doctor response sampled by the gate is at most 512 minified JSON bytes; the official Skill is at most 350 production-model tokens. |
+| Output budgets | Every deterministic common-response fixture and every real context/doctor response sampled by the gate is at most 512 minified JSON bytes, except the three non-active lifecycle contexts, which are at most 544 (512 plus the bounded 32-byte `lifecycle` suffix the active case elides); the official Skill is at most 350 production-model tokens. |
 | APFS benchmark | Warm source materialization at no more than 25k entries has p50 below 300 ms and p95 below 1 s; context p95 is below 200 ms; CLI/IPC p95 is below 10 ms. |
 | Space benchmark | Twenty unchanged workspaces add at least five times less physical storage than twenty complete copies/installations. |
 
