@@ -53,7 +53,9 @@ const refreshHandle = Symbol("shade.refreshHandle");
  * has ever emitted it: a released workspace answers `WORKSPACE_ALREADY_RELEASED`,
  * or `LEASE_EXPIRED` if the lease went first. `WORKSPACE_NOT_LEASED` and
  * `WORKSPACE_NOT_FOUND` went the other way: both are sent, both are
- * `retry: never`, and neither was here.
+ * `retry: never`, and neither was here. `SUSPENSION_VAULT_MISSING` joined them
+ * when wake started refusing a suspension whose vaulted private files are gone:
+ * that session cannot be woken by anything the SDK can do on its own.
  */
 const TERMINAL_LEASE_ERRORS = new Set([
   "LEASE_EXPIRED",
@@ -66,6 +68,7 @@ const TERMINAL_LEASE_ERRORS = new Set([
   "SESSION_ALREADY_RELEASED",
   "SESSION_NOT_FOUND",
   "SESSION_SUSPENDED",
+  "SUSPENSION_VAULT_MISSING",
 ]);
 
 export interface ShadeClientOptions {

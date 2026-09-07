@@ -2741,6 +2741,18 @@ impl Engine {
                 EngineError::domain("SUSPENSION_CHECKPOINT_MISSING", "safe")
                     .next("shade doctor, then release the workspace if it stays missing")
             })?;
+        // Every sleep vaults the private files before it marks the workspace
+        // `suspending`, and it writes a manifest even when there was nothing to
+        // vault. A suspended workspace with no vault has therefore lost it to
+        // something outside Shade, and waking would rebuild the tree from the
+        // checkpoint with `.env.local` quietly gone -- an agent finds out when
+        // the app cannot reach its database. Refuse instead, before a successor
+        // exists to throw away.
+        if !self.secrets.has_suspension_vault(&workspace.id) {
+            return Err(EngineError::domain("SUSPENSION_VAULT_MISSING", "never").next(
+                "restore the vault from backup, or shade release --session <id> to give the work up",
+            ));
+        }
         self.database
             .bind_operation_resource(operation, &workspace.id.0, "wake")?;
         let successor = self

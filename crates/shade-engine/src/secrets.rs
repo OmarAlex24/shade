@@ -197,20 +197,35 @@ impl SecretStore {
         })
     }
 
+    /// Whether a suspension vault is there to be restored.
+    ///
+    /// The manifest is the last thing [`SecretStore::capture_suspension`]
+    /// writes into the staging directory, and the whole directory arrives by
+    /// one rename, so a readable manifest is what distinguishes a finished
+    /// vault from a directory some other step happened to create.
+    pub fn has_suspension_vault(&self, workspace_id: &WorkspaceId) -> bool {
+        self.suspension_root(workspace_id)
+            .join("manifest.json")
+            .is_file()
+    }
+
     /// Writes a suspension vault back into a freshly materialized tree.
     ///
     /// The suspended workspace has no tree left, so the wake path cannot use
     /// [`SecretStore::copy_workspace_secrets`], which reads from the source
     /// working copy.
+    ///
+    /// A missing vault is not an empty one: every sleep writes a manifest,
+    /// even for a workspace with no private files at all, so its absence means
+    /// something removed it. The caller checks
+    /// [`SecretStore::has_suspension_vault`] first and refuses the wake rather
+    /// than materializing a tree that silently lost its `.env.local`.
     pub fn restore_suspension(
         &self,
         source_workspace: &WorkspaceId,
         destination: &Path,
     ) -> Result<Vec<String>, SecretError> {
         let vault = self.suspension_root(source_workspace);
-        if !vault.exists() {
-            return Ok(Vec::new());
-        }
         let encoded = fs::read(vault.join("manifest.json"))?;
         let manifest: BaselineManifest =
             serde_json::from_slice(&encoded).map_err(std::io::Error::other)?;

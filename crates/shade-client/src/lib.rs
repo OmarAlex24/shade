@@ -1329,7 +1329,9 @@ fn completed_only<T>(outcome: TerminalOutcome<T>, operation: &'static str) -> Cl
 /// documentation cannot keep, so it is gone. `WORKSPACE_NOT_LEASED` and
 /// `WORKSPACE_NOT_FOUND` went the other way: both are sent, both are
 /// `retry: never`, and neither was here, so a handle kept heartbeating into an
-/// answer that will never change.
+/// answer that will never change. `SUSPENSION_VAULT_MISSING` joined them when
+/// wake started refusing a suspension whose vaulted private files are gone:
+/// that session cannot be woken by anything the SDK can do on its own.
 fn terminal_lease_error(code: &str) -> bool {
     matches!(
         code,
@@ -1343,6 +1345,7 @@ fn terminal_lease_error(code: &str) -> bool {
             | "SESSION_ALREADY_RELEASED"
             | "SESSION_NOT_FOUND"
             | "SESSION_SUSPENDED"
+            | "SUSPENSION_VAULT_MISSING"
     )
 }
 

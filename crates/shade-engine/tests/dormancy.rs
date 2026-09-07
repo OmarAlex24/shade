@@ -1299,6 +1299,50 @@ async fn wake_restores_content_from_the_sleep_checkpoint_and_the_shared_dependen
     assert!(!slept.checkpoint_id.0.is_empty());
 }
 
+/// A vault is not optional data. Every sleep writes one -- a manifest even
+/// for a workspace with no private files -- so a suspended workspace without
+/// one lost it to something outside Shade, and a wake that carried on would
+/// hand back a tree whose `.env.local` is silently gone.
+#[tokio::test]
+async fn a_wake_whose_vault_vanished_refuses_rather_than_losing_the_secrets() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    fs::write(
+        Path::new(&opened.cwd).join(".env.local"),
+        "TOKEN=must-not-vanish\n",
+    )
+    .unwrap();
+    sleep_workspace(&engine, "sleep", &opened).await;
+
+    let vault = directory
+        .path()
+        .join("state/secrets")
+        .join(&opened.workspace.0)
+        .join("suspended");
+    assert!(vault.join("manifest.json").is_file());
+    fs::remove_dir_all(&vault).unwrap();
+
+    let error = failed(wake(&engine, "wake-no-vault", &opened.session).await);
+    assert_eq!(error.code, "SUSPENSION_VAULT_MISSING");
+    assert_eq!(error.retry, "never");
+    assert!(
+        error.next.unwrap_or_default().contains("release"),
+        "the caller is told the one way out"
+    );
+    assert_eq!(
+        workspace_state(&engine, &opened),
+        "suspended",
+        "the refusal costs the suspension nothing"
+    );
+    assert_eq!(session_state(&engine, &opened.session), "suspended");
+}
+
 #[tokio::test]
 async fn wake_failure_leaves_the_workspace_suspended() {
     let directory = tempfile::tempdir().unwrap();
