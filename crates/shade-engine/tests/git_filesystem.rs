@@ -823,6 +823,119 @@ async fn checkpoint_excludes_ignored_dependency_directories() {
     );
 }
 
+/// A path an exclusion pathspec matches counts as explicitly named, and Git
+/// refuses to add an explicitly named ignored path. The blanket
+/// `:(exclude,glob).env*` therefore failed the whole checkpoint in the most
+/// ordinary repository there is: one whose `.gitignore` lists `.env` while an
+/// untracked `.env` sits in the tree. Whether the name is gitignored decides
+/// nothing about the exclusion -- both trees below keep their private files
+/// and their dependency forest out of the checkpoint, and both succeed.
+#[tokio::test]
+async fn checkpoint_keeps_private_and_dependency_paths_out_whether_or_not_gitignored() {
+    for ignored in [true, false] {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        init_repository(&source, None);
+        fs::write(
+            source.join(".gitignore"),
+            if ignored {
+                ".env\nnode_modules/\n.venv/\n"
+            } else {
+                "unrelated-output/\n"
+            },
+        )
+        .unwrap();
+        fs::write(source.join(".env.example"), "API_URL=http://localhost\n").unwrap();
+        commit_fixture(&source);
+        let store = GitStore::system();
+        let remote = store.canonicalize_remote(source.to_str().unwrap()).unwrap();
+        let managed = store
+            .create_managed_bare(&temporary.path().join("managed.git"), Some(&remote))
+            .await
+            .unwrap();
+        let base = store
+            .resolve_base(
+                &managed,
+                Some(&remote),
+                BaseSpec::OriginBranch("main".to_owned()),
+            )
+            .await
+            .unwrap();
+        let workspace = temporary.path().join("workspace");
+        store
+            .prepare_base(&managed, &base, &workspace)
+            .await
+            .unwrap();
+        store
+            .register_precloned_worktree(&managed, &workspace, &base, "dotenv exclusion")
+            .await
+            .unwrap();
+
+        fs::write(workspace.join(".env"), "FOO=bar\n").unwrap();
+        fs::write(workspace.join(".env.local"), "FOO=baz\n").unwrap();
+        for path in ["node_modules/pkg/index.js", ".venv/lib/dependency.py"] {
+            fs::create_dir_all(workspace.join(path).parent().unwrap()).unwrap();
+            fs::write(workspace.join(path), "dependency\n").unwrap();
+        }
+        // A tracked template is ordinary content and its edit is checkpointed.
+        fs::write(workspace.join(".env.example"), "API_URL=http://127.0.0.1\n").unwrap();
+        fs::write(workspace.join("untracked.txt"), "keep me\n").unwrap();
+
+        let checkpoint = store
+            .checkpoint(
+                &managed,
+                &workspace,
+                "workspace_dotenv",
+                "checkpoint_dotenv",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("ignored={ignored}: {error}"));
+        let names = git(
+            temporary.path(),
+            &[
+                &format!("--git-dir={}", managed.git_dir().display()),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                checkpoint.working_tree.as_str(),
+            ],
+        );
+        let staged = names.lines().collect::<Vec<_>>();
+        assert!(staged.contains(&"untracked.txt"), "ignored={ignored}");
+        assert!(staged.contains(&".env.example"), "ignored={ignored}");
+        assert!(
+            !staged
+                .iter()
+                .any(|path| *path == ".env" || *path == ".env.local"),
+            "ignored={ignored}: a private dotenv was staged: {staged:?}"
+        );
+        assert!(
+            !staged
+                .iter()
+                .any(|path| path.contains("node_modules") || path.contains(".venv")),
+            "ignored={ignored}: dependency output was staged: {staged:?}"
+        );
+        assert_eq!(
+            git(
+                temporary.path(),
+                &[
+                    &format!("--git-dir={}", managed.git_dir().display()),
+                    "show",
+                    &format!("{}:.env.example", checkpoint.working_tree),
+                ],
+            ),
+            "API_URL=http://127.0.0.1"
+        );
+        for path in [".env", ".env.local", "node_modules/pkg/index.js"] {
+            let oid = git(&workspace, &["hash-object", "--no-filters", path]);
+            assert!(
+                !bare_git_succeeds(managed.git_dir(), &["cat-file", "-e", &oid]),
+                "ignored={ignored}: excluded content entered the object database: {path}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn checkpoint_fails_without_refs_when_the_workspace_never_quiesces() {
     let temporary = tempfile::tempdir().unwrap();

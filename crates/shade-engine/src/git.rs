@@ -2031,19 +2031,46 @@ impl GitStore {
             .await?;
         self.require_success(&output)?;
 
-        // Git rejects an ignored literal path even in an exclusion pathspec.
-        // Recursive globs cover root and nested dependency directories without
-        // making an ignored directory an explicit argument to `git add`.
-        let mut args = vec![
-            OsString::from("add"),
-            OsString::from("-A"),
-            OsString::from("--"),
-            OsString::from("."),
-            OsString::from(":(exclude,glob).env*"),
-            OsString::from(":(exclude,glob)**/.env*"),
-            OsString::from(":(exclude,glob)**/node_modules/**"),
-            OsString::from(":(exclude,glob)**/.venv/**"),
+        // Git counts a path an exclusion pathspec matches as explicitly named,
+        // and refuses an explicitly named ignored path, so a blanket
+        // `:(exclude,glob).env*` fails the whole `git add` in any repository
+        // whose `.gitignore` lists `.env` or `node_modules`. An exclusion may
+        // therefore only name paths the traversal would otherwise stage: the
+        // untracked, unignored candidates enumerated here. Tracked private
+        // files and tracked dependency output never reach this point, the
+        // `validate_worktree_policy` in `status` above having already refused
+        // the checkpoint by name.
+        let mut excluded = BTreeSet::new();
+        let candidate_args = vec![
+            OsString::from("ls-files"),
+            OsString::from("--others"),
+            OsString::from("--exclude-standard"),
+            OsString::from("-z"),
         ];
+        let output = self
+            .run_raw(Some(worktree), &candidate_args, &environment, None)
+            .await?;
+        self.require_success(&output)?;
+        for raw_path in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            // One pathspec per dependency forest rather than one per file: an
+            // installed `node_modules` that nothing gitignores would otherwise
+            // put a hundred thousand arguments on the command line.
+            if let Some(prefix) = dependency_output_prefix(raw_path) {
+                excluded.insert(prefix.to_vec());
+                continue;
+            }
+            let basename = raw_path
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or_default();
+            if crate::secret_policy::is_private_env_name(basename) {
+                excluded.insert(raw_path.to_vec());
+            }
+        }
         let secret_paths = crate::secrets::discover_secret_paths(worktree)?;
         let mut ignored_secrets = BTreeSet::new();
         if !secret_paths.is_empty() {
@@ -2078,8 +2105,17 @@ impl GitStore {
             if ignored_secrets.contains(path.as_bytes()) {
                 continue;
             }
-            args.push(format!(":(exclude,literal){path}").into());
+            excluded.insert(path.into_bytes());
         }
+        let mut args = vec![
+            OsString::from("add"),
+            OsString::from("-A"),
+            OsString::from("--"),
+            OsString::from("."),
+        ];
+        args.extend(excluded.into_iter().map(|path| {
+            OsString::from_vec([b":(exclude,literal)".as_slice(), path.as_slice()].concat())
+        }));
         let output = self
             .run_raw(Some(worktree), &args, &environment, None)
             .await?;
@@ -2100,8 +2136,8 @@ impl GitStore {
     /// Stage the `.env`-named files that are ordinary content after all --
     /// `.env.example` and its siblings -- in a second pass.
     ///
-    /// An exclusion pathspec has no negation, so the blanket `.env*` exclusion
-    /// above cannot re-admit them and the templates have to be named. Listing
+    /// An exclusion pathspec has no negation, so the pass above cannot
+    /// re-admit a name it excluded and the templates have to be named. Listing
     /// them with `--exclude-standard` is what keeps this safe: a gitignored
     /// candidate never appears, so `git add` is never handed an ignored
     /// literal path, and `-A` still records a template the agent deleted.
@@ -3640,6 +3676,23 @@ fn is_dependency_output_path(path: &Path) -> bool {
         };
         name == OsStr::new("node_modules") || name == OsStr::new(".venv")
     })
+}
+
+/// The dependency directory a repository-relative path lies inside, if any.
+///
+/// One exclusion naming that directory covers its whole subtree, which is what
+/// keeps the checkpoint's pathspec list bounded when a dependency forest is
+/// present and nothing gitignores it.
+fn dependency_output_prefix(path: &[u8]) -> Option<&[u8]> {
+    let mut end = 0;
+    for segment in path.split(|byte| *byte == b'/') {
+        end += segment.len();
+        if segment == b"node_modules" || segment == b".venv" {
+            return Some(&path[..end]);
+        }
+        end += 1;
+    }
+    None
 }
 
 fn parse_tree_entry(record: &[u8]) -> anyhow::Result<TreeEntry> {
