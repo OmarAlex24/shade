@@ -1063,6 +1063,159 @@ async fn sha256_import_and_opaque_oid_resolution_do_not_assume_sha1_width() {
     assert!(Oid::new("abc123").is_ok());
 }
 
+/// `.env.example` and its siblings are committed placeholders, tracked on
+/// purpose in most repositories. They have to survive open and checkpoint as
+/// ordinary content while `.env`, `.env.local` and `.env.production` keep
+/// their blanket refusal, including the required clean filter that stops a
+/// forced `git add` before Git writes the blob.
+#[tokio::test]
+async fn env_templates_are_ordinary_content_while_real_dotenv_files_stay_out() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    init_repository(&source, None);
+    fs::create_dir_all(source.join("apps/web")).unwrap();
+    fs::write(
+        source.join("apps/web/.env.example"),
+        "API_URL=http://localhost:3000\nAPI_KEY=your-api-key-here\n",
+    )
+    .unwrap();
+    fs::write(source.join(".env.sample"), "PORT=3000\n").unwrap();
+    commit_fixture(&source);
+
+    let store = GitStore::system();
+    let remote = store.canonicalize_remote(source.to_str().unwrap()).unwrap();
+    let managed_path = temporary.path().join("managed.git");
+    let managed = store
+        .create_managed_bare(&managed_path, Some(&remote))
+        .await
+        .unwrap();
+    let base = store
+        .resolve_base(
+            &managed,
+            Some(&remote),
+            BaseSpec::OriginBranch("main".to_owned()),
+        )
+        .await
+        .unwrap();
+    let workspace = temporary.path().join("workspace");
+    store
+        .prepare_base(&managed, &base, &workspace)
+        .await
+        .unwrap();
+    store
+        .register_precloned_worktree(&managed, &workspace, &base, "env-template-test")
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join("apps/web/.env.example")).unwrap(),
+        "API_URL=http://localhost:3000\nAPI_KEY=your-api-key-here\n",
+        "a tracked template must check out like any other file"
+    );
+
+    // An edit to the template, a brand new untracked one, and two private
+    // files that must not follow them into the checkpoint.
+    fs::write(
+        workspace.join("apps/web/.env.example"),
+        "API_URL=http://localhost:4000\nAPI_KEY=your-api-key-here\n",
+    )
+    .unwrap();
+    fs::write(workspace.join(".env.dist"), "PORT=8080\n").unwrap();
+    fs::write(workspace.join("apps/web/.env.local"), "TOKEN=do-not-hash\n").unwrap();
+    fs::write(workspace.join(".env.production"), "TOKEN=also-private\n").unwrap();
+
+    let checkpoint = store
+        .checkpoint(&managed, &workspace, "workspace_1", "checkpoint_1")
+        .await
+        .unwrap();
+    let working_names = git(
+        temporary.path(),
+        &[
+            &format!("--git-dir={}", managed.git_dir().display()),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            checkpoint.working_tree.as_str(),
+        ],
+    );
+    let names: Vec<&str> = working_names.lines().collect();
+    for template in ["apps/web/.env.example", ".env.sample", ".env.dist"] {
+        assert!(
+            names.contains(&template),
+            "{template} must be checkpointed as ordinary content: {names:?}"
+        );
+    }
+    for private in ["apps/web/.env.local", ".env.production"] {
+        assert!(
+            !names.contains(&private),
+            "{private} must never enter a checkpoint tree: {names:?}"
+        );
+    }
+    assert_eq!(
+        git(
+            temporary.path(),
+            &[
+                &format!("--git-dir={}", managed.git_dir().display()),
+                "show",
+                &format!("{}:apps/web/.env.example", checkpoint.working_tree),
+            ],
+        ),
+        "API_URL=http://localhost:4000\nAPI_KEY=your-api-key-here",
+        "an edit to a template belongs in the checkpoint"
+    );
+
+    // The required clean filter now distinguishes the two by name as well.
+    for (path, staged) in [
+        ("apps/web/.env.example", true),
+        (".env.dist", true),
+        ("apps/web/.env.local", false),
+        (".env.production", false),
+    ] {
+        let add = Command::new("git")
+            .args(["add", "-f", "--", path])
+            .current_dir(&workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run force add");
+        assert_eq!(
+            add.status.success(),
+            staged,
+            "unexpected `git add -f {path}`: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&add.stderr).contains("do-not-hash"));
+    }
+    assert_eq!(
+        git(&workspace, &["ls-files", "--", ".env.production"]),
+        "",
+        "a private file rejected by the clean filter must not enter the index"
+    );
+
+    // And the open-time refusal is unchanged for a repository that really does
+    // track a private file.
+    let hostile = temporary.path().join("hostile");
+    init_repository(&hostile, None);
+    fs::write(hostile.join(".env.production"), "TOKEN=tracked-secret\n").unwrap();
+    fs::write(hostile.join(".env.example"), "TOKEN=your-token-here\n").unwrap();
+    git(&hostile, &["add", "."]);
+    git(&hostile, &["commit", "-m", "tracked secret"]);
+    let identity = store.canonicalize_local(&hostile).await.unwrap();
+    let error = store
+        .import_managed_bare(
+            &hostile,
+            &temporary.path().join("hostile.git"),
+            "main",
+            &identity.remote,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("TRACKED_SECRET_FILE") && error.contains(".env.production"),
+        "unexpected rejection: {error}"
+    );
+    assert!(!error.contains("tracked-secret"));
+}
+
 #[tokio::test]
 async fn local_import_rejects_tracked_dotenv_before_publishing_the_bare() {
     let temporary = tempfile::tempdir().unwrap();

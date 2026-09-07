@@ -108,6 +108,26 @@ async fn real_filter_withholds_secrets_and_preserves_safe_binary_content() {
         assert!(!String::from_utf8_lossy(&rejected.stderr).contains(credential));
     }
     assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+
+    // Template names are exempt from the refusal by name, and only from that:
+    // a placeholder file stages like any other content, while one carrying a
+    // real credential is still withheld by the same scanner.
+    fs::write(
+        workspace.join(".env.example"),
+        "API_URL=http://localhost:3000\nAPI_KEY=your-api-key-here\n",
+    )
+    .unwrap();
+    ok(&workspace, &["add", "-f", "--", ".env.example"]);
+    fs::write(workspace.join(".env.sample"), credential.as_bytes()).unwrap();
+    let rejected = git(&workspace, &["add", "-f", "--", ".env.sample"]);
+    assert!(
+        !rejected.status.success(),
+        "a template holding a real credential must still be withheld"
+    );
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(credential));
+    fs::remove_file(workspace.join(".env.sample")).unwrap();
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+
     store.status(&workspace).await.unwrap();
     store.context_state(&workspace).await.unwrap();
     let checkpoint = store

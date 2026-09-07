@@ -1420,6 +1420,42 @@ mod tests {
         ));
     }
 
+    /// Sleep vaults a workspace's private files, and a template is not one.
+    /// `.env.example` is committed content: it comes back from the checkpoint
+    /// on wake like any other tracked file, so vaulting it would only hide a
+    /// second, stale copy of it under the private root.
+    #[test]
+    fn sleep_vaults_private_environment_files_and_leaves_templates_to_git() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(directory.path().join("private")).unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(workspace.join("apps/web")).unwrap();
+        fs::write(
+            workspace.join("apps/web/.env.local"),
+            "TOKEN=never-print-this\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("apps/web/.env.example"),
+            "API_URL=http://localhost:3000\nAPI_KEY=your-api-key-here\n",
+        )
+        .unwrap();
+        fs::write(workspace.join(".env.dist"), "PORT=3000\n").unwrap();
+        fs::write(workspace.join(".env.production"), "TOKEN=also-private\n").unwrap();
+
+        let workspace_id = WorkspaceId("ws_templates".into());
+        let manifest = store.capture_suspension(&workspace_id, &workspace).unwrap();
+        assert_eq!(
+            manifest.files,
+            [".env.production", "apps/web/.env.local"],
+            "only the private files belong in the vault"
+        );
+        assert!(store.has_suspension_vault(&workspace_id));
+        let vault = store.suspension_root(&workspace_id).join("files");
+        assert!(!vault.join(".env.dist").exists());
+        assert!(!vault.join("apps/web/.env.example").exists());
+    }
+
     #[test]
     fn captures_every_dotenv_prefix_without_exposing_values() {
         let directory = tempfile::tempdir().unwrap();

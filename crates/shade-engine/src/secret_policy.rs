@@ -358,6 +358,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn separates_private_environment_files_from_committed_templates() {
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.development.local",
+            ".env.example.local",
+            ".env.staging",
+            // Never a template suffix, and both have always been private.
+            ".envrc",
+            ".environment",
+            // The suffix list is matched byte for byte, so a shouted one is
+            // still refused rather than quietly admitted.
+            ".env.EXAMPLE",
+            ".env.Example",
+        ] {
+            assert!(
+                is_private_env_name(name.as_bytes()),
+                "{name} must stay private"
+            );
+        }
+        for name in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+            ".env.defaults",
+            ".env.local.example",
+            ".env.production.sample",
+            ".envrc.example",
+        ] {
+            assert!(
+                !is_private_env_name(name.as_bytes()),
+                "{name} is a committed template"
+            );
+        }
+        for name in [
+            "env",
+            "readme.env",
+            "config.env.local",
+            // Case-sensitive on purpose: the `.env*` globs built from this
+            // predicate are case-sensitive too, and a name this called private
+            // but those globs missed could be staged into a checkpoint. An
+            // uppercase file with real credentials is still caught by content.
+            ".ENV",
+            ".ENV.local",
+        ] {
+            assert!(
+                !is_private_env_name(name.as_bytes()),
+                "{name} is not a dotenv basename"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_basename_of_a_nested_path() {
+        for path in [
+            "apps/web/.env.local",
+            "/tmp/deep/nested/.env",
+            "packages/api/.envrc",
+        ] {
+            assert!(
+                private_env_path(Path::new(path)),
+                "{path} must stay private"
+            );
+        }
+        for path in [
+            "apps/web/.env.example",
+            "packages/api/.env.local.template",
+            // A directory whose own name looks private does not make the file
+            // inside it private.
+            ".env.local/notes.md",
+            "src/main.rs",
+        ] {
+            assert!(
+                !private_env_path(Path::new(path)),
+                "{path} is ordinary content"
+            );
+        }
+    }
+
+    #[test]
+    fn template_globs_agree_with_the_predicate() {
+        for (pattern, suffix) in ENV_TEMPLATE_PATTERNS.iter().zip(ENV_TEMPLATE_SUFFIXES) {
+            assert_eq!(*pattern, format!(".env*.{suffix}"));
+        }
+    }
+
+    #[test]
     fn detects_private_material_without_echoing_it() {
         for bytes in [
             ["-----BEGIN ", "OPENSSH PRIVATE KEY-----"].concat(),
