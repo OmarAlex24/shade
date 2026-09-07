@@ -18,7 +18,7 @@ use shade_client::{ClientError, ShadeClient};
 use shade_engine::config::EngineConfig;
 use shade_protocol::{
     Intent, KeepaliveStatus, LeaseId, OpenedSession, Outcome, Query, ResponseBody, SessionId,
-    SessionStatus, WireResponse,
+    SessionStatus, ShadeError, WireResponse,
 };
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -296,6 +296,10 @@ pub async fn run(config: &EngineConfig, client: &ShadeClient, args: RunArgs) -> 
                 failures = 0;
                 backoff = Duration::from_millis(250);
             }
+            Beat::Terminal(code) => {
+                log.line(&format!("session_not_resumable {code}"));
+                break;
+            }
             Beat::Transport => {
                 failures += 1;
                 if failures >= MAX_TRANSPORT_FAILURES {
@@ -514,6 +518,8 @@ fn stop_registered(config: &EngineConfig, session: &str) -> Option<u32> {
 enum Beat {
     Renewed,
     LeaseGone,
+    /// A domain error the daemon says will never succeed, carrying its code.
+    Terminal(String),
     Domain,
     Transport,
 }
@@ -527,16 +533,26 @@ async fn heartbeat(client: &ShadeClient, session: &str, lease: &str) -> Beat {
     match client.execute_wait_idempotent(intent, key).await {
         Ok(response) => match response.body {
             ResponseBody::Ok { .. } => Beat::Renewed,
-            ResponseBody::Error { error } => classify(&error.code),
+            ResponseBody::Error { error } => classify(&error),
         },
-        Err(ClientError::Domain(error)) => classify(&error.code),
+        Err(ClientError::Domain(error)) => classify(&error),
         Err(_) => Beat::Transport,
     }
 }
 
-fn classify(code: &str) -> Beat {
-    match code {
+/// Decide what one refused beat means for this child.
+///
+/// The two lease codes are the only ones worth another question: an expiry is
+/// a dormancy the child reattaches from, and a fence may be a lease that
+/// rotated under it. Every other `retry: never` answer names something no
+/// amount of beating changes -- a suspended session, a released one, a
+/// workspace that is gone -- and beating on was how a suspended session kept a
+/// child alive until its agent exited. Retryable codes stay `Domain`: the
+/// daemon is saying "not now", not "never".
+fn classify(error: &ShadeError) -> Beat {
+    match error.code.as_str() {
         "LEASE_EXPIRED" | "LEASE_FENCED" => Beat::LeaseGone,
+        _ if error.retry == "never" => Beat::Terminal(error.code.clone()),
         _ => Beat::Domain,
     }
 }
@@ -837,10 +853,54 @@ mod tests {
         assert!(registry::read(&config, "s1").is_some());
     }
 
+    fn refused(code: &str, retry: &str) -> ShadeError {
+        ShadeError {
+            code: code.into(),
+            retry: retry.into(),
+            operation: None,
+            next: None,
+            diagnostics_id: None,
+        }
+    }
+
     #[test]
     fn heartbeat_classification_separates_lease_loss_from_other_domain_errors() {
-        assert!(matches!(classify("LEASE_EXPIRED"), Beat::LeaseGone));
-        assert!(matches!(classify("LEASE_FENCED"), Beat::LeaseGone));
-        assert!(matches!(classify("WORKSPACE_NOT_FOUND"), Beat::Domain));
+        assert!(matches!(
+            classify(&refused("LEASE_EXPIRED", "never")),
+            Beat::LeaseGone
+        ));
+        assert!(matches!(
+            classify(&refused("LEASE_FENCED", "never")),
+            Beat::LeaseGone
+        ));
+        // Retryable: the daemon is saying "not now", and the next tick asks
+        // again rather than abandoning a lease that is still this child's.
+        assert!(matches!(
+            classify(&refused("WORKSPACE_NOT_QUIESCENT", "safe")),
+            Beat::Domain
+        ));
+    }
+
+    /// Every terminal code that is not one of the two lease codes ends the
+    /// child. `SESSION_SUSPENDED` is the one that made this a bug: a slept
+    /// session answers it forever, and treating it as an ordinary domain
+    /// error left a keepalive beating against a workspace with no tree until
+    /// its agent exited.
+    #[test]
+    fn a_terminal_domain_error_ends_the_keepalive() {
+        for code in [
+            "SESSION_SUSPENDED",
+            "SESSION_ALREADY_RELEASED",
+            "SESSION_NOT_FOUND",
+            "WORKSPACE_ALREADY_RELEASED",
+            "WORKSPACE_NOT_MATERIALIZED",
+            "WORKSPACE_NOT_ATTACHABLE",
+            "WORKSPACE_NOT_FOUND",
+        ] {
+            match classify(&refused(code, "never")) {
+                Beat::Terminal(reported) => assert_eq!(reported, code),
+                _ => panic!("{code} must end the keepalive"),
+            }
+        }
     }
 }

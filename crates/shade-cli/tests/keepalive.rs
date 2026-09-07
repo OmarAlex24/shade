@@ -370,6 +370,60 @@ fn keepalive_stops_when_the_owner_exits() {
 }
 
 #[test]
+fn keepalive_stops_when_the_session_is_suspended_behind_its_back() {
+    let fixture = Fixture::new();
+    let _daemon = fixture.daemon(120);
+    let owner = fake_owner();
+
+    let opened = fixture.open("ka-suspended", &["--owner-pid", &owner.0.to_string()]);
+    let pid = keepalive(&opened)["pid"].as_u64().unwrap() as u32;
+    let workspace = opened["outcome"]["result"]["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lease = opened["outcome"]["result"]["lease"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_until("the keepalive to prove itself with one beat", || {
+        fixture.heartbeats(&lease) >= 1
+    });
+
+    // Sleep over the wire rather than through `shade sleep`, which stops the
+    // keepalive itself. This is the case the child has to survive on its own:
+    // some other process reclaimed the disk, and the only thing that tells
+    // this child is the `SESSION_SUSPENDED` its next beat comes back with.
+    let response = try_rpc(
+        &fixture.socket,
+        &json!({"type":"execute","v":1,"request_id":"raw-sleep",
+            "idempotency_key":"raw-sleep","actor":{"kind":"host","id":"raw-sleeper"},
+            "intent":{"kind":"workspace_sleep","selector":{"workspace_id":workspace}}}),
+    )
+    .unwrap();
+    assert_eq!(response["status"], "ok", "{response}");
+    wait_until("the session to report itself suspended", || {
+        fixture.session_state("ka-suspended") == "suspended"
+    });
+
+    wait_until("the keepalive to exit on a terminal domain error", || {
+        !alive(pid)
+    });
+    let log = fixture.keepalive_log("ka-suspended");
+    assert!(
+        log.contains("session_not_resumable SESSION_SUSPENDED"),
+        "the child must say which code ended it: {log}"
+    );
+    let beats = fixture.heartbeats(&lease);
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(
+        fixture.heartbeats(&lease),
+        beats,
+        "a stopped keepalive beats no more"
+    );
+    assert!(alive(owner.0), "the owning agent is untouched");
+}
+
+#[test]
 fn release_stops_the_keepalive() {
     let fixture = Fixture::new();
     let _daemon = fixture.daemon(120);
