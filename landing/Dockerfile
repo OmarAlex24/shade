@@ -5,7 +5,12 @@
 #
 #   docker build -t shade-landing landing/
 #
-# On Dokploy this is the `Dockerfile` build type with Build Path `landing`.
+# The context MUST be `landing/`: every COPY below is relative to this file, so a
+# root context fails at `COPY Caddyfile` with `"/Caddyfile": not found`.
+#
+# On Dokploy this is the `Dockerfile` build type with Build Path `landing`,
+# Dockerfile Path `landing/Dockerfile` and Docker Context Path `landing` — Dokploy
+# resolves the latter two from the repository root, not from Build Path.
 # See "Deploy on Dokploy" in README.md.
 
 # ---- build ------------------------------------------------------------------

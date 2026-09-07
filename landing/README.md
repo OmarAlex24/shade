@@ -49,19 +49,18 @@ Create an Application and set:
 | Provider | Branch               | `main`                                 |
 | Provider | Build Path           | `landing`                              |
 | Build    | Build Type           | `Dockerfile`                           |
-| Build    | Dockerfile Path      | `Dockerfile`                           |
-| Build    | Docker Context Path  | `.`                                    |
+| Build    | Dockerfile Path      | `landing/Dockerfile`                   |
+| Build    | Docker Context Path  | `landing`                              |
 | Build    | Docker Build Stage   | *(empty — the last stage is the one)*  |
 | Domains  | Host                 | the domain you are serving from        |
 | Domains  | Container Port       | `80`                                   |
 | Domains  | HTTPS                | on, certificate provider `Let's Encrypt` |
 
-`Build Path` is what scopes the build to this subdirectory, and the Dockerfile path
-and context are then resolved inside it — so `Dockerfile` and `.` mean
-`landing/Dockerfile` and `landing/`. If Dokploy reports that it cannot find the
-Dockerfile, set the path to `landing/Dockerfile` and the context to `landing`
-instead; the image builds identically either way because the build context is
-`landing/` in both.
+Dokploy resolves both the Dockerfile path and the Docker context path from the
+repository root rather than from `Build Path`, and the context has to be `landing`
+because the Dockerfile copies `package.json`, `bun.lock`, `Caddyfile` and the sources
+relative to itself — with the root as context those `COPY` paths do not resolve and
+the build fails on `COPY Caddyfile /etc/caddy/Caddyfile` with `"/Caddyfile": not found`.
 
 Before the first deploy, set `SITE_URL` in `src/consts.ts` **and** `astro.config.mjs`
 to the domain configured above. It is baked into `og:url`, the canonical link and
