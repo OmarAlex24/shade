@@ -29,7 +29,12 @@ await session.release();
 `sessions.open` returns the session object itself. Its machine-facing fields are
 `session`, `workspace`, `lease`, `cwd`, `env`, and `compact_context`; its lifecycle
 methods are `context`, `checkpoint`, `fork`, `sync`, `restore`,
-`refreshDependencies`, `publish`, `resolve`, and `release`.
+`refreshDependencies`, `publish`, `resolve`, `sleep`, and `release`.
+
+`sessions.reattach(id)` resumes a session whose lease expired, on the workspace
+it already owns. `session.sleep()` gives that workspace's tree back to the
+filesystem and retires the handle; `sessions.wake(id)` rebuilds the content as a
+successor and returns a new handle with a new `workspace` and `cwd`.
 
 A `publish` that cannot integrate settles as `conflict` and returns a resolution
 workspace. Fix the conflict there, then `resolve` it: the daemon publishes from

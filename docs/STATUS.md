@@ -4,6 +4,8 @@ Shade V1 is implemented and its complete functional, recovery, operational and p
 
 ## Latest implementation work
 
+- Added the four-state workspace lifecycle. An expired lease now leaves a session **dormant** with its tree, checkpoints and secret decisions intact instead of handing it to the collector; the CLI spawns a detached keepalive bound to the agent process that opened the session, with a private `0600` pidfile; and `shade sleep` / `shade wake` suspend a quiescent workspace to its checkpoint and private-file vault and rebuild it as a successor. There is no schema change: `user_version` stays at 1 and every new state is a value in a column that already existed. Six new SIGKILL boundaries cut the suspension at each of its four commits and the wake at both of its two, and the real harness adds a CLI-opened session that proves the keepalive heartbeats unprompted, retires with its owner, and survives a sleep/wake round trip. The recorded evidence bundle predates this work and does not certify it; the release gate re-records it.
+
 - Added reproducible local [release packaging](RELEASE.md#package-an-accepted-distribution). The packager verifies the accepted binary, recorded source/evidence digests, skill and APFS limits before producing a single-binary archive with installation instructions, manifest and checksums. The [packaging verification](../artifacts/packaging-validation.json) records nine passing tests, identical bytes across two real package builds, all 38 payload checksums and successful execution of the extracted binary's version command. The archive is 4,765,924 bytes. The accepted runtime source and binary remain identified by the existing release bundle.
 - The immutable APFS inventory now reads directory entries without fetching every file's attributes. It validates pinned directories and falls back to the full inventory for hardlinks, unknown entries and trees above 25,000 entries. The boundary regression and 145 ordinary Rust tests pass, with Clippy across all targets/features. The quick benchmark now retains twenty clones and uses the release gate's deterministic payload.
 - The [complete current recovery matrix](../artifacts/v1-release/crash.json) passes all 251 cases across 138 points, with 266 actual SIGKILLs. The same distribution passes fourteen real-manager cases, four optimized CLI/LaunchAgent scenarios, twelve TypeScript tests and the [twenty-session harness](../artifacts/v1-release/zenith.json). All final source and binary identities are verified in the evidence bundle.
@@ -84,7 +86,7 @@ The storage comparison uses `ATTR_CMNEXT_PRIVATESIZE`, not an estimate of global
 
 The [real harness](../artifacts/zenith-real.json) uses a controlled npm executable with the real daemon, Git, APFS and SQLite. It exercises one shared dependency preparation, COW isolation, checkpoints, fork, sync/adoption, publishing, SIGKILL/restart against the same SQLite file, resumed events and final cleanup. [Validation metadata](../artifacts/validation.json) ties these checks to the same release binary digest.
 
-The official Skill measures 239 tokens with `o200k_base` (tiktoken 0.14.0), below the 350-token limit; its exact bytes, tokenizer and limit are recorded in [skill-tokens.json](../artifacts/skill-tokens.json).
+The official Skill measures 267 tokens with `o200k_base` (tiktoken 0.14.0), below the 350-token limit; its exact bytes, tokenizer and limit are recorded in [skill-tokens.json](../artifacts/skill-tokens.json).
 
 ## Final V1 acceptance
 

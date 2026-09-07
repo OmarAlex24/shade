@@ -20,6 +20,7 @@ Platform constraint, stated up front: **Apple Silicon, macOS and APFS only.** Th
 - Dependency installs run in a sandbox. Offline replay runs under macOS `sandbox-exec` with network operations denied for the process tree, and JavaScript lifecycle scripts run only after an explicit per package/version/integrity approval.
 - Sessions hold a lease. The CLI starts a detached keepalive tied to the agent process that opened the session and stops it when that process exits; SDK session handles heartbeat in-process. A lease expires after 120 seconds without a heartbeat.
 - An expired lease makes a workspace **dormant**, not garbage. A dormant workspace keeps its tree, its checkpoints and its secret decisions, is never garbage-collected, and `shade attach --session <id>` brings it back with a fresh lease. Only `shade release` makes a workspace collectible.
+- `shade sleep` **suspends** a workspace: it takes a checkpoint, moves the private files a checkpoint cannot hold into a store outside Git, and gives the tree back to the filesystem. The session, its history and its identity all survive. `shade wake --session <id>` rebuilds the content as a successor workspace with a new id and cwd, restoring the dependency layer from its shared fingerprint rather than reinstalling it.
 - Checkpoints capture HEAD, the real index tree and the complete working tree, including deletions, untracked files, symlinks and executable modes.
 - Sync, restore, dependency refresh and reviewed secret merge produce a **successor** workspace through a two-phase handoff. The predecessor stays live until the caller adopts the new cwd and env. No integration path rewrites or deletes a predecessor.
 - Publish is squash-only, with compare-and-swap on the branch and opt-in, lease-protected push. A conflict is a first-class outcome that returns a resolution workspace.
@@ -54,10 +55,14 @@ cd "$(jq -r '.outcome.result.cwd' <<<"$opened")"
 shade context
 shade checkpoint --reason before-refactor
 shade publish --branch agent/result --message 'Result'
+# Done for now, but not done with the work: `sleep` frees the disk and
+# `wake` gives it back. `release` is the only verb that ends a session.
+shade sleep
+shade wake --session task-42
 shade release
 ```
 
-The full command set is `open`, `attach`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`, plus the administrative `warm`, `review resolve`, `doctor`, `gc` and `install`.
+The full command set is `open`, `attach`, `sleep`, `wake`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`, plus the administrative `warm`, `review resolve`, `doctor`, `gc` and `install`.
 
 Mutation commands wait for their terminal domain outcome. A client deadline does not cancel daemon work: the structured timeout carries `operation` when known, and its `next` field preserves the exact idempotency key for a safe retry.
 
@@ -84,7 +89,7 @@ await session.publish({ branch: "agent/change", message: "agent change" });
 await session.release();
 ```
 
-The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish`, `resolve` and `release`. Review decisions live on `client.reviews()`.
+The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish`, `resolve`, `sleep` and `release`, and `client.sessions().reattach(..)` / `.wake(..)` bring an idle or suspended one back. Review decisions live on `client.reviews()`.
 
 ## Outcomes
 
@@ -105,6 +110,7 @@ Version 0.1.0, release candidate. Honest limitations:
 - The daemon is single-user and runs as your login user. It is **not** a same-UID process sandbox. A linked worktree exposes a writable Git object database, so the secret clean filter is an accidental-commit guardrail, not a boundary against a malicious local process. See [docs/SECURITY.md](docs/SECURITY.md) for the precise threat model.
 - The SQLite schema is version 1 and there are no migrations. A database written by a different schema version is rejected rather than upgraded.
 - V1 rejects submodules, Git LFS, custom Git filters, tracked `.env*` files, missing dependency locks, source builds and executable package-manager configuration. Shade never installs a runtime or toolchain.
+- Sleep preserves tracked content, untracked files and gitignored private files, but not gitignored build output: `node_modules`, `.venv` and anything like them are excluded from the checkpoint and rebuilt on wake from the shared dependency fingerprint. A wake also changes the workspace id and cwd, so a host that cached either must read them from the wake result.
 
 See [docs/STATUS.md](docs/STATUS.md) for the current acceptance evidence.
 

@@ -72,7 +72,7 @@ transition destroys work.
 | --- | --- | --- | --- | --- |
 | `active` | materialized | live | `open`, `attach`, adoption of a successor | lease expiry, `release` |
 | `dormant` | materialized | none | lease expiry (no heartbeat for 120 s) | `attach` / `open` on the same session, `release` |
-| `suspended` | reclaimed | none | explicit suspension (not implemented) | explicit resumption, `release` |
+| `suspended` | reclaimed | none | `sleep`, from `active` or `dormant` | `wake`, `release` |
 | `released` | deleted after GC | none | `release` | — |
 
 Dormancy is the ordinary resting state of an agent that stopped talking, not a
@@ -85,18 +85,46 @@ idempotent for a session that already holds a live lease. Deletion is always
 explicit: `release` is the only path into `released`, which is also the only
 state GC collects, and only after its grace period.
 
+Suspension is the state that trades the tree for everything else. `sleep` takes
+a checkpoint with reason `sleep`, vaults the private files a checkpoint cannot
+hold, unregisters the worktree and removes the directory; the record, the
+session id, the checkpoints and the retention refs all stay. It refuses a
+workspace with unfinished work of its own -- a pending review, another running
+operation, a pending handoff or publication, a non-ready checkpoint -- with
+`WORKSPACE_NOT_QUIESCENT`.
+
+`wake` is the only way back, and it builds a successor rather than reviving the
+record in place: a new workspace id and cwd, cloned from the immutable base,
+restored from the sleep checkpoint, refilled from the shared dependency
+fingerprint and given back its vaulted files. That is not a compromise; it is
+what keeps every crash-recovery path already proven, because a half-built
+successor is an ordinary incomplete workspace and the suspension it was built
+from is untouched until the final transaction. The handoff machinery cannot be
+reused here: adoption requires a live lease on the predecessor, and a suspension
+has none, so the predecessor is released and the successor bound in one
+transaction that also writes the operation journal.
+
+Two optional sweeps, both off by default, automate the ends of the lifecycle.
+`SHADE_AUTO_SLEEP_DAYS` sleeps a workspace that has been dormant that long, and
+`SHADE_SUSPENDED_RETENTION_DAYS` releases a suspension that old. Both run
+through the ordinary verbs, so every gate a manual `sleep` or `release` applies
+still applies, and releasing is still not deleting: GC keeps all of its own
+gates and its grace period afterwards.
+
 Sessions and workspaces recorded as `orphaned` by an earlier version are
 normalized to `dormant` at startup, which is a value change and not a schema
 change: neither column carries a CHECK constraint and `user_version` stays at 1.
+Suspension adds no schema change either -- `suspended` and `suspending` are two
+more values in the same two columns.
 
 ## Failure model
 
 - Operations are idempotent per actor/key and reject key reuse for a different intent.
 - WAL + `synchronous=FULL` protects control-plane transitions.
 - Private retention refs independently anchor checkpoint HEAD, real index tree and working tree.
-- Startup reconciliation normalizes legacy states, expires leases into dormancy, cancels their pending handoffs, closes interrupted non-terminal operations and removes only known staging artifacts. An expired lease never deletes a tree; it only drops the session to `dormant`. An interrupted successor adoption is closed with `OPERATION_INTERRUPTED`, but its original actor/key may atomically reclaim the same operation ID and retry the pending handoff.
+- Startup reconciliation first finishes or reverts any interrupted suspension, so every later pass sees a workspace that is cleanly `suspended` or cleanly `dormant`. It then normalizes legacy states, expires leases into dormancy, cancels their pending handoffs, closes interrupted non-terminal operations and removes only known staging artifacts. A workspace that gave its tree up on purpose -- a suspension, or the predecessor a wake released out of one -- is never read as corruption: marking those `failed` would hand a whole suspension to the collector. An expired lease never deletes a tree; it only drops the session to `dormant`. An interrupted successor adoption is closed with `OPERATION_INTERRUPTED`, but its original actor/key may atomically reclaim the same operation ID and retry the pending handoff.
 - Reconciliation also removes locked registrations at the exact `.shade-register-*/worktree` staging shape. If `.git` was already moved but repair did not finish, the empty staging directory is removed before asking Git to remove its registration. Arbitrary nested paths and symlinked stages are ineligible. Temporary Git indexes live beside managed repositories and use the same owned staging cleanup.
-- GC only ever considers `released`, `failed` and legacy `orphaned` workspaces, so a dormant workspace is not a candidate at any point. It checks the lease, operation, review, checkpoint, unmerged-index and detached-commit gates again immediately before deletion.
+- GC only ever considers `released`, `failed` and legacy `orphaned` workspaces, so neither a dormant nor a suspended workspace is a candidate at any point. It checks the lease, operation, review, checkpoint, unmerged-index and detached-commit gates again immediately before deletion.
 - Common replies stay compact; [durable failure diagnostics](DIAGNOSTICS.md) are referenced by `diagnostics_id`. Sanitized detail commits with the failed operation and outbox event; explicit CLI/SDK queries retrieve it. The CLI can also read the existing database while the daemon is stopped.
 
 The deterministic full-copy `CopyFilesystem` exists only behind the `test-support` Cargo feature, which the crate enables for its own integration tests and never for the distribution binary; a release build has no byte-copy `WorkspaceFilesystem` to reach, so `COW_UNAVAILABLE` cannot degrade into silent copying. The Apple Silicon/APFS gate is enforced by `Engine::with_components_and_git`, the single constructor body every other constructor funnels through, so `with_components` and `open` reject an unsupported platform identically with `PLATFORM_UNSUPPORTED`: tests cannot run on a construction path production cannot reach.
@@ -116,6 +144,15 @@ Resolved-publication cases cover dependency readiness, checkpoint phases, local
 and remote CAS, completion, anchor cleanup and handoff. Recovery must finish one
 publication, preserve the original workspace, replay its operation idempotently
 and remove every temporary anchor.
+
+Lifecycle cases cut a suspension at each of its four commits and a wake at both
+of its two. An interrupted sleep must leave a tree that is still registered and
+still usable, or a `suspending` workspace that startup finishes from its sleep
+checkpoint; either way the workspace ends `suspended` with no tree, no live
+lease, and content that comes back on the next wake. An interrupted wake must
+leave the suspension it was building from untouched and its half-built successor
+collected as the ordinary incomplete workspace it is, and once the binding
+transaction commits, its operation must replay without waking a second time.
 
 Reconciliation cases use two actual process kills. The first interrupts an
 operation to create the incomplete state; the second interrupts startup while

@@ -21,7 +21,7 @@ query(query)
 events(after_cursor)
 ```
 
-The normative wire shape, outcomes and selector rules are in [Protocol v1](PROTOCOL.md). The CLI exposes `open`, `attach`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`; administration adds `warm`, `review resolve`, `doctor`, `gc` and `install`.
+The normative wire shape, outcomes and selector rules are in [Protocol v1](PROTOCOL.md). The CLI exposes `open`, `attach`, `sleep`, `wake`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`; administration adds `warm`, `review resolve`, `doctor`, `gc` and `install`.
 
 ## Required behavior
 
@@ -32,6 +32,7 @@ The normative wire shape, outcomes and selector rules are in [Protocol v1](PROTO
 - Publish is squash-only. Local and remote branch movement use compare-and-swap; remote push is opt-in and lease-protected. Integration conflicts produce a resolution workspace.
 - Mutating any workspace can never mutate its base, dependency layer or sibling. Production clone failure returns `COW_UNAVAILABLE`.
 - A lease expiry never destroys work. An unheartbeated session becomes dormant with its tree, checkpoints and secret decisions intact, `attach` resumes it under a fresh lease, and deletion is always explicit through `release`.
+- Disk can be reclaimed without losing work. `sleep` suspends a quiescent workspace, giving up only its tree, and `wake` rebuilds the content as a successor from the sleep checkpoint, the private-file vault and the shared dependency layer. A suspended workspace is never a GC candidate.
 - The daemon journals operations before side effects, commits completion with its event, reconciles interrupted work at startup and fences stale leases.
 - GC rechecks every preservation gate immediately before deletion and operates only on daemon-owned resources.
 
