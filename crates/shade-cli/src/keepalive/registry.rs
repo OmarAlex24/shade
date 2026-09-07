@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shade_engine::config::EngineConfig;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const RECORD_VERSION: u32 = 1;
@@ -62,9 +62,43 @@ pub fn ensure_directory(config: &EngineConfig) -> io::Result<PathBuf> {
             .recursive(true)
             .mode(0o700)
             .create(&path)?;
+        // Checked before the chmod, so a directory this process must not own
+        // is never widened or narrowed by it.
+        private_directory(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(directory)
+}
+
+/// Refuse to keep pidfiles anywhere that is not this user's own directory.
+///
+/// `create_dir_all` is satisfied by anything that resolves to a directory,
+/// symlinks included, and says nothing about who owns what it found. A
+/// keepalive directory that is a symlink is a directory some other process
+/// chose: it decides where a PID that `stop` will signal is read from, and the
+/// `chmod` that follows would be applied to its target. Neither is a decision
+/// a runtime path may inherit from whatever happens to be on disk.
+fn private_directory(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != super::owner::effective_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is owned by another user", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 /// Write the record through a private staging file and one atomic rename, so a
@@ -301,6 +335,32 @@ mod tests {
         written.root = "/somewhere/else".into();
         std::fs::write(path(&config, "mine"), serde_json::to_vec(&written).unwrap()).unwrap();
         assert!(read(&config, "mine").is_none());
+    }
+
+    /// A runtime path that is a symlink is a directory something else chose,
+    /// and this one holds the PIDs `stop` signals and gets chmodded to 0700 on
+    /// every use. `create_dir_all` is satisfied by it; the check is not.
+    #[test]
+    fn a_keepalive_directory_that_is_a_symlink_is_refused() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EngineConfig::at(temporary.path());
+        let elsewhere = temporary.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(config.runtime_dir()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, directory(&config)).unwrap();
+
+        let refused = ensure_directory(&config).expect_err("a symlinked directory is refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "and the mode of whatever it pointed at is left alone"
+        );
+        assert!(
+            write(&config, &filed(&config, "chat/42", 4242)).is_err(),
+            "so nothing is ever filed through it"
+        );
     }
 
     #[test]

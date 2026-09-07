@@ -42,6 +42,43 @@ impl shade_engine::dependencies::DependencyProvider for FailingDependencies {
     }
 }
 
+/// Every directory the engine invents on the way to its root is private from
+/// the moment it exists. `create_dir_all` made them with `0o777` minus the
+/// umask -- world-readable under the usual `022` -- and only the leaf was
+/// chmodded afterwards, so an intermediate directory stayed open for good and
+/// the leaf was open for as long as the chmod took to arrive.
+#[test]
+fn every_directory_the_engine_creates_for_its_root_is_private_from_the_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("nested/deeper/state");
+    let engine = Engine::with_components(
+        EngineConfig::at(&root),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap();
+    drop(engine);
+
+    for path in [
+        directory.path().join("nested"),
+        directory.path().join("nested/deeper"),
+        root.clone(),
+        root.join("repositories"),
+        root.join("bases"),
+        root.join("workspaces"),
+        root.join("dependencies"),
+        root.join("runtime"),
+        root.join("secrets"),
+    ] {
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{} must not be readable by anyone else, ever",
+            path.display()
+        );
+    }
+}
+
 #[tokio::test]
 async fn operation_diagnostics_are_durable_redacted_and_excluded_from_events() {
     let directory = tempfile::tempdir().unwrap();

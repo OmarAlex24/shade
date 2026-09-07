@@ -24,7 +24,7 @@ use shade_protocol::{
     WorkspaceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -4788,10 +4788,21 @@ fn cleanup_directory_entries(
     Ok(removed)
 }
 
+/// Build the Shade root and its top-level directories, private from the
+/// instant they exist.
+///
+/// `create_dir_all` creates with `0o777` minus the umask -- world-readable
+/// under the usual `022` -- and the `chmod` that followed closed it a moment
+/// later, which is a moment during which anything on the machine could walk
+/// into a workspace tree. `DirBuilder::mode` closes it at creation instead,
+/// and it applies to every component the recursive call has to invent, not
+/// just the leaf. The `chmod` stays because `mode` is a creation mode the
+/// caller's umask still subtracts from: under a restrictive umask it would
+/// otherwise leave a directory its owner cannot enter, and it does nothing at
+/// all for a directory that already existed.
 fn create_roots(config: &EngineConfig) -> std::io::Result<()> {
-    std::fs::create_dir_all(&config.root)?;
-    std::fs::set_permissions(&config.root, std::fs::Permissions::from_mode(0o700))?;
     for directory in [
+        config.root.clone(),
         config.repositories_dir(),
         config.bases_dir(),
         config.workspaces_dir(),
@@ -4799,7 +4810,10 @@ fn create_roots(config: &EngineConfig) -> std::io::Result<()> {
         config.runtime_dir(),
         config.secrets_dir(),
     ] {
-        std::fs::create_dir_all(&directory)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
