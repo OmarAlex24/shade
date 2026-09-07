@@ -2164,3 +2164,50 @@ async fn prepared_publish_is_private_and_every_cas_phase_is_idempotent() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn an_scp_style_origin_survives_being_read_back_from_its_recorded_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("scp-origin");
+    init_repository(&source, None);
+    commit_fixture(&source);
+    git(
+        &source,
+        &["remote", "add", "origin", "git@GitHub.com:Owner/Repo.git"],
+    );
+    let store = GitStore::system();
+    let identity = store.canonicalize_local(&source).await.unwrap();
+    assert_eq!(
+        identity.remote.canonical,
+        "ssh+scp://git@github.com/Owner/Repo"
+    );
+    assert_eq!(identity.remote.fetch_url, "git@GitHub.com:Owner/Repo.git");
+
+    // Every operation after the open re-canonicalizes the identity the
+    // database recorded, so an identity this cannot read back is a repository
+    // no checkpoint, sleep, fork or publish can reach.
+    let recorded = store
+        .canonicalize_remote(&identity.remote.canonical)
+        .unwrap();
+    assert_eq!(recorded.canonical, identity.remote.canonical);
+    assert_eq!(recorded.fetch_url, "git@github.com:Owner/Repo");
+    assert_eq!(
+        store
+            .canonicalize_remote(&recorded.canonical)
+            .unwrap()
+            .canonical,
+        recorded.canonical
+    );
+
+    // The scheme names an endpoint, not a path: it never becomes one.
+    for hostile in [
+        "ssh+scp://git@github.com",
+        "ssh+scp://git@github.com/",
+        "ssh+scp:///Owner/Repo",
+    ] {
+        assert!(
+            store.canonicalize_remote(hostile).is_err(),
+            "accepted {hostile}"
+        );
+    }
+}

@@ -20,6 +20,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use url::Url;
 
+/// The scheme the canonical identity of an scp-style SSH remote carries. It
+/// records that the endpoint is scp syntax rather than `ssh://`, whose path is
+/// absolute where scp's is relative to the remote user's home directory.
+const SCP_IDENTITY_SCHEME: &str = "ssh+scp://";
 const PRIVATE_REFS: &str = "refs/shade";
 const QUARANTINE_REF: &str = "refs/shade/quarantine/fetched-head";
 /// Bases taken from the local repository are anchored here so their objects
@@ -1136,26 +1140,21 @@ fn canonicalize_remote(locator: &str) -> anyhow::Result<RemoteIdentity> {
     let locator = locator.trim();
     ensure!(!locator.is_empty(), "remote locator cannot be empty");
 
+    // The identity this returns for an scp-style remote is read back the next
+    // time the repository is touched, so the scheme it invents has to survive
+    // the round trip. It is not a transport Git knows, and it is checked
+    // before the parser below, which would only reject it.
+    if let Some(rest) = locator.strip_prefix(SCP_IDENTITY_SCHEME) {
+        let (authority, path) = rest.split_once('/').context("scp identity has no path")?;
+        return canonicalize_scp(authority, path);
+    }
+
     if !locator.contains("://") {
         if let Some((authority, path)) = locator.split_once(':')
             && !authority.contains('/')
             && !path.is_empty()
         {
-            let (user, host) = authority
-                .rsplit_once('@')
-                .map_or((None, authority), |(user, host)| (Some(user), host));
-            ensure!(!host.is_empty(), "scp-style remote has no host");
-            let host = host.to_ascii_lowercase();
-            let transport_path = path.trim_matches('/');
-            let identity_path = normalize_remote_path(path);
-            let user = user.filter(|value| !value.is_empty());
-            let canonical_authority = user.map(|user| format!("{user}@{host}")).unwrap_or(host);
-            return Ok(RemoteIdentity {
-                canonical: format!("ssh+scp://{canonical_authority}/{identity_path}"),
-                // Keep scp syntax: unlike ssh://, its path is relative to
-                // the remote user's home directory.
-                fetch_url: format!("{authority}:{transport_path}"),
-            });
+            return canonicalize_scp(authority, path);
         }
         let canonical_path = fs::canonicalize(locator)
             .with_context(|| format!("remote path does not exist: {locator}"))?;
@@ -1203,6 +1202,29 @@ fn canonicalize_remote(locator: &str) -> anyhow::Result<RemoteIdentity> {
     Ok(RemoteIdentity {
         canonical,
         fetch_url,
+    })
+}
+
+/// The identity and fetch endpoint of an scp-style SSH remote, `host:path` or
+/// `user@host:path`. `authority` is everything before the separator and must
+/// already be free of `/`, which is what distinguishes this syntax from a
+/// local path.
+fn canonicalize_scp(authority: &str, path: &str) -> anyhow::Result<RemoteIdentity> {
+    let (user, host) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(user, host)| (Some(user), host));
+    ensure!(!host.is_empty(), "scp-style remote has no host");
+    let host = host.to_ascii_lowercase();
+    let transport_path = path.trim_matches('/');
+    ensure!(!transport_path.is_empty(), "scp-style remote has no path");
+    let identity_path = normalize_remote_path(path);
+    let user = user.filter(|value| !value.is_empty());
+    let canonical_authority = user.map(|user| format!("{user}@{host}")).unwrap_or(host);
+    Ok(RemoteIdentity {
+        canonical: format!("{SCP_IDENTITY_SCHEME}{canonical_authority}/{identity_path}"),
+        // Keep scp syntax: unlike ssh://, its path is relative to
+        // the remote user's home directory.
+        fetch_url: format!("{authority}:{transport_path}"),
     })
 }
 
