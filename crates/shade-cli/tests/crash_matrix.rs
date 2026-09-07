@@ -1249,11 +1249,22 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
         );
         fixture.assert_consistent();
         if point == Point::ReconcileLeasesExpired {
+            // An expired lease is not garbage any more. A collector round must
+            // leave the dormant workspace exactly where reconciliation left it;
+            // only the explicit release below can still reach it.
             std::thread::sleep(Duration::from_millis(2));
-            fixture.execute(json!({"kind":"garbage_collect"}), "cleanup-expired-session");
+            fixture.execute(json!({"kind":"garbage_collect"}), "sweep-dormant-session");
+            assert_eq!(
+                count(
+                    &fixture.database(),
+                    "SELECT count(*) FROM workspaces WHERE state='dormant'"
+                ),
+                1,
+                "the collector took a dormant workspace it must not touch"
+            );
             assert_eq!(
                 count(&fixture.database(), "SELECT count(*) FROM workspaces"),
-                0
+                1
             );
         }
         assert_eq!(
@@ -1711,7 +1722,9 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
         assert_dependency_artifacts_clean(&fixture.root);
         for id in strings(
             &fixture.database(),
-            "SELECT workspace_id FROM sessions WHERE state='active'",
+            // A dormant session still owns a tree, so the cleanup has to
+            // release it as deliberately as an active one.
+            "SELECT workspace_id FROM sessions WHERE state IN ('active','dormant')",
         ) {
             let result = fixture.execute(
                 json!({"kind":"workspace_release","selector":{"workspace_id":id}}),
