@@ -404,7 +404,14 @@ export async function runRealSessionHarness(
     ]);
     assert.equal(slept.suspended, true);
     assert.equal(slept.workspace, opened.workspace);
-    assert.ok(slept.reclaimed_bytes > 0, "sleeping a materialized tree reclaims disk");
+    // `private_bytes` on APFS, so zero is a legitimate answer: a clone whose
+    // every block is still shared with the immutable base frees nothing by
+    // being removed. What the contract promises is a number, measured before
+    // the tree goes, not that it is positive.
+    assert.ok(
+      Number.isFinite(slept.reclaimed_bytes) && slept.reclaimed_bytes >= 0,
+      "sleep reports the disk it measured before removing the tree",
+    );
     assert.equal(await pathExists(opened.cwd), false, "sleep gives up the tree");
     let suspendedDoctor = await runDoctor(shadeBin, stateRoot, socket);
     assert.equal(suspendedDoctor.workspaces_suspended, 1);

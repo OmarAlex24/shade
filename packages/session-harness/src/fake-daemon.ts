@@ -1,7 +1,9 @@
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   rmSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -36,6 +38,9 @@ interface FakeSession {
   released: boolean;
   /** Slept: the record is whole, the tree is gone, there is no lease. */
   suspended: boolean;
+  /** The `sleep` checkpoint a wake rebuilds from. A suspension without one is
+   * unwakeable, which is what `SUSPENSION_CHECKPOINT_MISSING` names. */
+  suspension_checkpoint?: string | undefined;
   expires_at_ms: number;
   secret_review: boolean;
 }
@@ -117,6 +122,18 @@ export class FakeShadeDaemon {
     const session = this.sessions.get(session_id);
     if (session === undefined) throw new Error(`no session ${session_id}`);
     session.expires_at_ms = 0;
+  }
+
+  /**
+   * Take away the checkpoint a suspension wakes from, which is the shape a
+   * suspended workspace is in when its checkpoint was collected or never
+   * finished being written. The daemon has `suspended_without_checkpoint` in
+   * `doctor` for exactly this; the harness needs to be able to produce it.
+   */
+  loseSuspensionCheckpoint(session_id: string): void {
+    const session = this.sessions.get(session_id);
+    if (session === undefined) throw new Error(`no session ${session_id}`);
+    session.suspension_checkpoint = undefined;
   }
 
   get active_leases(): number {
@@ -320,9 +337,26 @@ export class FakeShadeDaemon {
         return;
       }
       case "workspace_sleep": {
-        const session = this.select(intent.selector);
+        // Dormancy is no obstacle: an idle workspace is the one worth
+        // reclaiming disk from. A suspended one already answered
+        // `SESSION_SUSPENDED` inside `select`.
+        const session = this.select(intent.selector, { dormant: "allowed" });
+        this.refuseUnquiescent(session);
+        if (!existsSync(session.opened.cwd)) {
+          throw new FakeRequestError({
+            code: "WORKSPACE_NOT_MATERIALIZED",
+            retry: "never",
+            next: `shade wake --session ${session.opened.session}`,
+          });
+        }
         const checkpointId = this.next("ckpt", ++this.checkpoint_sequence);
+        // Measured while the tree is still there, and reported as measured: a
+        // constant here let `reclaimed_bytes > 0` pass in the harness while the
+        // daemon is free to answer 0 for a workspace whose blocks are all
+        // shared with the immutable base.
+        const reclaimedBytes = treeBytes(session.opened.cwd);
         session.suspended = true;
+        session.suspension_checkpoint = checkpointId;
         session.expires_at_ms = 0;
         // The tree is what sleep gives up; everything else survives.
         rmSync(session.opened.cwd, { recursive: true, force: true });
@@ -349,7 +383,7 @@ export class FakeShadeDaemon {
               workspace: session.opened.workspace,
               checkpoint_id: checkpointId,
               suspended: true,
-              reclaimed_bytes: 4096,
+              reclaimed_bytes: reclaimedBytes,
             },
           },
           intent.kind,
@@ -372,6 +406,16 @@ export class FakeShadeDaemon {
             retry: "never",
           });
         }
+        if (
+          session.suspended &&
+          session.suspension_checkpoint === undefined
+        ) {
+          throw new FakeRequestError({
+            code: "SUSPENSION_CHECKPOINT_MISSING",
+            retry: "never",
+            next: "shade release --session <id>",
+          });
+        }
         // Waking a session that never slept just resumes it, which is what
         // makes `wake` safe to call unconditionally.
         const opened = session.suspended
@@ -383,6 +427,7 @@ export class FakeShadeDaemon {
           { session: opened.session, lease: opened.lease },
         );
         session.suspended = false;
+        session.suspension_checkpoint = undefined;
         this.completeOperation(
           socket,
           requestId,
@@ -564,7 +609,8 @@ export class FakeShadeDaemon {
         return;
       }
       case "workspace_release": {
-        const session = this.select(intent.selector);
+        // Release, like sleep, is exactly what a dormant workspace is for.
+        const session = this.select(intent.selector, { dormant: "allowed" });
         if (session.secret_review && !session.released) {
           const reviewId = this.next("review", ++this.review_sequence);
           this.reviews.set(reviewId, {
@@ -713,8 +759,16 @@ export class FakeShadeDaemon {
         if (session === undefined || session.released) {
           throw new FakeRequestError({ code: "LEASE_EXPIRED", retry: "never" });
         }
+        // A superseded lease id simply matches no live row, which is
+        // indistinguishable from an expiry: the daemon's heartbeat has exactly
+        // two refusals, and `LEASE_FENCED` is not one of them. Answering it
+        // here taught hosts to handle a case the wire never produces.
         if (session.opened.lease !== intent.lease_id) {
-          throw new FakeRequestError({ code: "LEASE_FENCED", retry: "never" });
+          throw new FakeRequestError({
+            code: "LEASE_EXPIRED",
+            retry: "never",
+            next: "open a new session",
+          });
         }
         // Sleeping releases the lease too, so a suspension would otherwise be
         // indistinguishable from a dormancy -- and send the caller into a
@@ -896,6 +950,32 @@ export class FakeShadeDaemon {
    * lease every time made the harness assert the opposite of what a real host
    * observes -- and hid the case where a host caches the lease it was handed.
    */
+  /**
+   * Refuse a workspace with work of its own still in flight.
+   *
+   * A pending resolution or an unadopted handoff means a second owner is still
+   * going to want this tree, and the daemon answers `WORKSPACE_NOT_QUIESCENT`
+   * with `retry: safe` -- finish or cancel that work and the sleep succeeds.
+   */
+  private refuseUnquiescent(session: FakeSession): void {
+    const workspace = session.opened.workspace;
+    const busy =
+      [...this.resolutions.values()].some(
+        (pending) => pending.parent.opened.workspace === workspace,
+      ) ||
+      [...this.handoffs.values()].some(
+        (pending) =>
+          !pending.adopted && pending.parent.opened.workspace === workspace,
+      );
+    if (busy) {
+      throw new FakeRequestError({
+        code: "WORKSPACE_NOT_QUIESCENT",
+        retry: "safe",
+        next: "finish or cancel the pending work, then shade sleep",
+      });
+    }
+  }
+
   private renewLease(session: FakeSession): OpenedSessionPayload {
     const live = session.expires_at_ms >= Date.now();
     const lease = live
@@ -1040,16 +1120,43 @@ export class FakeShadeDaemon {
         retry: "never",
       });
     }
-    if (pending.parent.released || pending.parent.expires_at_ms < Date.now()) {
+    if (pending.parent.released) {
       throw new FakeRequestError({
-        code: "WORKSPACE_RELEASED",
+        code: "WORKSPACE_ALREADY_RELEASED",
         retry: "never",
+        next: "open a new session",
+      });
+    }
+    if (pending.parent.expires_at_ms < Date.now()) {
+      throw new FakeRequestError({
+        code: "LEASE_EXPIRED",
+        retry: "never",
+        next: `shade attach --session ${pending.parent.opened.session}`,
       });
     }
     return pending;
   }
 
-  private select(selector: WorkspaceSelector): FakeSession {
+  /**
+   * Resolve a selector to a session, answering the way the engine answers.
+   *
+   * The lifecycle order matters and is the engine's: released first, then
+   * suspended, then dormancy. A suspended workspace is checked before the cwd,
+   * because its tree is gone and the caller is still holding the path it used
+   * to have -- `SELECTOR_MISMATCH` would be true and useless where
+   * `SESSION_SUSPENDED` names the command that fixes it.
+   *
+   * `dormant` decides whether a lapsed lease is fatal. Most intents need a live
+   * lease and get `LEASE_EXPIRED` with the attach command; sleep and release do
+   * not, because an idle workspace is exactly the one worth reclaiming disk
+   * from, and refusing them was the bug: `WORKSPACE_RELEASED` for a workspace
+   * that is merely dormant made a whole class of sleeps impossible here that
+   * the daemon performs happily.
+   */
+  private select(
+    selector: WorkspaceSelector,
+    options: { dormant?: "allowed" } = {},
+  ): FakeSession {
     this.selector_checks += 1;
     if (selector.workspace_id === undefined || selector.cwd === undefined) {
       throw new FakeRequestError({
@@ -1066,16 +1173,31 @@ export class FakeShadeDaemon {
         retry: "never",
       });
     }
+    if (session.released) {
+      throw new FakeRequestError({
+        code: "WORKSPACE_ALREADY_RELEASED",
+        retry: "never",
+        next: "open a new session",
+      });
+    }
+    if (session.suspended) {
+      throw new FakeRequestError({
+        code: "SESSION_SUSPENDED",
+        retry: "never",
+        next: `shade wake --session ${session.opened.session}`,
+      });
+    }
     if (session.opened.cwd !== selector.cwd) {
       throw new FakeRequestError({
         code: "SELECTOR_MISMATCH",
         retry: "never",
       });
     }
-    if (session.released || session.expires_at_ms < Date.now()) {
+    if (options.dormant !== "allowed" && session.expires_at_ms < Date.now()) {
       throw new FakeRequestError({
-        code: "WORKSPACE_RELEASED",
+        code: "LEASE_EXPIRED",
         retry: "never",
+        next: `shade attach --session ${session.opened.session}`,
       });
     }
     return session;
@@ -1229,4 +1351,38 @@ export class FakeShadeDaemon {
   private next(prefix: string, value: number): string {
     return `${prefix}-${value.toString().padStart(4, "0")}`;
   }
+}
+
+/**
+ * What removing this tree actually gives back, measured while it is still
+ * there. Zero for an empty or missing directory, which the daemon can report
+ * too: on APFS a clone whose blocks are all shared with the immutable base
+ * frees nothing at all.
+ */
+function treeBytes(root: string): number {
+  let total = 0;
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop() as string;
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(path);
+      } else if (entry.isFile()) {
+        try {
+          total += statSync(path).size;
+        } catch {
+          // A file that vanished between the listing and the stat is gone
+          // either way, which is the number this is measuring.
+        }
+      }
+    }
+  }
+  return total;
 }
