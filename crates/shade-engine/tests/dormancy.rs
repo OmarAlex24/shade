@@ -271,16 +271,35 @@ async fn open_with_an_existing_dormant_session_id_reattaches_instead_of_erroring
     assert_eq!(same_base.workspace, opened.workspace);
 }
 
+/// Move a live lease's deadline without releasing it, the way a lease that has
+/// been running down since its last heartbeat looks.
+fn set_lease_deadline(root: &Path, session: &SessionId, expires_at_ms: i64) {
+    let connection =
+        rusqlite::Connection::open(EngineConfig::at(root.join("state")).database_path()).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE leases SET expires_at_ms=?2 WHERE session_id=?1 AND released_at_ms IS NULL",
+            rusqlite::params![session.0, expires_at_ms],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
 #[tokio::test]
-async fn reattach_of_an_active_session_is_idempotent() {
+async fn reattach_of_an_active_session_is_idempotent_and_renews_its_deadline() {
     let directory = tempfile::tempdir().unwrap();
     let repository = fixture(directory.path());
-    let engine = engine_at(directory.path());
+    let ttl_secs = 120;
+    let engine = engine_with_lease_ttl(directory.path(), ttl_secs);
     let opened: OpenedSession = completed(
         engine
             .execute(execute("open", open_request(&repository, SESSION, None)))
             .await,
     );
+    // Live, but with a fraction of a second left on it: the state an `attach`
+    // arrives in after the previous holder stopped heartbeating.
+    let expiring = shade_engine::db::now_ms() + 200;
+    set_lease_deadline(directory.path(), &opened.session, expiring);
 
     let resumed: OpenedSession = completed(
         engine
@@ -297,14 +316,16 @@ async fn reattach_of_an_active_session_is_idempotent() {
         "no second live lease is minted"
     );
     assert_eq!(resumed.workspace, opened.workspace);
-    assert_eq!(
-        engine
-            .database()
-            .active_lease_for_session(&opened.session)
-            .unwrap()
-            .unwrap()
-            .fence,
-        1
+    let lease = engine
+        .database()
+        .active_lease_for_session(&opened.session)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.fence, 1, "the same lease at the same fence");
+    assert!(
+        lease.expires_at_ms >= shade_engine::db::now_ms() + ttl_secs * 1000 - 5_000,
+        "an idempotent reattach still hands back a full TTL, not {} ms of one",
+        lease.expires_at_ms - expiring
     );
 }
 

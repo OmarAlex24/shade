@@ -769,13 +769,32 @@ impl Database {
             )
             .optional()?;
         // Reattaching an Active session is idempotent: the caller receives the
-        // lease it already holds rather than a second one.
+        // lease it already holds rather than a second one. It receives it with
+        // a full TTL, though. A reattach is a caller announcing that it is
+        // here, and its own heartbeat is one interval away; handing back
+        // whatever was left of a lease that had been running down since the
+        // last beat is how an `attach` ends in dormancy a moment later.
         if let Some(lease) = live {
             if lease.workspace_id != *expected_workspace {
                 return Err(DbError::LeaseFenced);
             }
+            let expires_at_ms = now + ttl_secs * 1000;
+            transaction.execute(
+                "UPDATE leases SET heartbeat_at_ms=?2, expires_at_ms=?3 WHERE id=?1",
+                params![lease.id.0, now, expires_at_ms],
+            )?;
+            append_event(
+                &transaction,
+                "lease.heartbeat",
+                &lease.id.0,
+                &json!({"lease": lease.id, "expires_at_ms": expires_at_ms}),
+            )?;
             transaction.commit()?;
-            return Ok(lease);
+            return Ok(LeaseRecord {
+                heartbeat_at_ms: now,
+                expires_at_ms,
+                ..lease
+            });
         }
         let session = transaction.execute(
             "UPDATE sessions SET state='active', updated_at_ms=?3 \

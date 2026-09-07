@@ -411,6 +411,39 @@ fn sleep_stops_the_keepalive_and_wake_starts_a_new_one() {
     drop(guard);
 }
 
+/// The child must prove itself before it waits, not after. With a two-minute
+/// interval the only heartbeat that can arrive promptly is the one sent at
+/// startup, which is what stops an `attach` whose lease has little left on it
+/// from lapsing while its keepalive sleeps through the remainder.
+#[test]
+fn the_keepalive_heartbeats_once_before_its_first_wait() {
+    let fixture = Fixture::new();
+    let _daemon = fixture.daemon(120);
+    let owner = fake_owner();
+
+    let opened = fixture.cli(&[
+        "open",
+        fixture.source.to_str().unwrap(),
+        "--session",
+        "ka-first-beat",
+        "--interval-secs",
+        "120",
+        "--owner-pid",
+        &owner.0.to_string(),
+    ]);
+    assert_eq!(opened["status"], "ok", "{opened}");
+    let pid = keepalive(&opened)["pid"].as_u64().unwrap() as u32;
+    let _guard = PidGuard(pid);
+    let lease = opened["outcome"]["result"]["lease"].as_str().unwrap();
+
+    let beat = wait_for(|| fixture.heartbeats(lease) >= 1);
+    assert!(
+        beat,
+        "the first heartbeat must not wait a whole interval; keepalive log:\n{}",
+        fixture.keepalive_log("ka-first-beat")
+    );
+}
+
 #[test]
 fn stale_pidfile_is_replaced_on_reopen() {
     let fixture = Fixture::new();

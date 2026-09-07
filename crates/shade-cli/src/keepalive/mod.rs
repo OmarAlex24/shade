@@ -241,22 +241,32 @@ pub async fn run(config: &EngineConfig, client: &ShadeClient, args: RunArgs) -> 
         process.pid(),
         interval.as_secs()
     ));
+    // The first beat goes out before the first wait. Everything this child was
+    // handed -- the lease, the owner identity, the daemon socket -- is proven
+    // by using it now rather than a whole interval from now, and a lease
+    // handed over with less than an interval left is renewed before it can
+    // lapse into dormancy.
+    let mut immediate = true;
     loop {
-        let watcher = Arc::clone(&process);
-        let observed = tokio::task::spawn_blocking(move || watcher.wait(interval)).await??;
-        if observed == watch::Observed::Exited {
-            log.line("owner_exited");
-            break;
-        }
-        if !owner::identity(args.owner_pid).is_some_and(|current| {
-            current.same_process(
-                args.owner_pid,
-                args.owner_start_tvsec,
-                args.owner_start_tvusec,
-            )
-        }) {
-            log.line("owner_replaced");
-            break;
+        if immediate {
+            immediate = false;
+        } else {
+            let watcher = Arc::clone(&process);
+            let observed = tokio::task::spawn_blocking(move || watcher.wait(interval)).await??;
+            if observed == watch::Observed::Exited {
+                log.line("owner_exited");
+                break;
+            }
+            if !owner::identity(args.owner_pid).is_some_and(|current| {
+                current.same_process(
+                    args.owner_pid,
+                    args.owner_start_tvsec,
+                    args.owner_start_tvusec,
+                )
+            }) {
+                log.line("owner_replaced");
+                break;
+            }
         }
         match heartbeat(client, &record.session, &record.lease).await {
             Beat::Renewed | Beat::Domain => {
