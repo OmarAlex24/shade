@@ -18,7 +18,8 @@ Platform constraint, stated up front: **Apple Silicon, macOS and APFS only.** Th
 - Workspaces are APFS clones of that base, created with `clonefileat` / `fclonefileat` against pinned directory descriptors, staged beside the destination and atomically published only after they verify.
 - Dependency layers are shared across workspaces by fingerprint. Fingerprints cover lock contents, the workspace graph, host tool identity, OS/ABI and the isolation policy; they exclude credentials and absolute paths.
 - Dependency installs run in a sandbox. Offline replay runs under macOS `sandbox-exec` with network operations denied for the process tree, and JavaScript lifecycle scripts run only after an explicit per package/version/integrity approval.
-- Sessions hold a lease. Holders heartbeat every 30 seconds; a lease expires after 120 seconds and stays out of GC for a further 10 minute grace period.
+- Sessions hold a lease. The CLI starts a detached keepalive tied to the agent process that opened the session and stops it when that process exits; SDK session handles heartbeat in-process. A lease expires after 120 seconds without a heartbeat.
+- An expired lease makes a workspace **dormant**, not garbage. A dormant workspace keeps its tree, its checkpoints and its secret decisions, is never garbage-collected, and `shade attach --session <id>` brings it back with a fresh lease. Only `shade release` makes a workspace collectible.
 - Checkpoints capture HEAD, the real index tree and the complete working tree, including deletions, untracked files, symlinks and executable modes.
 - Sync, restore, dependency refresh and reviewed secret merge produce a **successor** workspace through a two-phase handoff. The predecessor stays live until the caller adopts the new cwd and env. No integration path rewrites or deletes a predecessor.
 - Publish is squash-only, with compare-and-swap on the branch and opt-in, lease-protected push. A conflict is a first-class outcome that returns a resolution workspace.
@@ -48,16 +49,15 @@ export SHADE_WORKSPACE="$(jq -r '.outcome.result.env.SHADE_WORKSPACE' <<<"$opene
 export SHADE_LEASE="$(jq -r '.outcome.result.env.SHADE_LEASE' <<<"$opened")"
 export SHADE_SOCKET="$(jq -r '.outcome.result.env.SHADE_SOCKET' <<<"$opened")"
 cd "$(jq -r '.outcome.result.cwd' <<<"$opened")"
-# Both SDK session handles heartbeat on their own. A standalone CLI owner
-# must run this at least every 30 seconds while the session is alive:
-shade heartbeat
+# `open` already started a keepalive for this shell; `shade heartbeat` stays
+# available as the manual fallback when you opt out with --no-keepalive.
 shade context
 shade checkpoint --reason before-refactor
 shade publish --branch agent/result --message 'Result'
 shade release
 ```
 
-The full command set is `open`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`, plus the administrative `warm`, `review resolve`, `doctor`, `gc` and `install`.
+The full command set is `open`, `attach`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`, plus the administrative `warm`, `review resolve`, `doctor`, `gc` and `install`.
 
 Mutation commands wait for their terminal domain outcome. A client deadline does not cancel daemon work: the structured timeout carries `operation` when known, and its `next` field preserves the exact idempotency key for a safe retry.
 

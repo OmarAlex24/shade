@@ -61,14 +61,42 @@ GC checks current secrets before deleting an eligible directory. A newly discove
 
 Path and content detection share one local scanner. The CLI also serves Git's persistent clean/smudge protocol, withholding a file until its complete contents pass policy. Safe requests pass byte-for-byte; rejected requests return no content. Git history and index retention are validated independently of that porcelain guardrail. Private working files are copied after checkpoint restoration, so a tracked file can retain its safe index version while its detected secret contents follow the successor outside Git. Baseline files are stored separately from metadata. JSON/TOML merges operate on keys; ambiguous or opaque conflicts are checked before successor allocation.
 
+## Workspace lifecycle
+
+A session and its workspace share one lifecycle with four states. This is the
+vocabulary reported by `CompactContext.lifecycle` and the `session` query; on
+disk the workspace row reads `ready` while the session is `active`. Only one
+transition destroys work.
+
+| State | Tree on disk | Lease | Reached by | Leaves by |
+| --- | --- | --- | --- | --- |
+| `active` | materialized | live | `open`, `attach`, adoption of a successor | lease expiry, `release` |
+| `dormant` | materialized | none | lease expiry (no heartbeat for 120 s) | `attach` / `open` on the same session, `release` |
+| `suspended` | reclaimed | none | explicit suspension (not implemented) | explicit resumption, `release` |
+| `released` | deleted after GC | none | `release` | — |
+
+Dormancy is the ordinary resting state of an agent that stopped talking, not a
+fault. A dormant workspace keeps its tree, its checkpoints, its retention refs
+and its secret decisions; it is excluded from GC candidacy, and its mutations
+fail with `LEASE_EXPIRED` carrying the attach command in `next`. Reattachment is
+a single transaction that renews the lease at the next fence, restores the
+workspace to `ready` and emits `session.reattached` with `lease.acquired`; it is
+idempotent for a session that already holds a live lease. Deletion is always
+explicit: `release` is the only path into `released`, which is also the only
+state GC collects, and only after its grace period.
+
+Sessions and workspaces recorded as `orphaned` by an earlier version are
+normalized to `dormant` at startup, which is a value change and not a schema
+change: neither column carries a CHECK constraint and `user_version` stays at 1.
+
 ## Failure model
 
 - Operations are idempotent per actor/key and reject key reuse for a different intent.
 - WAL + `synchronous=FULL` protects control-plane transitions.
 - Private retention refs independently anchor checkpoint HEAD, real index tree and working tree.
-- Startup reconciliation expires leases, cancels their pending handoffs, closes interrupted non-terminal operations and removes only known staging artifacts. An interrupted successor adoption is closed with `OPERATION_INTERRUPTED`, but its original actor/key may atomically reclaim the same operation ID and retry the pending handoff.
+- Startup reconciliation normalizes legacy states, expires leases into dormancy, cancels their pending handoffs, closes interrupted non-terminal operations and removes only known staging artifacts. An expired lease never deletes a tree; it only drops the session to `dormant`. An interrupted successor adoption is closed with `OPERATION_INTERRUPTED`, but its original actor/key may atomically reclaim the same operation ID and retry the pending handoff.
 - Reconciliation also removes locked registrations at the exact `.shade-register-*/worktree` staging shape. If `.git` was already moved but repair did not finish, the empty staging directory is removed before asking Git to remove its registration. Arbitrary nested paths and symlinked stages are ineligible. Temporary Git indexes live beside managed repositories and use the same owned staging cleanup.
-- GC checks the lease, operation, review, checkpoint, unmerged-index and detached-commit gates again immediately before deletion.
+- GC only ever considers `released`, `failed` and legacy `orphaned` workspaces, so a dormant workspace is not a candidate at any point. It checks the lease, operation, review, checkpoint, unmerged-index and detached-commit gates again immediately before deletion.
 - Common replies stay compact; [durable failure diagnostics](DIAGNOSTICS.md) are referenced by `diagnostics_id`. Sanitized detail commits with the failed operation and outbox event; explicit CLI/SDK queries retrieve it. The CLI can also read the existing database while the daemon is stopped.
 
 The deterministic full-copy `CopyFilesystem` exists only behind the `test-support` Cargo feature, which the crate enables for its own integration tests and never for the distribution binary; a release build has no byte-copy `WorkspaceFilesystem` to reach, so `COW_UNAVAILABLE` cannot degrade into silent copying. The Apple Silicon/APFS gate is enforced by `Engine::with_components_and_git`, the single constructor body every other constructor funnels through, so `with_components` and `open` reject an unsupported platform identically with `PLATFORM_UNSUPPORTED`: tests cannot run on a construction path production cannot reach.

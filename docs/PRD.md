@@ -21,7 +21,7 @@ query(query)
 events(after_cursor)
 ```
 
-The normative wire shape, outcomes and selector rules are in [Protocol v1](PROTOCOL.md). The CLI exposes `open`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`; administration adds `warm`, `review resolve`, `doctor`, `gc` and `install`.
+The normative wire shape, outcomes and selector rules are in [Protocol v1](PROTOCOL.md). The CLI exposes `open`, `attach`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`; administration adds `warm`, `review resolve`, `doctor`, `gc` and `install`.
 
 ## Required behavior
 
@@ -31,6 +31,7 @@ The normative wire shape, outcomes and selector rules are in [Protocol v1](PROTO
 - Sync, restore, dependency refresh and reviewed secret merge produce successors. Their predecessor remains available until the caller adopts the returned cwd and environment.
 - Publish is squash-only. Local and remote branch movement use compare-and-swap; remote push is opt-in and lease-protected. Integration conflicts produce a resolution workspace.
 - Mutating any workspace can never mutate its base, dependency layer or sibling. Production clone failure returns `COW_UNAVAILABLE`.
+- A lease expiry never destroys work. An unheartbeated session becomes dormant with its tree, checkpoints and secret decisions intact, `attach` resumes it under a fresh lease, and deletion is always explicit through `release`.
 - The daemon journals operations before side effects, commits completion with its event, reconciles interrupted work at startup and fences stale leases.
 - GC rechecks every preservation gate immediately before deletion and operates only on daemon-owned resources.
 
