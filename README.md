@@ -18,7 +18,7 @@ Platform constraint, stated up front: **Apple Silicon, macOS and APFS only.** Th
 - Workspaces are APFS clones of that base, created with `clonefileat` / `fclonefileat` against pinned directory descriptors, staged beside the destination and atomically published only after they verify.
 - Dependency layers are shared across workspaces by fingerprint. Fingerprints cover lock contents, the workspace graph, host tool identity, OS/ABI and the isolation policy; they exclude credentials and absolute paths.
 - Dependency installs run in a sandbox. Offline replay runs under macOS `sandbox-exec` with network operations denied for the process tree, and JavaScript lifecycle scripts run only after an explicit per package/version/integrity approval.
-- Sessions hold a lease. The CLI starts a detached keepalive tied to the agent process that opened the session and stops it when that process exits; SDK session handles heartbeat in-process. A lease expires after 120 seconds without a heartbeat.
+- Sessions hold a lease. SDK session handles heartbeat in-process. The CLI starts a detached keepalive only when it can find an *agent* among the ancestors of the process that ran `shade open` — by default one of `claude`, `codex`, `cursor`, `cursor-agent`, `kimi` or `zumith`, overridable with `SHADE_OWNER_PROCESS_NAMES` or named outright with `--owner-pid` / `--owner-name`. A plain shell is not an agent: `open` reports `keepalive.state` as `owner_not_detected` and nothing renews the lease, so run `shade heartbeat` yourself or pass `--owner-pid $$`. The keepalive stops when the process it was bound to exits. A lease expires after 120 seconds without a heartbeat.
 - An expired lease makes a workspace **dormant**, not garbage. A dormant workspace keeps its tree, its checkpoints and its secret decisions, is never garbage-collected, and `shade attach --session <id>` brings it back with a fresh lease. Only `shade release` makes a workspace collectible.
 - `shade sleep` **suspends** a workspace: it takes a checkpoint, moves the private files a checkpoint cannot hold into a store outside Git, and gives the tree back to the filesystem. The session, its history and its identity all survive. `shade wake --session <id>` rebuilds the content as a successor workspace with a new id and cwd, restoring the dependency layer from its shared fingerprint rather than reinstalling it.
 - Checkpoints capture HEAD, the real index tree and the complete working tree, including deletions, untracked files, symlinks and executable modes.
@@ -50,8 +50,10 @@ export SHADE_WORKSPACE="$(jq -r '.outcome.result.env.SHADE_WORKSPACE' <<<"$opene
 export SHADE_LEASE="$(jq -r '.outcome.result.env.SHADE_LEASE' <<<"$opened")"
 export SHADE_SOCKET="$(jq -r '.outcome.result.env.SHADE_SOCKET' <<<"$opened")"
 cd "$(jq -r '.outcome.result.cwd' <<<"$opened")"
-# `open` already started a keepalive for this shell; `shade heartbeat` stays
-# available as the manual fallback when you opt out with --no-keepalive.
+# A plain shell is not one of the agent names `open` looks for, so no keepalive
+# was started: check `.outcome.result.keepalive.state`, and either bind one with
+# `--owner-pid $$` or renew the lease yourself.
+shade heartbeat
 shade context
 shade checkpoint --reason before-refactor
 shade publish --branch agent/result --message 'Result'

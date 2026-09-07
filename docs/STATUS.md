@@ -86,7 +86,7 @@ The storage comparison uses `ATTR_CMNEXT_PRIVATESIZE`, not an estimate of global
 
 The [real harness](../artifacts/zenith-real.json) uses a controlled npm executable with the real daemon, Git, APFS and SQLite. It exercises one shared dependency preparation, COW isolation, checkpoints, fork, sync/adoption, publishing, SIGKILL/restart against the same SQLite file, resumed events and final cleanup. [Validation metadata](../artifacts/validation.json) ties these checks to the same release binary digest.
 
-The official Skill measures 267 tokens with `o200k_base` (tiktoken 0.14.0), below the 350-token limit; its exact bytes, tokenizer and limit are recorded in [skill-tokens.json](../artifacts/skill-tokens.json).
+The official Skill measures 273 tokens with `o200k_base` (tiktoken 0.14.0), below the 350-token limit; its exact bytes, tokenizer and limit are recorded in [skill-tokens.json](../artifacts/skill-tokens.json).
 
 ## Final V1 acceptance
 
