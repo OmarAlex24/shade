@@ -6,10 +6,10 @@ import OutcomeFan from './svg/OutcomeFan.astro';
 
 const guarantees = [
   {
-    title: 'Leases',
+    title: 'Leases and the keepalive',
     body:
-      'A session holds a lease while an agent works in it. Holders heartbeat every 30 seconds, a lease expires after 120 seconds, and an expired workspace stays out of garbage collection for a further 10 minute grace period.',
-    figures: ['30 s heartbeat', '120 s expiry', '10 min GC grace'],
+      'A session holds a lease while an agent works in it. shade open spawns a detached keepalive bound to that agent process, holders heartbeat every 30 seconds, and a lease expires after 120 seconds. Expiry drops the session to dormant and never deletes a tree; the 10 minute grace period applies after an explicit release.',
+    figures: ['30 s heartbeat', '120 s expiry', 'expiry to dormant', '10 min grace after release'],
   },
   {
     title: 'Checkpoints',

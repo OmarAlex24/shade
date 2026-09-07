@@ -1,0 +1,237 @@
+---
+// Lifecycle.astro — the four workspace states, in the repository's own words.
+// Copy tracks README ("Sessions hold a lease" onwards), docs/ARCHITECTURE.md
+// "Workspace lifecycle" and docs/PROTOCOL.md. Only `release` destroys work, so
+// the section is built around that single asymmetry.
+import LifecycleTrack from './svg/LifecycleTrack.astro';
+
+const states = [
+  {
+    name: 'active',
+    live: true,
+    tree: 'materialized',
+    lease: 'live',
+    enter: 'shade open, shade attach, adopting a successor',
+    leave: '120 s without a heartbeat, or shade release',
+    body:
+      'shade open spawns a detached keepalive bound to the agent process that asked for the workspace. It heartbeats every 30 seconds and retires the moment its owner exits, so a crashed agent stops holding a lease it can no longer use.',
+  },
+  {
+    name: 'dormant',
+    tree: 'materialized',
+    lease: 'none',
+    enter: 'the lease expires',
+    leave: 'shade attach or shade open on the same session id',
+    body:
+      'The ordinary resting state of an agent that stopped talking, not a fault. The tree, the checkpoints, the retention refs and the secret decisions all stay on disk, and the workspace is never a collection candidate. A mutation fails with LEASE_EXPIRED and hands back the attach command in next.',
+  },
+  {
+    name: 'suspended',
+    tree: 'reclaimed',
+    lease: 'none',
+    enter: 'shade sleep, from active or dormant',
+    leave: 'shade wake, or shade release',
+    body:
+      'sleep takes a checkpoint, vaults the private .env-style files a checkpoint cannot hold, and gives the directory back to the filesystem, so build output and node_modules stop occupying disk. wake rebuilds the work as a fresh COW clone plus that checkpoint, refilled from the shared dependency fingerprint and handed its vaulted files.',
+  },
+  {
+    name: 'released',
+    terminal: true,
+    tree: 'deleted after the grace period',
+    lease: 'none',
+    enter: 'shade release, explicitly',
+    leave: 'nothing — this one is terminal',
+    body:
+      'The only state the collector ever considers, and the only one an operator reaches on purpose. Nothing is deleted automatically by default: the two sweeps that would age a dormant workspace into sleep and a suspension into release are off unless they are turned on.',
+  },
+];
+
+const owners = ['claude', 'codex', 'cursor', 'cursor-agent', 'kimi', 'zumith', '--owner-pid'];
+---
+
+<section class="life section-pad" id="lifecycle" aria-labelledby="life-title">
+  <div class="container">
+    <div class="lbl-row" data-reveal>
+      <span class="lbl">[ Workspace lifecycle ]</span>
+      <span class="lbl">[ 4 states ]</span>
+    </div>
+
+    <div class="life-intro" data-reveal>
+      <h2 class="t-section" id="life-title">
+        A lease that expires <span class="blue">deletes nothing.</span>
+      </h2>
+      <p class="t-body-lg life-lede">
+        A session and its workspace share one lifecycle with four states, and exactly one transition
+        destroys work. An agent that stops talking goes dormant with its tree intact. A workspace you
+        are finished with for now sleeps and gives the disk back. <code class="mono">shade release</code>
+        is the only verb that ends a session, and even that waits out the collector's grace period.
+      </p>
+    </div>
+
+    <div class="life-fig" data-reveal>
+      <LifecycleTrack />
+    </div>
+
+    <div class="divide-grid state-grid" role="list">
+      {states.map((state, i) => (
+        <article class:list={['cell', 'state', { 'state--live': state.live, 'state--terminal': state.terminal }]} role="listitem" data-reveal data-reveal-delay={i * 70}>
+          <h3 class="st-name mono">{state.name}</h3>
+          <dl class="st-facts">
+            <div class="st-fact"><dt>tree</dt><dd>{state.tree}</dd></div>
+            <div class="st-fact"><dt>lease</dt><dd>{state.lease}</dd></div>
+            <div class="st-fact"><dt>enter</dt><dd>{state.enter}</dd></div>
+            <div class="st-fact"><dt>leave</dt><dd>{state.leave}</dd></div>
+          </dl>
+          <p class="st-body">{state.body}</p>
+        </article>
+      ))}
+    </div>
+
+    <div class="panel keepalive" data-reveal>
+      <div class="ka-copy">
+        <span class="lbl">[ Keepalive ]</span>
+        <h3 class="ka-title">The lease is bound to the agent process, not to a terminal.</h3>
+        <p class="ka-body">
+          <code class="mono">shade open</code> walks up its own process tree and binds to the nearest
+          recognised agent ancestor, or to whatever process you name with
+          <code class="mono">--owner-pid</code>. An owner is identified by its pid together with its
+          start time, so a recycled pid can never inherit a lease, and a kqueue watch on that process
+          retires the keepalive the instant it exits. A plain shell is not an agent: there,
+          <code class="mono">shade heartbeat</code> stays the manual fallback, and both SDK session
+          handles heartbeat in-process without a keepalive at all.
+        </p>
+      </div>
+
+      <div class="ka-side">
+        <span class="lbl ka-side-label">[ Recognised owners ]</span>
+        <ul class="ka-names" role="list">
+          {owners.map((owner) => <li class="mono">{owner}</li>)}
+        </ul>
+        <p class="ka-side-note">
+          A host whose agents run under a different process name replaces the default set with
+          <code class="mono">SHADE_OWNER_PROCESS_NAMES</code>.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .life { border-top: 1px solid var(--border); }
+
+  .life-intro { max-width: 66ch; margin-bottom: 38px; }
+  .life-lede { margin-top: 18px; color: var(--body); max-width: 64ch; }
+  .life-lede code { font-size: 0.87em; color: var(--ink); }
+
+  .life-fig { margin-bottom: 46px; }
+
+  .state-grid { grid-template-columns: repeat(4, 1fr); }
+
+  .state { display: flex; flex-direction: column; padding: 26px 22px 28px; }
+
+  .st-name {
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: var(--faint);
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  /* The live state is the only one carrying the accent, so the column reads
+     left to right as "here, then further from here". */
+  .state--live .st-name { color: var(--accent); }
+  .state--live { box-shadow: inset 0 2px 0 var(--accent); }
+  .state--terminal .st-name { color: var(--ink); }
+  .state--terminal { box-shadow: inset 0 2px 0 var(--border-strong); }
+
+  .st-facts { margin-top: 16px; }
+  .st-fact {
+    display: grid;
+    grid-template-columns: 46px 1fr;
+    gap: 10px;
+    padding: 6px 0;
+  }
+  .st-fact dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint-2);
+    padding-top: 2px;
+  }
+  .st-fact dd {
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ink);
+  }
+
+  .st-body {
+    margin-top: 18px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--body);
+  }
+
+  .keepalive {
+    margin-top: 26px;
+    display: grid;
+    grid-template-columns: 1.5fr 1fr;
+  }
+
+  .ka-copy { padding: 30px 30px 32px; }
+  .ka-title {
+    margin-top: 14px;
+    font-size: clamp(1.1rem, 1.7vw, 1.3rem);
+    line-height: 1.18;
+    max-width: 26ch;
+  }
+  .ka-body {
+    margin-top: 14px;
+    font-size: 14px;
+    line-height: 1.65;
+    color: var(--body);
+    max-width: 62ch;
+  }
+  .ka-body code { font-size: 0.88em; color: var(--ink); }
+
+  .ka-side {
+    border-left: 1px solid var(--border);
+    background: var(--bg-soft);
+    padding: 30px 30px 32px;
+  }
+  .ka-side-label { display: block; margin-bottom: 16px; }
+  .ka-names { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; }
+  .ka-names li {
+    border: 1px solid var(--chip-border);
+    background: var(--chip);
+    color: var(--accent-strong);
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+    padding: 7px 9px;
+  }
+  .ka-names li:last-child { color: var(--faint); background: var(--panel); }
+
+  .ka-side-note {
+    margin-top: 18px;
+    font-size: 12.5px;
+    line-height: 1.65;
+    color: var(--faint);
+    max-width: 34ch;
+  }
+  .ka-side-note code { font-size: 0.92em; color: var(--body); overflow-wrap: anywhere; }
+
+  @media (max-width: 1000px) {
+    .state-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 860px) {
+    .keepalive { grid-template-columns: 1fr; }
+    .ka-side { border-left: 0; border-top: 1px solid var(--border); }
+  }
+  @media (max-width: 560px) {
+    .state-grid { grid-template-columns: 1fr; }
+    .state { padding: 24px 20px 26px; }
+    .ka-copy, .ka-side { padding: 26px 20px 28px; }
+  }
+</style>

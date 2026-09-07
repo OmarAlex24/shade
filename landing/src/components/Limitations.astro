@@ -28,6 +28,12 @@ const limits = [
     body: 'A database written by a different schema version is rejected rather than upgraded.',
   },
   {
+    tag: 'lifecycle',
+    title: 'Sleep keeps content, not build output',
+    body:
+      'Sleep preserves tracked content, untracked files and gitignored private files, but not gitignored build output: node_modules, .venv and anything like them are excluded from the checkpoint and rebuilt on wake from the shared dependency fingerprint. A wake also changes the workspace id and cwd, so a host that cached either must read them from the wake result.',
+  },
+  {
     tag: 'repositories',
     title: 'V1 rejects several repository shapes',
     body:
@@ -40,7 +46,7 @@ const limits = [
   <div class="container">
     <div class="lbl-row" data-reveal>
       <span class="lbl">[ Honest limitations ]</span>
-      <span class="lbl">[ 5 ]</span>
+      <span class="lbl">[ 6 ]</span>
     </div>
 
     <div class="limits-layout">

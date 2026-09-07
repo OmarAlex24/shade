@@ -1,0 +1,134 @@
+---
+// LifecycleTrack — the four workspace states and the verb that moves between
+// them. The point of the drawing is the two return paths: dormancy and
+// suspension both come back to `active` with one command, and only the far
+// right edge of the track ever deletes anything.
+//
+// Drawn twice, wide and tall, because a 920 unit row of state boxes is
+// unreadable once the figure is only a phone wide. CSS shows one.
+const LABEL =
+  'Diagram: a workspace moves from active to dormant when its lease expires, from dormant to suspended with shade sleep, and from suspended to released only with an explicit shade release. Two return paths lead back to active: shade attach from dormant and shade wake from suspended.';
+---
+
+<div class="fig lifecycle-track js-graph">
+  <span class="cm tl"></span><span class="cm tr"></span><span class="cm bl"></span><span class="cm br"></span>
+  <div class="lbl fig-label">[ Workspace lifecycle ]</div>
+
+  <svg class="track-wide" viewBox="0 0 920 300" width="100%" role="img" aria-label={LABEL}>
+    <!-- forward track -->
+    <path class="g-line" d="M 184 127 L 256 127" />
+    <path class="g-flow" d="M 184 127 L 256 127" />
+    <path class="g-line" d="M 424 127 L 496 127" />
+    <path class="g-flow" d="M 424 127 L 496 127" style="animation-delay:.5s" />
+    <path class="l-dash" d="M 664 127 L 736 127" />
+
+    <!-- return paths -->
+    <path class="g-line" d="M 340 166 L 340 206 L 140 206 L 140 166" />
+    <path class="g-flow" d="M 340 166 L 340 206 L 140 206 L 140 166" style="animation-delay:1s" />
+    <path class="g-line" d="M 580 166 L 580 262 L 68 262 L 68 166" />
+    <path class="g-flow" d="M 580 166 L 580 262 L 68 262 L 68 166" style="animation-delay:1.5s" />
+
+    <rect class="g-core" x="16" y="88" width="168" height="78" />
+    <text class="ill-tc g-label" x="100" y="120" text-anchor="middle">active</text>
+    <text class="ill-tc g-label cap" x="100" y="140" text-anchor="middle">tree kept · lease live</text>
+
+    <rect class="g-node" x="256" y="88" width="168" height="78" />
+    <text class="ill-t g-label" x="340" y="120" text-anchor="middle">dormant</text>
+    <text class="ill-tm g-label" x="340" y="140" text-anchor="middle">tree kept · no lease</text>
+
+    <rect class="g-node" x="496" y="88" width="168" height="78" />
+    <text class="ill-t g-label" x="580" y="120" text-anchor="middle">suspended</text>
+    <text class="ill-tm g-label" x="580" y="140" text-anchor="middle">tree reclaimed</text>
+
+    <rect class="g-node terminal" x="736" y="88" width="168" height="78" />
+    <text class="ill-t g-label" x="820" y="120" text-anchor="middle">released</text>
+    <text class="ill-tm g-label" x="820" y="140" text-anchor="middle">deleted after grace</text>
+
+    <text class="ill-tm g-label" x="220" y="56" text-anchor="middle">no heartbeat</text>
+    <text class="ill-tm g-label" x="220" y="72" text-anchor="middle">for 120 s</text>
+    <text class="ill-tm g-label" x="460" y="56" text-anchor="middle">shade sleep</text>
+    <text class="ill-tm g-label" x="460" y="72" text-anchor="middle">checkpoint + vault</text>
+    <text class="ill-tm g-label" x="700" y="56" text-anchor="middle">shade release</text>
+    <text class="ill-tm g-label" x="700" y="72" text-anchor="middle">explicit only</text>
+
+    <text class="ill-tm g-label" x="904" y="214" text-anchor="end">no other transition destroys work</text>
+
+    <text class="ill-tm g-label note" x="240" y="226" text-anchor="middle">shade attach · same session id</text>
+    <text class="ill-tm g-label note" x="324" y="282" text-anchor="middle">shade wake · new cwd, same session</text>
+  </svg>
+
+  <svg class="track-tall" viewBox="0 0 360 570" width="100%" role="img" aria-label={LABEL}>
+    <path class="g-line" d="M 206 88 L 206 160" />
+    <path class="g-flow" d="M 206 88 L 206 160" />
+    <path class="g-line" d="M 206 228 L 206 300" />
+    <path class="g-flow" d="M 206 228 L 206 300" style="animation-delay:.5s" />
+    <path class="l-dash" d="M 206 368 L 206 440" />
+
+    <path class="g-line" d="M 88 194 L 46 194 L 46 54 L 88 54" />
+    <path class="g-flow" d="M 88 194 L 46 194 L 46 54 L 88 54" style="animation-delay:1s" />
+    <path class="g-line" d="M 88 334 L 18 334 L 18 40 L 88 40" />
+    <path class="g-flow" d="M 88 334 L 18 334 L 18 40 L 88 40" style="animation-delay:1.5s" />
+
+    <rect class="g-core" x="88" y="20" width="236" height="68" />
+    <text class="ill-tc g-label" x="206" y="49" text-anchor="middle">active</text>
+    <text class="ill-tc g-label cap" x="206" y="69" text-anchor="middle">tree kept · lease live</text>
+
+    <rect class="g-node" x="88" y="160" width="236" height="68" />
+    <text class="ill-t g-label" x="206" y="189" text-anchor="middle">dormant</text>
+    <text class="ill-tm g-label" x="206" y="209" text-anchor="middle">tree kept · no lease</text>
+
+    <rect class="g-node" x="88" y="300" width="236" height="68" />
+    <text class="ill-t g-label" x="206" y="329" text-anchor="middle">suspended</text>
+    <text class="ill-tm g-label" x="206" y="349" text-anchor="middle">tree reclaimed</text>
+
+    <rect class="g-node terminal" x="88" y="440" width="236" height="68" />
+    <text class="ill-t g-label" x="206" y="469" text-anchor="middle">released</text>
+    <text class="ill-tm g-label" x="206" y="489" text-anchor="middle">deleted after grace</text>
+
+    <text class="ill-tm g-label" x="218" y="118">no heartbeat</text>
+    <text class="ill-tm g-label" x="218" y="134">for 120 s</text>
+    <text class="ill-tm g-label" x="218" y="258">shade sleep</text>
+    <text class="ill-tm g-label" x="218" y="274">checkpoint + vault</text>
+    <text class="ill-tm g-label" x="218" y="398">shade release</text>
+    <text class="ill-tm g-label" x="218" y="414">explicit only</text>
+
+    <text class="ill-tm g-label note" x="64" y="124" text-anchor="middle" transform="rotate(-90 64 124)">shade attach</text>
+    <text class="ill-tm g-label note" x="36" y="190" text-anchor="middle" transform="rotate(-90 36 190)">shade wake</text>
+
+    <text class="ill-tm g-label note" x="180" y="536" text-anchor="middle">attach and wake both land back on active</text>
+  </svg>
+</div>
+
+<style>
+  .lifecycle-track { padding: 26px 22px 22px; }
+  .lifecycle-track svg { margin-top: 12px; }
+  .lifecycle-track :global(.ill-tm) { font-size: 9.6px; }
+  .lifecycle-track :global(.cap) { font-size: 10.5px; fill: rgba(255, 255, 255, 0.82); }
+  .lifecycle-track :global(.note) { fill: var(--accent); }
+
+  /* Release is the one edge with no pulse travelling along it: nothing walks
+     this path on its own. It is kept off `.g-line` deliberately -- the graph
+     driver overwrites that class's dasharray to measure the draw-in. */
+  .lifecycle-track :global(.l-dash) {
+    stroke: var(--blue-line);
+    stroke-width: 1.5;
+    fill: none;
+    stroke-dasharray: 5 5;
+    opacity: 0;
+    transition: opacity 0.6s ease 0.35s;
+  }
+  .lifecycle-track.is-drawn :global(.l-dash) { opacity: 0.8; }
+  .lifecycle-track :global(.terminal) {
+    stroke-dasharray: 5 4;
+    fill: var(--bg-soft);
+  }
+
+  .track-tall { display: none; }
+
+  @media (max-width: 860px) {
+    .lifecycle-track { padding: 22px 14px 16px; }
+    .track-wide { display: none; }
+    .track-tall { display: block; }
+    .lifecycle-track :global(.ill-tm) { font-size: 10.5px; }
+  }
+</style>

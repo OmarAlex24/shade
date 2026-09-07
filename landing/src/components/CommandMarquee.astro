@@ -1,8 +1,13 @@
 ---
 // CommandMarquee.astro — the public command set, scrolling as one continuous
-// mono strip. Every command below is a real Shade CLI verb (README, Quick start).
+// mono strip. Every command below is a real Shade CLI verb, in the order the
+// README lists them (Quick start, "The full command set").
 const commands = [
   'open',
+  'attach',
+  'sleep',
+  'wake',
+  'status',
   'context',
   'heartbeat',
   'checkpoint',
@@ -155,7 +160,14 @@ const commands = [
 
     .marquee-track .marquee-group:nth-child(n + 2) { display: none; }
 
+    /* `flex: none` is what makes the scrolling group refuse to wrap. Under
+       reduced motion the strip has to become an ordinary centred block, so the
+       group must be allowed to shrink to the container and wrap inside it --
+       otherwise the first and last commands are clipped by the mask. */
     .marquee-group {
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 100%;
       flex-wrap: wrap;
       justify-content: center;
       gap: 16px 28px;

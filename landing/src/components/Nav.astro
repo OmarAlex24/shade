@@ -5,6 +5,7 @@ import { REPO_URL, repoTree } from '../consts';
 const links = [
   { label: 'How it works', href: '#how-it-works', spy: true },
   { label: 'Numbers', href: '#numbers', spy: true },
+  { label: 'Lifecycle', href: '#lifecycle', spy: true },
   { label: 'Docs', href: repoTree('docs'), spy: false },
   { label: 'GitHub', href: REPO_URL, spy: false },
 ];
@@ -307,7 +308,7 @@ const links = [
   });
 
   // ── Scroll-spy ──
-  const SPY_SECTIONS = ['#top', '#how-it-works', '#numbers'];
+  const SPY_SECTIONS = ['#top', '#how-it-works', '#numbers', '#lifecycle'];
   const spyLinks = Array.from(nav?.querySelectorAll<HTMLAnchorElement>('[data-spy-link]') ?? []);
 
   function setActiveLink(href: string): void {

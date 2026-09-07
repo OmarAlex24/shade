@@ -15,11 +15,16 @@ const tabs = [
       'export SHADE_SOCKET="$(jq -r \'.outcome.result.env.SHADE_SOCKET\' <<<"$opened")"',
       'cd "$(jq -r \'.outcome.result.cwd\' <<<"$opened")"',
       '',
-      '# A standalone CLI owner heartbeats at least every 30 seconds.',
-      'shade heartbeat',
+      '# shade open already started a keepalive bound to this agent process.',
+      '# shade heartbeat is the fallback when the owner is a plain shell.',
       'shade context',
       'shade checkpoint --reason before-refactor',
       "shade publish --branch agent/result --message 'Result'",
+      '',
+      '# Done for now, but not done with the work: sleep frees the disk,',
+      '# wake gives it back, and release is the only verb that ends a session.',
+      'shade sleep',
+      'shade wake --session task-42',
       'shade release',
     ],
   },
@@ -47,7 +52,11 @@ const tabs = [
       'await spawnAgent({ cwd: session.cwd, env: session.env });',
       'await session.checkpoint("turn-complete");',
       'await session.publish({ branch: "agent/change", message: "agent change" });',
-      'await session.release();',
+      '',
+      '// sleep retires the handle; wake returns a live one at a new cwd.',
+      'await session.sleep();',
+      'const resumed = await shade.sessions.wake(task.id);',
+      'await resumed.release();',
     ],
   },
   {
@@ -75,7 +84,11 @@ const tabs = [
       '',
       'session.checkpoint("turn-complete").await?;',
       'session.publish("agent/change", "agent change", false).await?;',
-      'session.release().await?;',
+      'session.sleep().await?;',
+      '',
+      '// The same facade brings a dormant or suspended session back.',
+      'let resumed = client.sessions().wake(SessionId("task-42".into())).await?;',
+      'resumed.release().await?;',
     ],
   },
 ];
@@ -143,9 +156,12 @@ const payloads = Object.fromEntries(tabs.map((tab) => [tab.id, tab.lines.join('\
     </div>
 
     <p class="host-note" data-reveal>
-      Both SDK session handles heartbeat on their own and adopt successor handoffs for you, so host
+      Both SDK session handles heartbeat in-process and adopt successor handoffs for you, so host
       code normally observes only the final <code class="mono">cwd</code> and
-      <code class="mono">env</code>.
+      <code class="mono">env</code>. Only the CLI spawns a keepalive, and only
+      <code class="mono">release</code> ends a session: an expired lease leaves it dormant, and
+      <code class="mono">sleep</code> trades the tree for its checkpoint until
+      <code class="mono">wake</code> rebuilds it.
       <a href={repoTree('packages/sdk-typescript')} rel="noreferrer">Read the SDK reference</a>.
     </p>
   </div>
