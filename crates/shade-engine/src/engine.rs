@@ -183,44 +183,85 @@ fn dependency_error(error: DependencyError) -> EngineError {
     }
 }
 
+/// A repository rejection names the first offending path. Bisecting a tree by
+/// hand to find out which file was meant is not an answer, and the path is
+/// the only part of the file that may ever be echoed. The bound keeps the
+/// widest rejection inside the common 512-byte response budget.
+const REJECTED_PATH_LIMIT_BYTES: usize = 120;
+
+/// The rejections that carry a path, as `<code>: <path>` with nothing after
+/// it, and how each one asks for that path to be dealt with.
+const PATH_REJECTIONS: [(&str, &str, &str, &str); 5] = [
+    (
+        "TRACKED_SECRET_FILE",
+        "untrack ",
+        ", then retry",
+        "untrack the private .env file, then retry",
+    ),
+    (
+        "TRACKED_DEPENDENCY_OUTPUT",
+        "untrack ",
+        ", then retry",
+        "untrack the dependency output directory, then retry",
+    ),
+    (
+        "UNSUPPORTED_SUBMODULE",
+        "remove the submodule at ",
+        ", then retry",
+        "remove or flatten submodules, then retry",
+    ),
+    (
+        "UNSUPPORTED_GIT_LFS",
+        "replace the Git LFS content at ",
+        ", then retry",
+        "replace Git LFS content before opening",
+    ),
+    (
+        "UNSUPPORTED_GIT_FILTER",
+        "remove the Git filter declared in ",
+        ", then retry",
+        "remove custom Git filters, then retry",
+    ),
+];
+
+/// The message tail after `<code>: `, bounded and reduced to one line. Only a
+/// path is ever repeated this way; no rejection carries content.
+fn rejected_path(message: &str, code: &str) -> Option<String> {
+    let tail = message.split_once(&format!("{code}: "))?.1;
+    let tail = tail.lines().next().unwrap_or_default().trim();
+    if tail.is_empty() {
+        return None;
+    }
+    let mut path = tail.to_owned();
+    if path.len() > REJECTED_PATH_LIMIT_BYTES {
+        let mut boundary = REJECTED_PATH_LIMIT_BYTES;
+        while !path.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        path.truncate(boundary);
+        path.push_str("...");
+    }
+    Some(path)
+}
+
 fn subsystem_error(error: impl std::fmt::Display) -> EngineError {
     let message = error.to_string();
+    for (code, before, after, fallback) in PATH_REJECTIONS {
+        if !message.contains(code) {
+            continue;
+        }
+        let next = match rejected_path(&message, code) {
+            Some(path) => format!("{before}{path}{after}"),
+            None => fallback.to_owned(),
+        };
+        return EngineError::domain(code, "never").next(next);
+    }
     let known = [
         (
             "COW_UNAVAILABLE",
             "COW_UNAVAILABLE",
             "never",
             "place all Shade pools on one APFS volume",
-        ),
-        (
-            "UNSUPPORTED_SUBMODULE",
-            "UNSUPPORTED_SUBMODULE",
-            "never",
-            "remove or flatten submodules",
-        ),
-        (
-            "UNSUPPORTED_GIT_LFS",
-            "UNSUPPORTED_GIT_LFS",
-            "never",
-            "replace Git LFS content before opening",
-        ),
-        (
-            "UNSUPPORTED_GIT_FILTER",
-            "UNSUPPORTED_GIT_FILTER",
-            "never",
-            "remove custom Git filters",
-        ),
-        (
-            "TRACKED_SECRET_FILE",
-            "TRACKED_SECRET_FILE",
-            "never",
-            "remove .env files from Git history and tracking",
-        ),
-        (
-            "TRACKED_DEPENDENCY_OUTPUT",
-            "TRACKED_DEPENDENCY_OUTPUT",
-            "never",
-            "remove dependency output directories from Git tracking",
         ),
         (
             "UNMERGED_WORKTREE",
@@ -1438,7 +1479,42 @@ impl Engine {
                 .await
                 .map_err(subsystem_error)?;
         }
+        self.survey_base_secrets(repository, revision).await;
         Ok(destination)
+    }
+
+    /// Note what the newly admitted base tree already carries. A credential
+    /// committed to a test fixture, a document or a CI file is the
+    /// repository owner's decision and no longer a reason to refuse the
+    /// repository, so the count and the paths are recorded once per base and
+    /// reported by `doctor` instead. Never a fragment of the matching bytes,
+    /// and never a reason to fail the open: an unreadable survey is a note
+    /// Shade could not take, not a workspace it should refuse.
+    async fn survey_base_secrets(&self, repository: &RepositoryHandle, revision: &BaseRevision) {
+        let Ok(survey) = self
+            .git
+            .survey_tracked_secrets(&repository.managed, &revision.tree)
+            .await
+        else {
+            return;
+        };
+        if survey.matched == 0 {
+            return;
+        }
+        let _ = self.database.record_event(
+            "repository.tracked_secret_matches",
+            &repository.record.id.0,
+            &json!({
+                "repository": repository.record.id,
+                "base": revision.commit.as_str(),
+                "matched": survey.matched,
+                "paths": survey
+                    .paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            }),
+        );
     }
 
     async fn incremental_base_candidate(
@@ -4909,10 +4985,60 @@ fn intent_kind(intent: &Intent) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEYED_LOCK_SWEEP_THRESHOLD, LifecycleLocks};
+    use super::{
+        KEYED_LOCK_SWEEP_THRESHOLD, LifecycleLocks, REJECTED_PATH_LIMIT_BYTES, subsystem_error,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn a_repository_rejection_names_its_path_and_stays_bounded() {
+        for (message, code, next) in [
+            (
+                "TRACKED_SECRET_FILE: apps/web/.env.production",
+                "TRACKED_SECRET_FILE",
+                "untrack apps/web/.env.production, then retry",
+            ),
+            (
+                "TRACKED_DEPENDENCY_OUTPUT: apps/web/node_modules/left-pad/index.js",
+                "TRACKED_DEPENDENCY_OUTPUT",
+                "untrack apps/web/node_modules/left-pad/index.js, then retry",
+            ),
+            (
+                "UNSUPPORTED_SUBMODULE: vendor/library",
+                "UNSUPPORTED_SUBMODULE",
+                "remove the submodule at vendor/library, then retry",
+            ),
+            (
+                "UNSUPPORTED_GIT_LFS: assets/video.mp4",
+                "UNSUPPORTED_GIT_LFS",
+                "replace the Git LFS content at assets/video.mp4, then retry",
+            ),
+            (
+                "UNSUPPORTED_GIT_FILTER: packages/api/.gitattributes",
+                "UNSUPPORTED_GIT_FILTER",
+                "remove the Git filter declared in packages/api/.gitattributes, then retry",
+            ),
+        ] {
+            let error = subsystem_error(message);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retry, "never");
+            assert_eq!(error.next.as_deref(), Some(next));
+        }
+
+        // A path long enough to threaten the response budget is truncated,
+        // and a rejection carrying no path still says something actionable.
+        let long = format!("TRACKED_SECRET_FILE: {}/.env", "nested".repeat(64));
+        let next = subsystem_error(long).next.unwrap();
+        assert!(next.starts_with("untrack nestednested"));
+        assert!(next.ends_with("..., then retry"));
+        assert!(next.len() <= REJECTED_PATH_LIMIT_BYTES + 32);
+        assert_eq!(
+            subsystem_error("UNSUPPORTED_GIT_LFS").next.as_deref(),
+            Some("replace Git LFS content before opening")
+        );
+    }
 
     #[tokio::test]
     async fn keyed_lock_serializes_concurrent_callers_on_the_same_key() {

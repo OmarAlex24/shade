@@ -25,6 +25,17 @@ const QUARANTINE_REF: &str = "refs/shade/quarantine/fetched-head";
 const ORIGIN: &str = "origin";
 const LFS_POINTER_HEADER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 const CHECKPOINT_STABILITY_ATTEMPTS: usize = 4;
+/// An LFS pointer is a short text stub. Bounding it is what lets the tree
+/// inventory read a handful of bytes per candidate instead of every blob;
+/// `validate_worktree_policy` bounds the working-tree copy identically.
+const LFS_POINTER_LIMIT_BYTES: u64 = 1024;
+/// Above this an object is streamed rather than batched, so a single blob
+/// cannot decide how much the inventory holds in memory.
+const STREAMED_BLOB_BYTES: u64 = 1024 * 1024;
+/// How many matching paths one content survey reports. The count is exact;
+/// the list is bounded so a repository full of test fixtures cannot turn one
+/// event into an unbounded record.
+const SURVEYED_PATH_LIMIT: usize = 20;
 
 /// A Git object name. Deliberately opaque: callers must not assume a
 /// forty-character SHA-1 object id.
@@ -1036,17 +1047,43 @@ struct TreeEntry {
     size: Option<u64>,
 }
 
-fn validate_entry_path(entry: &TreeEntry) -> anyhow::Result<()> {
+/// What a validated tree is to Shade.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PolicyScope {
+    /// A tree Shade materializes, retains or publishes. Its paths are the
+    /// shape of the repository Shade is about to work in, so a tracked
+    /// private `.env*` name and tracked dependency output are refused here.
+    Checkout,
+    /// A tree reachable only through history. Nothing is ever checked out
+    /// from it, so it is inspected for the features Shade cannot materialize
+    /// at all and for nothing else. What an ancestor commit once tracked is
+    /// the repository's own past, not the shape of anything Shade writes.
+    History,
+}
+
+/// Every rejection below names its path as the whole message tail, with no
+/// explanation after it: the daemon repeats that path in `next` so a caller
+/// is told which file to act on rather than being sent to bisect a tree.
+fn validate_entry_path(entry: &TreeEntry, scope: PolicyScope) -> anyhow::Result<()> {
     let basename = entry.path.file_name().unwrap_or_default().as_bytes();
     ensure!(
         entry.mode.as_slice() != b"160000",
-        "UNSUPPORTED_SUBMODULE: {} is a gitlink",
+        "UNSUPPORTED_SUBMODULE: {}",
         entry.path.display()
     );
     ensure!(
         basename != b".gitmodules",
-        "UNSUPPORTED_SUBMODULE: .gitmodules is present"
+        "UNSUPPORTED_SUBMODULE: {}",
+        entry.path.display()
     );
+    ensure!(
+        basename != b".lfsconfig",
+        "UNSUPPORTED_GIT_LFS: {}",
+        entry.path.display()
+    );
+    if scope == PolicyScope::History {
+        return Ok(());
+    }
     ensure!(
         !crate::secret_policy::is_private_env_name(basename),
         "TRACKED_SECRET_FILE: {}",
@@ -1057,8 +1094,42 @@ fn validate_entry_path(entry: &TreeEntry) -> anyhow::Result<()> {
         "TRACKED_DEPENDENCY_OUTPUT: {}",
         entry.path.display()
     );
-    ensure!(basename != b".lfsconfig", "UNSUPPORTED_GIT_LFS");
     Ok(())
+}
+
+/// Which blobs the tree inventory has to open. An LFS pointer is a bounded
+/// text stub, and `.gitattributes` is read whatever its size; nothing else is
+/// opened, because tree content is no longer scanned for credentials and
+/// reading a repository's history byte for byte would buy nothing.
+fn blob_needs_inspection(entry: &TreeEntry) -> bool {
+    entry.path.file_name() == Some(OsStr::new(".gitattributes"))
+        || entry
+            .size
+            .is_none_or(|size| size <= LFS_POINTER_LIMIT_BYTES)
+}
+
+/// What one content survey found, by path. Never a fragment of the matching
+/// bytes: a count and a path are what an operator can act on, and echoing
+/// more would move the credential into the daemon's own records.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TrackedSecretSurvey {
+    pub matched: usize,
+    pub paths: Vec<PathBuf>,
+}
+
+impl TrackedSecretSurvey {
+    fn record(&mut self, path: &Path) {
+        self.matched += 1;
+        if self.paths.len() < SURVEYED_PATH_LIMIT {
+            self.paths.push(path.to_owned());
+        }
+    }
+}
+
+/// What streaming one oversized blob established.
+struct LargeBlobFacts {
+    secret: bool,
+    filter: bool,
 }
 
 fn take_batch_blob<'a>(
@@ -1121,8 +1192,15 @@ impl MergeTreeResult {
 
 impl GitStore {
     /// Validate every tree reachable from a fetched commit before any of its
-    /// objects or refs are promoted out of quarantine. Checking only the tip
-    /// would allow a deleted `.env*` blob to enter through repository history.
+    /// objects or refs are promoted out of quarantine.
+    ///
+    /// History is inspected for what Shade cannot materialize at all --
+    /// gitlinks, LFS and attributes declaring a filter -- and for nothing
+    /// else. An ancestor that once tracked `.env.production` or a
+    /// `node_modules` directory is the repository's own past: the tip is what
+    /// Shade checks out, and refusing the whole repository for a commit its
+    /// owner already moved past rejected ordinary projects. Blob contents are
+    /// not read here at all.
     async fn validate_reachable_checkout_policy(
         &self,
         repository: &ManagedRepository,
@@ -1138,28 +1216,57 @@ impl GitStore {
         self.require_success(&output)?;
 
         let mut trees = BTreeSet::new();
+        // `rev-list` starts at the requested commit, so the first record is
+        // the tree Shade will actually check out. That one is held to the
+        // full checkout policy; its ancestors are only history.
+        let mut tip = None;
         for line in output.stdout.split(|byte| *byte == b'\n') {
             let line = trim_ascii_newline(line);
             if line.is_empty() {
                 continue;
             }
-            trees.insert(parse_oid(line)?);
+            let tree = parse_oid(line)?;
+            tip.get_or_insert_with(|| tree.clone());
+            trees.insert(tree);
         }
-        ensure!(!trees.is_empty(), "fetched history has no reachable trees");
+        let tip = tip.context("fetched history has no reachable trees")?;
+        self.validate_tree_policy(repository, &tip, PolicyScope::Checkout)
+            .await?;
         for tree in trees {
-            self.validate_checkout_policy(repository, &tree).await?;
+            if tree == tip {
+                continue;
+            }
+            self.validate_tree_policy(repository, &tree, PolicyScope::History)
+                .await?;
         }
         Ok(())
     }
 
     /// Reject repository features which would execute external programs or
-    /// replace bytes while Shade materializes an index. Tracked dotenv files
-    /// are rejected here as well: secrets must never reach a managed object
-    /// database in the first place.
+    /// replace bytes while Shade materializes an index, together with the
+    /// tracked paths Shade will not carry: a private `.env*` name and
+    /// dependency output.
+    ///
+    /// Blob *contents* are not policy. A credential committed to a test
+    /// fixture, a document or a CI file is the repository owner's decision
+    /// and Shade cannot unsay it; `survey_tracked_secrets` records what a
+    /// tree carries so `doctor` can report it. What Shade keeps out of Git is
+    /// the untracked private file, and the clean filter, the secret review
+    /// and the private-state vault all still own that.
     pub async fn validate_checkout_policy(
         &self,
         repository: &ManagedRepository,
         tree: &Oid,
+    ) -> anyhow::Result<()> {
+        self.validate_tree_policy(repository, tree, PolicyScope::Checkout)
+            .await
+    }
+
+    async fn validate_tree_policy(
+        &self,
+        repository: &ManagedRepository,
+        tree: &Oid,
+        scope: PolicyScope,
     ) -> anyhow::Result<()> {
         let entries = self.tree_entries(repository, tree).await?;
         ensure!(!entries.is_empty() || self.object_exists(repository, tree).await?);
@@ -1167,11 +1274,11 @@ impl GitStore {
         let mut attribute_input = Vec::new();
         let mut inspect_blobs = Vec::new();
         for entry in &entries {
-            validate_entry_path(entry)?;
+            validate_entry_path(entry, scope)?;
             attribute_input.extend_from_slice(entry.path.as_os_str().as_bytes());
             attribute_input.push(0);
 
-            if entry.mode.as_slice() != b"160000" {
+            if entry.mode.as_slice() != b"160000" && blob_needs_inspection(entry) {
                 inspect_blobs.push(entry);
             }
         }
@@ -1197,13 +1304,19 @@ impl GitStore {
         entries: &[&TreeEntry],
     ) -> anyhow::Result<()> {
         // Batch small objects; stream large ones without retaining their
-        // contents in memory. Every byte is checked before promotion/retention.
+        // contents in memory. Only `.gitattributes` reaches the streaming
+        // branch, since nothing else is inspected above the pointer bound.
         let mut batch = Vec::new();
         let mut batch_bytes = 0;
         for &entry in entries {
             let size = entry.size.unwrap_or(0);
-            if size > 1024 * 1024 {
-                self.validate_large_blob(repository, entry).await?;
+            if size > STREAMED_BLOB_BYTES {
+                let facts = self.inspect_large_blob(repository, entry).await?;
+                ensure!(
+                    !facts.filter,
+                    "UNSUPPORTED_GIT_FILTER: {}",
+                    entry.path.display()
+                );
                 continue;
             }
             if batch.len() == 1024 || batch_bytes + size > 8 * 1024 * 1024 {
@@ -1238,11 +1351,12 @@ impl GitStore {
             .collect()
     }
 
-    async fn validate_blob_batch(
+    /// Read one group of objects with a single `cat-file --batch` process.
+    async fn read_blob_batch(
         &self,
         repository: &ManagedRepository,
         entries: &[&TreeEntry],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<u8>> {
         let mut input = Vec::new();
         for entry in entries {
             input.extend_from_slice(entry.object.as_str().as_bytes());
@@ -1251,24 +1365,25 @@ impl GitStore {
         let args = Self::repo_args(repository, &["cat-file", "--batch", "--buffer"]);
         let output = self.run_raw(None, &args, &[], Some(&input)).await?;
         self.require_success(&output)?;
-        let mut remaining = output.stdout.as_slice();
+        Ok(output.stdout)
+    }
+
+    async fn validate_blob_batch(
+        &self,
+        repository: &ManagedRepository,
+        entries: &[&TreeEntry],
+    ) -> anyhow::Result<()> {
+        let stdout = self.read_blob_batch(repository, entries).await?;
+        let mut remaining = stdout.as_slice();
         for entry in entries {
             let bytes = take_batch_blob(&mut remaining, &entry.object, entry.size)?;
-            ensure!(
-                !crate::secret_policy::contains_secret(bytes),
-                "TRACKED_SECRET_FILE: {}",
-                entry.path.display()
-            );
             if bytes.starts_with(LFS_POINTER_HEADER) {
                 bail!("UNSUPPORTED_GIT_LFS: {}", entry.path.display());
             }
             if entry.path.file_name() == Some(OsStr::new(".gitattributes"))
                 && attributes_declare_filter(bytes)
             {
-                bail!(
-                    "UNSUPPORTED_GIT_FILTER: {} declares a filter",
-                    entry.path.display()
-                );
+                bail!("UNSUPPORTED_GIT_FILTER: {}", entry.path.display());
             }
         }
         ensure!(
@@ -1278,11 +1393,74 @@ impl GitStore {
         Ok(())
     }
 
-    async fn validate_large_blob(
+    /// Count the tracked blobs of one tree whose contents the local detector
+    /// recognizes. Nothing is rejected: the survey exists so an operator can
+    /// be told what a repository already carries, and it runs once, over the
+    /// base tree alone, when a base is first admitted.
+    pub async fn survey_tracked_secrets(
+        &self,
+        repository: &ManagedRepository,
+        tree: &Oid,
+    ) -> anyhow::Result<TrackedSecretSurvey> {
+        let entries = self.tree_entries(repository, tree).await?;
+        let mut survey = TrackedSecretSurvey::default();
+        let mut batch: Vec<&TreeEntry> = Vec::new();
+        let mut batch_bytes = 0;
+        for entry in &entries {
+            if entry.mode.as_slice() == b"160000" {
+                continue;
+            }
+            let size = entry.size.unwrap_or(0);
+            if size > STREAMED_BLOB_BYTES {
+                if self.inspect_large_blob(repository, entry).await?.secret {
+                    survey.record(&entry.path);
+                }
+                continue;
+            }
+            if batch.len() == 1024 || batch_bytes + size > 8 * 1024 * 1024 {
+                self.survey_blob_batch(repository, &batch, &mut survey)
+                    .await?;
+                batch.clear();
+                batch_bytes = 0;
+            }
+            batch.push(entry);
+            batch_bytes += size;
+        }
+        if !batch.is_empty() {
+            self.survey_blob_batch(repository, &batch, &mut survey)
+                .await?;
+        }
+        Ok(survey)
+    }
+
+    async fn survey_blob_batch(
+        &self,
+        repository: &ManagedRepository,
+        entries: &[&TreeEntry],
+        survey: &mut TrackedSecretSurvey,
+    ) -> anyhow::Result<()> {
+        let stdout = self.read_blob_batch(repository, entries).await?;
+        let mut remaining = stdout.as_slice();
+        for entry in entries {
+            let bytes = take_batch_blob(&mut remaining, &entry.object, entry.size)?;
+            if crate::secret_policy::contains_secret(bytes) {
+                survey.record(&entry.path);
+            }
+        }
+        ensure!(
+            remaining.is_empty(),
+            "unexpected trailing cat-file batch output"
+        );
+        Ok(())
+    }
+
+    /// Stream one oversized object without retaining it, reporting only the
+    /// two decisions its bytes can carry.
+    async fn inspect_large_blob(
         &self,
         repository: &ManagedRepository,
         entry: &TreeEntry,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<LargeBlobFacts> {
         let args = Self::repo_args(repository, &["cat-file", "blob", entry.object.as_str()]);
         let mut child = self
             .command(None, &args, &[])
@@ -1340,13 +1518,10 @@ impl GitStore {
             entry.size.is_none_or(|expected| expected == size),
             "Git blob size changed"
         );
-        ensure!(!secret, "TRACKED_SECRET_FILE: {}", entry.path.display());
-        ensure!(
-            !attributes,
-            "UNSUPPORTED_GIT_FILTER: {}",
-            entry.path.display()
-        );
-        Ok(())
+        Ok(LargeBlobFacts {
+            secret,
+            filter: attributes,
+        })
     }
 
     async fn object_exists(
@@ -2296,7 +2471,8 @@ impl GitStore {
             );
             ensure!(
                 fields[0] != b"160000",
-                "UNSUPPORTED_SUBMODULE: index contains a gitlink"
+                "UNSUPPORTED_SUBMODULE: {}",
+                bytes_to_path(&record[tab + 1..]).display()
             );
             entries.push(TreeEntry {
                 mode: fields[0].to_vec(),
@@ -2306,7 +2482,7 @@ impl GitStore {
             });
         }
         for entry in &entries {
-            validate_entry_path(entry)?;
+            validate_entry_path(entry, PolicyScope::Checkout)?;
         }
         // Size metadata is read without write-tree: even a deliberately
         // contaminated index must not make Shade create its tree object.
@@ -2345,8 +2521,11 @@ impl GitStore {
                 entry.size = Some(std::str::from_utf8(fields[2])?.parse()?);
             }
             ensure!(records.next().is_none(), "unexpected index object metadata");
-            self.validate_blobs(repository, &batch.iter().collect::<Vec<_>>())
-                .await?;
+            let inspect = batch
+                .iter()
+                .filter(|entry| blob_needs_inspection(entry))
+                .collect::<Vec<_>>();
+            self.validate_blobs(repository, &inspect).await?;
         }
         Ok(())
     }
@@ -2451,10 +2630,14 @@ impl GitStore {
             .split(|byte| *byte == 0)
             .filter(|record| !record.is_empty())
         {
-            ensure!(
-                !record.starts_with(b"160000 "),
-                "UNSUPPORTED_SUBMODULE: index contains a gitlink"
-            );
+            if record.starts_with(b"160000 ") {
+                let path = record
+                    .iter()
+                    .position(|byte| *byte == b'\t')
+                    .map(|tab| bytes_to_path(&record[tab + 1..]))
+                    .unwrap_or_default();
+                bail!("UNSUPPORTED_SUBMODULE: {}", path.display());
+            }
         }
 
         let candidates_args = vec![
@@ -2484,9 +2667,14 @@ impl GitStore {
             }
             ensure!(
                 basename != b".gitmodules",
-                "UNSUPPORTED_SUBMODULE: .gitmodules is present"
+                "UNSUPPORTED_SUBMODULE: {}",
+                relative.display()
             );
-            ensure!(basename != b".lfsconfig", "UNSUPPORTED_GIT_LFS");
+            ensure!(
+                basename != b".lfsconfig",
+                "UNSUPPORTED_GIT_LFS: {}",
+                relative.display()
+            );
             attribute_input.extend_from_slice(raw_path);
             attribute_input.push(0);
 
@@ -2495,7 +2683,7 @@ impl GitStore {
                 match fs::read(&absolute) {
                     Ok(bytes) => ensure!(
                         !attributes_declare_filter(&bytes),
-                        "UNSUPPORTED_GIT_FILTER: {} declares a filter",
+                        "UNSUPPORTED_GIT_FILTER: {}",
                         relative.display()
                     ),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3497,16 +3685,22 @@ fn attributes_declare_filter(bytes: &[u8]) -> bool {
 fn reject_filter_attributes(bytes: &[u8]) -> anyhow::Result<()> {
     let fields: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
     for triple in fields.chunks(3) {
+        // Shade's own two drivers are not repository configuration: the
+        // content filter is this process, and `shade-secret` refuses a clean
+        // outright. Everything else would run a program of the repository's
+        // choosing while Shade materializes an index.
         if triple.len() == 3
             && triple[1] == b"filter"
             && triple[2] != b"unspecified"
             && triple[2] != b"unset"
             && triple[2] != b"shade-content"
+            && triple[2] != b"shade-secret"
         {
+            // The path is the whole tail: the daemon repeats it in `next`,
+            // and the code word already says what the attribute did.
             bail!(
-                "UNSUPPORTED_GIT_FILTER: {} uses filter {}",
-                bytes_to_path(triple[0]).display(),
-                String::from_utf8_lossy(triple[2])
+                "UNSUPPORTED_GIT_FILTER: {}",
+                bytes_to_path(triple[0]).display()
             );
         }
     }

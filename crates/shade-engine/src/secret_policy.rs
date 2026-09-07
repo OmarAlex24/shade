@@ -233,10 +233,8 @@ pub fn run_git_filter(
     }
     flush_packet(&mut output)?;
     while let Some(headers) = read_list(&mut input)? {
-        if !headers
-            .iter()
-            .any(|line| line == b"command=clean\n" || line == b"command=smudge\n")
-        {
+        let clean = headers.iter().any(|line| line == b"command=clean\n");
+        if !clean && !headers.iter().any(|line| line == b"command=smudge\n") {
             return Err(protocol_error());
         }
         let path = headers
@@ -244,10 +242,15 @@ pub fn run_git_filter(
             .find_map(|line| line.strip_prefix(b"pathname="))
             .ok_or_else(protocol_error)?;
         let path = path.strip_suffix(b"\n").unwrap_or(path);
-        let mut blocked = path
-            .rsplit(|byte| *byte == b'/')
-            .next()
-            .is_some_and(is_private_env_name);
+        // Only the clean direction decides what enters Git. A smudge request
+        // returns bytes the object database already holds, so refusing them
+        // keeps nothing out of Git and would leave a repository that already
+        // carries a credential impossible to check out at all.
+        let mut blocked = clean
+            && path
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .is_some_and(is_private_env_name);
         let mut scanner = SecretScanner::default();
         let mut memory = Vec::new();
         let mut spill = None::<std::fs::File>;
@@ -258,8 +261,10 @@ pub fn run_git_filter(
             let Some(bytes) = packet else {
                 break;
             };
-            scanner.feed(&bytes);
-            blocked |= scanner.detected();
+            if clean {
+                scanner.feed(&bytes);
+                blocked |= scanner.detected();
+            }
             if !blocked {
                 if spill.is_none() && memory.len() + bytes.len() > 1024 * 1024 {
                     let mut file = tempfile::tempfile_in(spool_root)?;

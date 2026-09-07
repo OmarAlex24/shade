@@ -3,9 +3,8 @@ use shade_engine::git::{BaseSpec, GitStore};
 use shade_engine::secrets::SecretStore;
 use shade_protocol::WorkspaceId;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 fn git(root: &Path, args: &[&str]) -> Output {
     Command::new("git")
@@ -159,7 +158,10 @@ async fn real_filter_withholds_secrets_and_preserves_safe_binary_content() {
         fs::read(child.join("large-private.bin")).unwrap(),
         large_secret
     );
-    // A bypassed insertion is rejected at the retention boundary too.
+    // A same-UID bypass can still put a credential in the index: the boundary
+    // no longer re-reads that content. A tracked path the owner staged is the
+    // owner's decision, and the clean filter above is where Shade refuses to
+    // write a new secret. What the boundary still refuses is the private name.
     ok(
         &workspace,
         &[
@@ -171,52 +173,44 @@ async fn real_filter_withholds_secrets_and_preserves_safe_binary_content() {
             "tracked.json",
         ],
     );
-    // Predict this flat index's tree hash without writing it. A rejected
-    // checkpoint must not create even a tree referencing the bypassed blob.
-    let records = String::from_utf8(ok(&workspace, &["ls-files", "--stage"])).unwrap();
-    let mut tree = Vec::new();
-    for record in records.lines() {
-        let (metadata, path) = record.split_once('\t').unwrap();
-        let fields = metadata.split_whitespace().collect::<Vec<_>>();
-        assert!(!path.contains('/'), "flat fixture index");
-        tree.extend_from_slice(format!("{} {path}\0", fields[0]).as_bytes());
-        tree.extend_from_slice(&hex::decode(fields[1]).unwrap());
-    }
-    let mut hash = Command::new("git")
-        .current_dir(&workspace)
-        .args(["hash-object", "-t", "tree", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    hash.stdin.take().unwrap().write_all(&tree).unwrap();
-    let hash = hash.wait_with_output().unwrap();
-    assert!(hash.status.success());
-    let tree_oid = String::from_utf8(hash.stdout).unwrap();
-    let tree_oid = tree_oid.trim();
-    assert!(
-        !git(&workspace, &["cat-file", "-e", tree_oid])
-            .status
-            .success()
-    );
-    let error = store
+    let bypassed = store
         .checkpoint(&managed, &workspace, "ws_filter", "cp_bypass")
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("TRACKED_SECRET_FILE"));
-    assert!(
-        !git(&workspace, &["cat-file", "-e", tree_oid])
-            .status
-            .success(),
-        "checkpoint created a contaminated tree object"
+        .expect("committed content is not a retention rejection");
+    assert_eq!(
+        ok(
+            &workspace,
+            &["show", &format!("{}:tracked.json", bypassed.working_tree),],
+        ),
+        credential.as_bytes(),
     );
+
+    fs::write(workspace.join(".env.local"), "TOKEN=must-not-be-retained\n").unwrap();
+    ok(
+        &workspace,
+        &[
+            "-c",
+            "filter.shade-secret.clean=cat",
+            "add",
+            "-f",
+            "--",
+            ".env.local",
+        ],
+    );
+    let error = store
+        .checkpoint(&managed, &workspace, "ws_filter", "cp_dotenv")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "TRACKED_SECRET_FILE: .env.local");
+    assert!(!error.contains("must-not-be-retained"));
     assert!(
         !git(
             &workspace,
             &[
                 "rev-parse",
                 "--verify",
-                "refs/shade/workspaces/ws_filter/checkpoints/cp_bypass/head"
+                "refs/shade/workspaces/ws_filter/checkpoints/cp_dotenv/head"
             ]
         )
         .status

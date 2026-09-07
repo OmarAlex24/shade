@@ -2880,6 +2880,15 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        // Committed content is the repository owner's decision, so a base
+        // whose tracked files match the local detector is admitted and noted
+        // rather than refused. The count is how many bases were noted; the
+        // event carries the paths.
+        let tracked_secret_matches: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE event='repository.tracked_secret_matches'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(json!({
             "state": integrity,
             "sessions": active_sessions,
@@ -2891,6 +2900,7 @@ impl Database {
             "workspaces_suspending": suspending_workspaces,
             "workspaces_failed": failed_workspaces,
             "suspended_without_checkpoint": suspended_without_checkpoint,
+            "tracked_secret_matches": tracked_secret_matches,
         }))
     }
 }

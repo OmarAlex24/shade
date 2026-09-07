@@ -2030,3 +2030,199 @@ async fn read_only_context_is_fast_path_but_every_retention_intent_rejects_index
         "a rejected publish must not create or move its target branch"
     );
 }
+
+/// A repository whose own test fixtures, documents and CI files carry things
+/// the detector recognizes is an ordinary repository: it opens, and what its
+/// base tree carries is recorded once and reported by `doctor` instead of
+/// refusing the whole project. Everything Shade keeps *out* of Git is
+/// untouched -- an untracked `.env` stays out of the checkpoint and is still
+/// the subject of a review.
+#[tokio::test]
+async fn committed_content_opens_and_is_reported_instead_of_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().join("committed-content");
+    fs::create_dir_all(repository.join("apps/service/src")).unwrap();
+    git(&repository, &["init", "-b", "main"]);
+    git(&repository, &["config", "user.name", "Shade Test"]);
+    git(&repository, &["config", "user.email", "shade@test.invalid"]);
+    fs::write(
+        repository.join("apps/service/src/main.rs"),
+        format!(
+            "#[test]\nfn redacts() {{\n    let sample = \"{}{}\";\n    let password = \"hunter2hunter2\";\n    assert!(redact(sample, password));\n}}\n",
+            "-----BEGIN ", "PRIVATE KEY-----"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        repository.join(".env.example"),
+        "DATABASE_URL=postgres://user:hunter2hunter2@localhost:5432/app\n",
+    )
+    .unwrap();
+    fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+    git(&repository, &["add", "-A"]);
+    git(&repository, &["commit", "-m", "committed fixtures"]);
+
+    let engine = test_engine(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "committed-content",
+                "open",
+                Intent::SessionOpen(OpenSession {
+                    session_id: SessionId("committed-content".into()),
+                    repository: RepositoryLocator::Local {
+                        path: repository.to_string_lossy().into_owned(),
+                    },
+                    base: Some("main".into()),
+                    intent: None,
+                }),
+            ))
+            .await,
+    );
+    let workspace = PathBuf::from(&opened.cwd);
+    assert!(workspace.join("apps/service/src/main.rs").is_file());
+
+    let recorded: Vec<_> = engine
+        .events(0, 1_000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event == "repository.tracked_secret_matches")
+        .collect();
+    assert_eq!(recorded.len(), 1, "one survey per admitted base");
+    let payload = &recorded[0].payload;
+    assert_eq!(payload["matched"], 2);
+    let paths: Vec<String> = serde_json::from_value(payload["paths"].clone()).unwrap();
+    assert!(paths.contains(&"apps/service/src/main.rs".to_owned()));
+    assert!(paths.contains(&".env.example".to_owned()));
+    let serialized = serde_json::to_string(payload).unwrap();
+    for fragment in ["PRIVATE KEY", "hunter2hunter2", "postgres://"] {
+        assert!(
+            !serialized.contains(fragment),
+            "the record must carry paths, never content: {serialized}"
+        );
+    }
+    let doctor: serde_json::Value = completed(
+        engine
+            .query(QueryRequest {
+                v: PROTOCOL_VERSION,
+                request_id: "doctor-after-open".into(),
+                query: Query::Doctor,
+            })
+            .await,
+    );
+    assert_eq!(doctor["tracked_secret_matches"], 1);
+
+    // Nothing about the untracked private file changed.
+    fs::write(workspace.join(".env"), "TOKEN=b7Y2n9W4q1R8d3M6\n").unwrap();
+    fs::write(workspace.join("tracked.txt"), "edited\n").unwrap();
+    let selector = WorkspaceSelector {
+        workspace_id: Some(opened.workspace.clone()),
+        cwd: None,
+    };
+    let checkpoint: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "committed-content",
+                "checkpoint",
+                Intent::WorkspaceCheckpoint {
+                    selector: selector.clone(),
+                    reason: "committed-content".into(),
+                },
+            ))
+            .await,
+    );
+    let managed = engine
+        .database()
+        .repository_by_id(
+            &engine
+                .database()
+                .workspace(&opened.workspace)
+                .unwrap()
+                .unwrap()
+                .repository_id,
+        )
+        .unwrap()
+        .unwrap()
+        .bare_path;
+    let names = git(
+        directory.path(),
+        &[
+            &format!("--git-dir={}", managed.display()),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            checkpoint["working_tree"].as_str().unwrap(),
+        ],
+    );
+    let names: Vec<&str> = names.lines().collect();
+    assert!(names.contains(&"apps/service/src/main.rs"));
+    assert!(names.contains(&".env.example"));
+    assert!(
+        !names.contains(&".env"),
+        "an untracked private file must stay out of the checkpoint: {names:?}"
+    );
+    let release = engine
+        .execute(execute(
+            "committed-content",
+            "release",
+            Intent::WorkspaceRelease { selector },
+        ))
+        .await;
+    match release.body {
+        ResponseBody::Ok {
+            outcome: Outcome::ReviewRequired(required),
+        } => assert!(
+            required.files.iter().any(|file| file.path == ".env"),
+            "the untracked private file must still be reviewed: {:?}",
+            required.files
+        ),
+        other => panic!("expected a secret review, got {other:?}"),
+    }
+}
+
+/// A private `.env*` tracked in the base tree is still refused, and the
+/// refusal says which file to act on rather than leaving the caller to
+/// bisect the tree.
+#[tokio::test]
+async fn tracked_dotenv_is_refused_and_the_rejection_names_its_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().join("tracked-dotenv");
+    fs::create_dir_all(repository.join("apps/web")).unwrap();
+    git(&repository, &["init", "-b", "main"]);
+    git(&repository, &["config", "user.name", "Shade Test"]);
+    git(&repository, &["config", "user.email", "shade@test.invalid"]);
+    fs::write(
+        repository.join("apps/web/.env.production"),
+        "TOKEN=tracked-secret\n",
+    )
+    .unwrap();
+    fs::write(repository.join("apps/web/.env.example"), "TOKEN=\n").unwrap();
+    git(&repository, &["add", "-A"]);
+    git(&repository, &["commit", "-m", "tracked secret"]);
+
+    let engine = test_engine(directory.path());
+    let response = engine
+        .execute(execute(
+            "tracked-dotenv",
+            "open",
+            Intent::SessionOpen(OpenSession {
+                session_id: SessionId("tracked-dotenv".into()),
+                repository: RepositoryLocator::Local {
+                    path: repository.to_string_lossy().into_owned(),
+                },
+                base: Some("main".into()),
+                intent: None,
+            }),
+        ))
+        .await;
+    let error = match response.body {
+        ResponseBody::Error { error } => error,
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+    assert_eq!(error.code, "TRACKED_SECRET_FILE");
+    assert_eq!(
+        error.next.as_deref(),
+        Some("untrack apps/web/.env.production, then retry")
+    );
+    assert!(serde_json::to_string(&error).unwrap().contains("never"));
+}

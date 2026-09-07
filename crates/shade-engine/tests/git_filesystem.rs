@@ -1256,21 +1256,43 @@ async fn local_import_rejects_tracked_dotenv_before_publishing_the_bare() {
     assert!(!secret_blob.is_empty());
 }
 
+/// Committed content is the repository owner's decision. A source file that
+/// carries a private-key header inside a redaction test, or a documented
+/// `password = "..."`, is ordinary tracked content: the repository opens, and
+/// what the base tree carries is surveyed by path so `doctor` can report it.
 #[tokio::test]
-async fn ingress_rejects_large_content_secrets_even_after_the_file_was_deleted() {
+async fn tracked_content_signatures_are_surveyed_rather_than_rejected() {
     let temporary = tempfile::tempdir().unwrap();
-    let source = temporary.path().join("content-secret-history");
+    let source = temporary.path().join("content-signature-source");
     init_repository(&source, None);
-    let mut bytes = vec![0xff; 2 * 1024 * 1024 - 7];
-    bytes.extend_from_slice(["-----BEGIN ", "PRIVATE KEY-----"].concat().as_bytes());
-    fs::write(source.join("ordinary.bin"), &bytes).unwrap();
-    git(&source, &["add", "."]);
-    git(&source, &["commit", "-m", "unsafe ancestor"]);
-    let blob = git(&source, &["rev-parse", "HEAD:ordinary.bin"]);
-    fs::remove_file(source.join("ordinary.bin")).unwrap();
-    fs::write(source.join("safe.txt"), "safe tip\n").unwrap();
+    fs::create_dir_all(source.join("apps/service/src")).unwrap();
+    fs::write(
+        source.join("apps/service/src/main.rs"),
+        format!(
+            "#[test]\nfn redacts() {{\n    let sample = \"{}{}\";\n    let password = \"hunter2hunter2\";\n    assert!(redact(sample, password));\n}}\n",
+            "-----BEGIN ", "PRIVATE KEY-----"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.join(".env.example"),
+        "DATABASE_URL=postgres://user:hunter2hunter2@localhost:5432/app\n",
+    )
+    .unwrap();
+    fs::create_dir_all(source.join("ops")).unwrap();
+    fs::write(
+        source.join("ops/ci.yaml"),
+        "env:\n  password = \"p9F2vQ7xR4tL0nB6\"\n",
+    )
+    .unwrap();
+    // A blob past the streaming bound is surveyed by the same scanner.
+    let mut oversized = vec![0xff; 2 * 1024 * 1024 - 7];
+    oversized.extend_from_slice(["-----BEGIN ", "PRIVATE KEY-----"].concat().as_bytes());
+    fs::write(source.join("fixture.bin"), &oversized).unwrap();
+    fs::write(source.join("safe.txt"), "ordinary\n").unwrap();
     git(&source, &["add", "-A"]);
-    git(&source, &["commit", "-m", "safe tip"]);
+    git(&source, &["commit", "-m", "committed fixtures"]);
+
     let store = GitStore::system();
     let remote = store.canonicalize_remote(source.to_str().unwrap()).unwrap();
     let managed_path = temporary.path().join("managed.git");
@@ -1278,62 +1300,135 @@ async fn ingress_rejects_large_content_secrets_even_after_the_file_was_deleted()
         .create_managed_bare(&managed_path, Some(&remote))
         .await
         .unwrap();
-    let error = store
+    let base = store
         .resolve_base(
             &managed,
             Some(&remote),
-            BaseSpec::OriginBranch("main".into()),
+            BaseSpec::OriginBranch("main".to_owned()),
         )
         .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("TRACKED_SECRET_FILE: ordinary.bin")
-    );
-    assert!(!bare_git_succeeds(
-        &managed_path,
-        &["cat-file", "-e", &blob]
-    ));
-    assert!(!bare_git_succeeds(
-        &managed_path,
-        &["rev-parse", "--verify", "refs/remotes/origin/main"]
-    ));
-    let local = temporary.path().join("local.git");
-    let identity = store.canonicalize_local(&source).await.unwrap();
-    let error = store
-        .import_managed_bare(&source, &local, "main", &identity.remote)
+        .expect("committed content must not refuse a repository");
+    let workspace = temporary.path().join("workspace");
+    store
+        .prepare_base(&managed, &base, &workspace)
         .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("TRACKED_SECRET_FILE: ordinary.bin")
+        .unwrap();
+    assert!(workspace.join("apps/service/src/main.rs").is_file());
+    assert_eq!(fs::read(workspace.join("fixture.bin")).unwrap(), oversized);
+
+    let survey = store
+        .survey_tracked_secrets(&managed, &base.tree)
+        .await
+        .unwrap();
+    let paths: Vec<String> = survey
+        .paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    assert_eq!(survey.matched, 4, "surveyed paths: {paths:?}");
+    for expected in [
+        "apps/service/src/main.rs",
+        ".env.example",
+        "ops/ci.yaml",
+        "fixture.bin",
+    ] {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "{expected} must be surveyed: {paths:?}"
+        );
+    }
+    // A tip that carries none of them surveys clean.
+    git(
+        &source,
+        &[
+            "rm",
+            "-q",
+            "--",
+            "apps/service/src/main.rs",
+            ".env.example",
+            "ops/ci.yaml",
+            "fixture.bin",
+        ],
     );
-    assert!(!local.exists());
+    git(&source, &["commit", "-m", "clean tip"]);
+    let clean_base = store
+        .resolve_base(
+            &managed,
+            Some(&remote),
+            BaseSpec::OriginBranch("main".to_owned()),
+        )
+        .await
+        .unwrap();
+    let clean = store
+        .survey_tracked_secrets(&managed, &clean_base.tree)
+        .await
+        .unwrap();
+    assert_eq!(clean.matched, 0);
+    assert!(clean.paths.is_empty());
 }
 
+/// A repository whose history once tracked `.env.production` opens: the tip
+/// is what Shade checks out, and an ancestor the owner already moved past is
+/// no longer a reason to refuse the whole repository. A tracked private file
+/// in the base tree still is, and the rejection names it.
 #[tokio::test]
-async fn remote_fetch_rejects_dotenv_in_history_without_promoting_its_blob_or_ref() {
+async fn dotenv_in_history_opens_while_the_base_tree_still_decides() {
     let temporary = tempfile::tempdir().unwrap();
-    let source = temporary.path().join("malicious-remote");
+    let source = temporary.path().join("dotenv-history");
     init_repository(&source, None);
-    fs::write(source.join(".env"), "TOKEN=remote-secret\n").unwrap();
-    git(&source, &["add", ".env"]);
+    fs::write(source.join(".env.production"), "TOKEN=remote-secret\n").unwrap();
+    git(&source, &["add", ".env.production"]);
     git(&source, &["commit", "-m", "tracked secret"]);
-    let secret_blob = git(&source, &["rev-parse", "HEAD:.env"]);
-    fs::remove_file(source.join(".env")).unwrap();
+    let secret_blob = git(&source, &["rev-parse", "HEAD:.env.production"]);
+    fs::remove_file(source.join(".env.production")).unwrap();
     fs::write(source.join("safe.txt"), "tip tree is clean\n").unwrap();
     git(&source, &["add", "-A"]);
-    git(&source, &["commit", "-m", "remove tracked secret"]);
+    git(&source, &["commit", "-m", "untrack the secret"]);
 
     let store = GitStore::system();
     let remote = store.canonicalize_remote(source.to_str().unwrap()).unwrap();
-    let managed_path = temporary.path().join("managed-remote.git");
+    let managed_path = temporary.path().join("managed-history.git");
     let managed = store
         .create_managed_bare(&managed_path, Some(&remote))
         .await
         .unwrap();
+    let base = store
+        .resolve_base(
+            &managed,
+            Some(&remote),
+            BaseSpec::OriginBranch("main".to_owned()),
+        )
+        .await
+        .expect("an ancestor's dotenv must not refuse the repository");
+    let workspace = temporary.path().join("workspace");
+    store
+        .prepare_base(&managed, &base, &workspace)
+        .await
+        .unwrap();
+    assert!(!workspace.join(".env.production").exists());
+    assert!(bare_git_succeeds(
+        &managed_path,
+        &["cat-file", "-e", &secret_blob]
+    ));
+    assert!(bare_git_succeeds(
+        &managed_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/main"]
+    ));
+    assert!(
+        !store
+            .survey_tracked_secrets(&managed, &base.tree)
+            .await
+            .unwrap()
+            .paths
+            .iter()
+            .any(|path| path.ends_with(".env.production")),
+        "the survey reads the base tree, not history"
+    );
+
+    // Bringing it back to the tip refuses the repository again, by name.
+    fs::write(source.join(".env.production"), "TOKEN=back-again\n").unwrap();
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "-m", "track it again"]);
     let error = store
         .resolve_base(
             &managed,
@@ -1341,39 +1436,66 @@ async fn remote_fetch_rejects_dotenv_in_history_without_promoting_its_blob_or_re
             BaseSpec::OriginBranch("main".to_owned()),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "TRACKED_SECRET_FILE: .env.production");
+    assert!(!error.contains("back-again"));
+}
 
-    let error = error.to_string();
-    assert!(error.contains("TRACKED_SECRET_FILE"));
-    assert!(error.contains(".env"));
-    assert!(!error.contains("remote-secret"));
-    assert!(managed_path.is_dir());
-    assert!(
-        !bare_git_succeeds(&managed_path, &["cat-file", "-e", &secret_blob]),
-        "the managed object database must not contain the quarantined secret blob"
-    );
-    assert!(
-        !bare_git_succeeds(
-            &managed_path,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "refs/remotes/origin/main"
-            ]
+/// Ancestor trees are still inspected for the features Shade cannot
+/// materialize at all, and those rejections name their path too.
+#[tokio::test]
+async fn history_still_refuses_gitlinks_lfs_and_declared_filters() {
+    let store = GitStore::system();
+    for (name, path, contents, code) in [
+        (
+            "lfs-history",
+            "assets/video.mp4",
+            "version https://git-lfs.github.com/spec/v1\noid sha256:012345\nsize 1\n",
+            "UNSUPPORTED_GIT_LFS",
         ),
-        "the rejected remote ref must not be promoted"
-    );
-    assert!(
-        fs::read_dir(temporary.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .all(|entry| !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".shade-git-quarantine-")),
-        "fetch quarantine must be removed after rejection"
-    );
+        (
+            "filter-history",
+            "packages/api/.gitattributes",
+            "*.bin filter=custom\n",
+            "UNSUPPORTED_GIT_FILTER",
+        ),
+        (
+            "lfsconfig-history",
+            ".lfsconfig",
+            "[lfs]\n",
+            "UNSUPPORTED_GIT_LFS",
+        ),
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join(name);
+        init_repository(&source, None);
+        let file = source.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, contents).unwrap();
+        git(&source, &["add", "-A"]);
+        git(&source, &["commit", "-m", "unsupported ancestor"]);
+        fs::remove_file(&file).unwrap();
+        fs::write(source.join("safe.txt"), "clean tip\n").unwrap();
+        git(&source, &["add", "-A"]);
+        git(&source, &["commit", "-m", "clean tip"]);
+
+        let remote = store.canonicalize_remote(source.to_str().unwrap()).unwrap();
+        let managed = store
+            .create_managed_bare(&temporary.path().join("managed.git"), Some(&remote))
+            .await
+            .unwrap();
+        let error = store
+            .resolve_base(
+                &managed,
+                Some(&remote),
+                BaseSpec::OriginBranch("main".to_owned()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, format!("{code}: {path}"), "{name}");
+    }
 }
 
 #[tokio::test]
