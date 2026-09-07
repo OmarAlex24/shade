@@ -706,17 +706,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 ReviewChoice::Keep => ReviewAction::Keep,
                 ReviewChoice::Discard => ReviewAction::Discard,
             };
-            emit(
-                &client
-                    .execute_wait_idempotent(
-                        Intent::ReviewResolve {
-                            review_id: ReviewId(review),
-                            action,
-                        },
-                        idempotency_key,
-                    )
-                    .await?,
-            );
+            let response = client
+                .execute_wait_idempotent(
+                    Intent::ReviewResolve {
+                        review_id: ReviewId(review),
+                        action,
+                    },
+                    idempotency_key,
+                )
+                .await?;
+            keepalive::stop_for_review(&config, &response);
+            emit(&response);
         }
         Command::Doctor { diagnostics: None } => emit(&client.query(Query::Doctor).await?),
         Command::Doctor {

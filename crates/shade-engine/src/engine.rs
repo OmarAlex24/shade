@@ -3423,11 +3423,18 @@ impl Engine {
             return Ok(Outcome::ReviewRequired(current));
         }
         match action {
+            // Keep and discard both close the reviewed workspace's session --
+            // `retained` and `released` differ only in whether the tree
+            // survives for a human. The session is named on the outcome so a
+            // caller that started something for the duration of that session,
+            // the CLI keepalive above all, can end it here rather than leaving
+            // a child heartbeating a lease nothing holds.
             ReviewAction::Discard => {
                 let outcome = Outcome::Completed(json!({
                     "review": review_id,
                     "resolution": "discarded",
                     "released": child.id,
+                    "session": child.session_id,
                 }));
                 self.database
                     .complete_secret_review(&review_id, false, operation, &outcome)?;
@@ -3438,6 +3445,7 @@ impl Engine {
                     "review": review_id,
                     "resolution": "kept",
                     "workspace": child.id,
+                    "session": child.session_id,
                 }));
                 self.database
                     .complete_secret_review(&review_id, true, operation, &outcome)?;

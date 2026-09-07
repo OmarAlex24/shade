@@ -660,11 +660,13 @@ export class FakeShadeDaemon {
                 review: intent.review_id,
                 resolution: "discarded",
                 released: review.workspace,
+                session: session.opened.session,
               }
             : {
                 review: intent.review_id,
                 resolution: "kept",
                 workspace: review.workspace,
+                session: session.opened.session,
               },
           intent.kind,
           idempotencyKey,

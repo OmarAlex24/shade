@@ -171,6 +171,29 @@ pub fn stop_for_sleep(config: &EngineConfig, response: &WireResponse) {
     stop_for_completed(config, response, "suspended");
 }
 
+/// Stop the keepalive belonging to a resolved secret review. Keep and discard
+/// both close the reviewed workspace's session -- `retained` keeps the tree for
+/// a human, `released` does not, and neither leaves a lease to renew -- so both
+/// end the child. A merge does not: it hands off to a successor the session
+/// keeps living in.
+pub fn stop_for_review(config: &EngineConfig, response: &WireResponse) {
+    let ResponseBody::Ok {
+        outcome: Outcome::Completed(ref value),
+    } = response.body
+    else {
+        return;
+    };
+    if !matches!(
+        value.get("resolution").and_then(Value::as_str),
+        Some("kept" | "discarded")
+    ) {
+        return;
+    }
+    if let Some(session) = value.get("session").and_then(Value::as_str) {
+        let _ = stop_registered(config, session);
+    }
+}
+
 fn stop_for_completed(config: &EngineConfig, response: &WireResponse, flag: &str) {
     let ResponseBody::Ok {
         outcome: Outcome::Completed(ref value),
@@ -731,6 +754,83 @@ mod tests {
             &config,
             &completed(json!({"session": "s1", "released": true})),
         );
+    }
+
+    /// A stale pidfile is the observable half of a stop: `stop_registered`
+    /// removes it without signalling anything, so its absence proves the stop
+    /// ran and its presence proves it did not.
+    fn stale_record(config: &EngineConfig, session: &str) {
+        registry::write(
+            config,
+            &registry::KeepaliveRecord {
+                v: registry::RECORD_VERSION,
+                session: session.into(),
+                lease: "lease_1".into(),
+                socket: "/tmp/shade.sock".into(),
+                root: "/tmp/shade-root".into(),
+                keepalive_pid: u32::MAX - 1,
+                keepalive_start_tvsec: 1,
+                keepalive_start_tvusec: 2,
+                owner_pid: u32::MAX - 2,
+                owner_start_tvsec: 3,
+                owner_start_tvusec: 4,
+                owner_name: "claude".into(),
+                created_at_ms: 1_700_000_000_000,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Keep and discard both release the reviewed workspace's session, so both
+    /// have to end its keepalive. Only `release` was wired, which left a child
+    /// heartbeating a lease nothing held until its owner exited.
+    #[test]
+    fn keep_and_discard_stop_the_keepalive_and_merge_does_not() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EngineConfig::at(temporary.path());
+
+        for resolution in ["kept", "discarded"] {
+            stale_record(&config, "s1");
+            stop_for_review(
+                &config,
+                &completed(json!({
+                    "review": "rev_1",
+                    "resolution": resolution,
+                    "session": "s1",
+                })),
+            );
+            assert!(
+                registry::read(&config, "s1").is_none(),
+                "{resolution} closes the session, so it closes the keepalive"
+            );
+        }
+
+        // A merge hands off to a successor the session keeps living in, so its
+        // keepalive has to survive. It arrives as an `accepted` handoff, not a
+        // completed resolution, but guard the shape either way.
+        stale_record(&config, "s1");
+        stop_for_review(
+            &config,
+            &completed(json!({
+                "handoff_id": "ho_1",
+                "session": "s1",
+                "predecessor": "ws_1",
+                "successor": "ws_2",
+            })),
+        );
+        assert!(registry::read(&config, "s1").is_some());
+
+        // And a resolution the engine could not attribute to a session leaves
+        // the registry alone rather than guessing.
+        stop_for_review(
+            &config,
+            &completed(json!({
+                "review": "rev_1",
+                "resolution": "kept",
+                "session": Value::Null,
+            })),
+        );
+        assert!(registry::read(&config, "s1").is_some());
     }
 
     #[test]

@@ -337,9 +337,23 @@ export interface ReleaseResult {
   released: boolean;
 }
 
+/**
+ * Keep and discard both close the reviewed workspace's session, so both name
+ * it; a merge hands off to a successor instead and is not one of these.
+ */
 export type ReviewResolutionResult =
-  | { review: ReviewId; resolution: "discarded"; released: WorkspaceId }
-  | { review: ReviewId; resolution: "kept"; workspace: WorkspaceId };
+  | {
+      review: ReviewId;
+      resolution: "discarded";
+      released: WorkspaceId;
+      session: SessionId | null;
+    }
+  | {
+      review: ReviewId;
+      resolution: "kept";
+      workspace: WorkspaceId;
+      session: SessionId | null;
+    };
 
 export interface HeartbeatResult {
   lease: LeaseId;
