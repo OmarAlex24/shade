@@ -217,3 +217,135 @@ async fn real_filter_withholds_secrets_and_preserves_safe_binary_content() {
         .success()
     );
 }
+
+/// Content Git already records for a path is not new content.
+///
+/// Every index that loses its stat cache makes Git re-clean the whole tree:
+/// a checkpoint stages through a fresh private index, a woken successor's
+/// index is read out of a tree, and base verification refreshes one. A filter
+/// that judged those bytes as if they were arriving for the first time refused
+/// the repository at exactly the moments Shade needs it most -- and refused it
+/// for a credential its owner committed long ago. The filter therefore
+/// compares the request against the blob Git holds for that path and only
+/// scans what differs.
+#[tokio::test]
+async fn committed_content_survives_re_cleaning_while_new_secrets_are_refused() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    fs::create_dir(&source).unwrap();
+    ok(&source, &["init", "-b", "main"]);
+    ok(&source, &["config", "user.name", "Shade Test"]);
+    ok(&source, &["config", "user.email", "shade@example.invalid"]);
+    // The ordinary shape of committed content that matches: a redaction test
+    // holding a private-key header inside a string literal.
+    let fixture = format!(
+        "const SAMPLE: &str = \"{}{}\";\n",
+        "-----BEGIN ", "PRIVATE KEY-----"
+    );
+    fs::write(source.join("redaction_test.rs"), &fixture).unwrap();
+    fs::write(source.join("plain.txt"), "ordinary\n").unwrap();
+    ok(&source, &["add", "."]);
+    ok(&source, &["commit", "-m", "base"]);
+
+    let spool = temporary.path().join("spool");
+    let store =
+        GitStore::system().with_content_filter(env!("CARGO_BIN_EXE_shade").into(), spool.clone());
+    let remote = store.canonicalize_remote(source.to_str().unwrap()).unwrap();
+    let managed = store
+        .create_managed_bare(&temporary.path().join("managed.git"), Some(&remote))
+        .await
+        .unwrap();
+    let base = store
+        .resolve_base(
+            &managed,
+            Some(&remote),
+            BaseSpec::OriginBranch("main".into()),
+        )
+        .await
+        .unwrap();
+
+    // The wake path: a materialized base is verified through an index whose
+    // stat cache is empty, so Git re-cleans every file it holds.
+    let base_root = temporary.path().join("base-root");
+    store
+        .prepare_base(&managed, &base, &base_root)
+        .await
+        .unwrap();
+    store
+        .verify_materialized_tree(&managed, &base.tree, &base_root)
+        .await
+        .expect("committed content must survive base verification");
+
+    let workspace = temporary.path().join("workspace");
+    store
+        .prepare_base(&managed, &base, &workspace)
+        .await
+        .unwrap();
+    store
+        .register_precloned_worktree(&managed, &workspace, &base, "committed-content")
+        .await
+        .unwrap();
+
+    // The checkpoint path: staging runs through a private index read out of a
+    // tree, which has no stat cache either.
+    let checkpoint = store
+        .checkpoint(&managed, &workspace, "ws_committed", "cp_committed")
+        .await
+        .expect("committed content must survive checkpoint staging");
+    assert_eq!(
+        ok(
+            &workspace,
+            &[
+                "show",
+                &format!("{}:redaction_test.rs", checkpoint.working_tree)
+            ]
+        ),
+        fixture.as_bytes(),
+        "the checkpoint must hold the committed bytes unchanged"
+    );
+
+    // A change to that same tracked file is new content, and the scanner
+    // speaks for all of it again.
+    let introduced = format!("{fixture}let token = \"{}\";\n", "abcdefghijklmnop");
+    fs::write(workspace.join("redaction_test.rs"), &introduced).unwrap();
+    let oid = String::from_utf8(ok(
+        &workspace,
+        &["hash-object", "--no-filters", "--", "redaction_test.rs"],
+    ))
+    .unwrap();
+    let oid = oid.trim().to_owned();
+    let rejected = git(&workspace, &["add", "--", "redaction_test.rs"]);
+    assert!(
+        !rejected.status.success(),
+        "a modification carrying a credential must still be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("clean filter 'shade-content' failed"),
+        "the refusal must name the filter: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        !git(&workspace, &["cat-file", "-e", &oid]).status.success(),
+        "rejected content entered the object database"
+    );
+
+    // An untracked file has no recorded blob to be identical to, so it is
+    // judged entirely on its contents, as it always was.
+    fs::write(
+        workspace.join("deploy_key.pem"),
+        ["-----BEGIN ", "OPENSSH PRIVATE KEY-----\n"].concat(),
+    )
+    .unwrap();
+    assert!(
+        !git(&workspace, &["add", "--", "deploy_key.pem"])
+            .status
+            .success(),
+        "an untracked private key must still be refused"
+    );
+    fs::remove_file(workspace.join("deploy_key.pem")).unwrap();
+
+    // Restoring the committed bytes restores the pass-through.
+    fs::write(workspace.join("redaction_test.rs"), &fixture).unwrap();
+    ok(&workspace, &["add", "--", "redaction_test.rs"]);
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+}
