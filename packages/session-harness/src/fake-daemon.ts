@@ -50,6 +50,12 @@ interface FakeHandoff {
   adopted: boolean;
 }
 
+/** A resolution workspace handed back by a `conflict` publish, awaiting `resolution_complete`. */
+interface FakeResolution {
+  parent: FakeSession;
+  successor: OpenedSessionPayload;
+}
+
 class FakeRequestError extends Error {
   constructor(readonly body: ShadeErrorBody) {
     super(body.code);
@@ -78,6 +84,7 @@ export class FakeShadeDaemon {
   private readonly checkpoints = new Map<string, string>();
   private readonly reviews = new Map<ReviewId, FakeReview>();
   private readonly handoffs = new Map<string, FakeHandoff>();
+  private readonly resolutions = new Map<string, FakeResolution>();
   private readonly events: EventEnvelope[] = [];
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -386,6 +393,13 @@ export class FakeShadeDaemon {
         if (intent.branch === "conflict") {
           const operationId = this.operationId();
           const resolution = this.buildSession(session.opened.session, this.objectId());
+          resolution.compact_context.dependencies = {
+            ...session.opened.compact_context.dependencies,
+          };
+          this.resolutions.set(resolution.workspace, {
+            parent: session,
+            successor: resolution,
+          });
           this.emit("publish_conflict", resolution.workspace, {
             operation_id: operationId,
             predecessor: session.opened.workspace,
@@ -609,8 +623,28 @@ export class FakeShadeDaemon {
         );
         return;
       }
+      case "resolution_complete": {
+        const pending = this.selectResolution(intent.selector);
+        this.resolutions.delete(pending.successor.workspace);
+        const handoff = this.registerHandoff(
+          pending.parent,
+          pending.successor,
+          actor.id,
+        );
+        this.emit("resolution_completed", handoff.successor, {
+          predecessor: pending.parent.opened.workspace,
+        });
+        this.acceptOperation(
+          socket,
+          requestId,
+          handoff,
+          intent.kind,
+          idempotencyKey,
+          actor.id,
+        );
+        return;
+      }
       case "repository_warm":
-      case "resolution_complete":
       case "garbage_collect":
       case "maintenance_sweep":
       case "reconcile":
@@ -747,6 +781,14 @@ export class FakeShadeDaemon {
     successor.compact_context.dependencies = {
       ...parent.opened.compact_context.dependencies,
     };
+    return this.registerHandoff(parent, successor, actor);
+  }
+
+  private registerHandoff(
+    parent: FakeSession,
+    successor: OpenedSessionPayload,
+    actor: string,
+  ): PendingHandoffPayload {
     const handoffId = this.next("handoff", ++this.handoff_sequence);
     this.handoffs.set(handoffId, {
       actor,
@@ -760,6 +802,33 @@ export class FakeShadeDaemon {
       predecessor: parent.opened.workspace,
       successor: successor.workspace,
     };
+  }
+
+  /**
+   * Resolution selectors carry only the workspace id, matching the engine's
+   * `resolve_workspace`: the workspace, not the caller's cwd, is authoritative.
+   */
+  private selectResolution(selector: WorkspaceSelector): FakeResolution {
+    this.selector_checks += 1;
+    const pending =
+      selector.workspace_id === undefined
+        ? [...this.resolutions.values()].find(
+            (candidate) => candidate.successor.cwd === selector.cwd,
+          )
+        : this.resolutions.get(selector.workspace_id);
+    if (pending === undefined) {
+      throw new FakeRequestError({
+        code: "WORKSPACE_NOT_FOUND",
+        retry: "never",
+      });
+    }
+    if (pending.parent.released || pending.parent.expires_at_ms < Date.now()) {
+      throw new FakeRequestError({
+        code: "WORKSPACE_RELEASED",
+        retry: "never",
+      });
+    }
+    return pending;
   }
 
   private select(selector: WorkspaceSelector): FakeSession {

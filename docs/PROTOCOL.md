@@ -9,7 +9,7 @@ Outcomes:
 - `completed`: the result is durable.
 - `accepted`: execution continues; retain `operation_id`.
 - `review_required`: no secret values are present; resolve the review explicitly.
-- `conflict`: work only in the returned resolution workspace and run `shade resolve`.
+- `conflict`: work only in the returned resolution workspace, then send `resolution_complete` (`shade resolve`, or `session.resolve` in the SDKs); the outcome is a successor for the parent session.
 
 Errors contain `code`, `retry`, optional `operation`, optional `next`, and optional `diagnostics_id`. They never embed command transcripts, secret fragments, access tokens, absolute tool paths, or a human-only fallback.
 

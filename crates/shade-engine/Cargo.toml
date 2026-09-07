@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 # Test-only SIGSTOP rendezvous. Never enabled in the distribution binary.
 fault-injection = []
+# Exposes deterministic fakes for integration tests. Never enabled in the distribution binary.
+test-support = []
 
 [dependencies]
 anyhow.workspace = true
@@ -32,5 +34,8 @@ url.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+# Self-dependency so the crate's own integration tests (compiled as external
+# crates) see the `test-support` fakes without a command-line `--features`.
+shade-engine = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

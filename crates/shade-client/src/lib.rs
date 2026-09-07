@@ -834,6 +834,22 @@ impl Session {
             .await
     }
 
+    /// Finish a `conflict` outcome. Fix the conflict inside the resolution
+    /// workspace named by `conflict` first: the daemon publishes from that
+    /// workspace and hands this session a successor, exactly as `sync` does.
+    pub async fn resolve(
+        &self,
+        conflict: &ConflictOutcome,
+    ) -> ClientResult<TerminalOutcome<Session>> {
+        self.successor(Intent::ResolutionComplete {
+            selector: WorkspaceSelector {
+                workspace_id: Some(conflict.workspace.clone()),
+                cwd: None,
+            },
+        })
+        .await
+    }
+
     pub async fn release(&self) -> ClientResult<TerminalOutcome<ReleaseResult>> {
         self.require_active()?;
         let outcome = self

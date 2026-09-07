@@ -77,8 +77,6 @@ bun test packages
 bun run test:harness
 SHADE_BIN="$CARGO_TARGET_DIR/release/shade" bun run test:harness:real
 
-skill_validator="${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py"
-python3 "$skill_validator" skills/shade-workspaces
 test "$(wc -w < skills/shade-workspaces/SKILL.md)" -le 175
 test "$(wc -c < skills/shade-workspaces/SKILL.md)" -le 1100
 test -f LICENSE

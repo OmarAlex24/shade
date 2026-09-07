@@ -55,7 +55,8 @@ pub struct DependencyContext<'a> {
     pub cache_root: &'a Path,
     pub runtime_root: &'a Path,
     /// Filesystem capability used for workspace fan-out. Production passes an
-    /// `ApfsFilesystem`; tests may deliberately pass `CopyFilesystem`.
+    /// `ApfsFilesystem`; tests may deliberately pass `CopyFilesystem`, which is
+    /// compiled only under `cfg(test)` or the `test-support` feature.
     pub filesystem: &'a dyn WorkspaceFilesystem,
     /// Decisions supplied by the control plane, never repository configuration.
     pub script_approvals: &'a [shade_protocol::ScriptApproval],

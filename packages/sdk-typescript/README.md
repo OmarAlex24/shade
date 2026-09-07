@@ -29,7 +29,21 @@ await session.release();
 `sessions.open` returns the session object itself. Its machine-facing fields are
 `session`, `workspace`, `lease`, `cwd`, `env`, and `compact_context`; its lifecycle
 methods are `context`, `checkpoint`, `fork`, `sync`, `restore`,
-`refreshDependencies`, `publish`, and `release`.
+`refreshDependencies`, `publish`, `resolve`, and `release`.
+
+A `publish` that cannot integrate settles as `conflict` and returns a resolution
+workspace. Fix the conflict there, then `resolve` it: the daemon publishes from
+that workspace and returns a successor session, so the old handle is retired and
+heartbeats move with it.
+
+```ts
+const outcome = await session.publish({ branch: "agent/change", message: "agent change" });
+if (outcome.state === "conflict") {
+  await launchAgent({ cwd: outcome.result.cwd, task: "resolve the conflict" });
+  const next = await session.resolve(outcome.result);
+  if (next.state === "completed") await next.result.release();
+}
+```
 
 Mutations accept an optional explicit `idempotency_key`. Shade generates one when
 omitted. Once the daemon answers `accepted`, the SDK only polls the returned

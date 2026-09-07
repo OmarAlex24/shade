@@ -8,7 +8,9 @@
 //! directly into the unpublished staging tree with `clonefileat` relative to
 //! pinned directory descriptors in a bounded worker set. `CopyFilesystem` is a
 //! deliberately boring deterministic fake for
-//! tests; it is never selected as a production fallback.
+//! tests; it is never selected as a production fallback and only exists under
+//! `cfg(test)` or the `test-support` feature, so it is absent from the
+//! distribution binary entirely.
 
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
@@ -19,7 +21,10 @@ use std::io;
 #[cfg(target_os = "macos")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+// Only `set_portable_mode`, itself test-only, needs `Permissions::from_mode`.
+#[cfg(any(test, feature = "test-support"))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -67,7 +72,10 @@ pub const APFS_IMMUTABLE_CLONE_STRATEGY: &str =
     "readdir_bounded_immutable_fclonefileat_staged_exclusive_publish";
 
 /// Full-copy fake used only by tests. Production code must construct
-/// `ApfsFilesystem` directly.
+/// `ApfsFilesystem` directly. Compiled only under `cfg(test)` or the
+/// `test-support` feature, so a downstream embedder cannot reach it through
+/// `Engine::with_components` and silently trade APFS clones for byte copies.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct CopyFilesystem;
 
@@ -93,6 +101,7 @@ impl WorkspaceFilesystem for ApfsFilesystem {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl WorkspaceFilesystem for CopyFilesystem {
     fn clone_tree(&self, source: &Path, destination: &Path) -> anyhow::Result<()> {
         ensure_source_and_destination(source, destination)?;
@@ -1063,6 +1072,7 @@ fn clone_limiter() -> &'static CloneLimiter {
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn copy_entries(
     source: &Path,
     destination: &Path,
@@ -1101,6 +1111,7 @@ fn copy_entries(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn sorted_entries(directory: &Path) -> anyhow::Result<Vec<fs::DirEntry>> {
     let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
     entries.sort_by(|left, right| {
@@ -1111,6 +1122,7 @@ fn sorted_entries(directory: &Path) -> anyhow::Result<Vec<fs::DirEntry>> {
     Ok(entries)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn set_portable_mode(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     // Git worktrees need the executable bits; ownership/set-id bits are not
     // propagated into an agent workspace.
@@ -1144,6 +1156,7 @@ fn remove_tree_checked(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn fake_usage(root: &Path) -> anyhow::Result<Usage> {
     let mut logical = 0_u64;
     let mut seen = BTreeMap::new();

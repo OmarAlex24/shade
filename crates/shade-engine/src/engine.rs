@@ -25,7 +25,7 @@ use shade_protocol::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -334,12 +334,54 @@ pub struct Engine {
     locks: Arc<LifecycleLocks>,
 }
 
+/// Sweep threshold for the keyed-lock map. Below it the common path stays
+/// O(1); at or above it a lookup also drops entries nobody holds any more.
+const KEYED_LOCK_SWEEP_THRESHOLD: usize = 256;
+
 #[derive(Default)]
 struct LifecycleLocks {
-    keyed: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Weak so a key touched once does not pin an `AsyncMutex` for the
+    /// daemon's lifetime. Live callers keep their `Arc` through the
+    /// `OwnedMutexGuard`, so mutual exclusion is unaffected.
+    keyed: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     fetch_cache: AsyncMutex<HashMap<String, CachedBase>>,
     script_policy: tokio::sync::RwLock<()>,
     dependency_artifacts: tokio::sync::RwLock<()>,
+}
+
+impl LifecycleLocks {
+    /// Serialize callers that name the same key. Concurrent callers resolve to
+    /// the same `Arc`; the returned guard owns it, so the map entry stays
+    /// upgradable for the whole critical section. Once every guard drops the
+    /// `Weak` dangles and a later lookup replaces or sweeps it.
+    async fn keyed_lock(&self, key: String) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut keyed = self.keyed.lock().await;
+            // Opportunistic sweep: entries whose owners have all finished no
+            // longer upgrade, so the map cannot grow once per key ever touched.
+            if keyed.len() >= KEYED_LOCK_SWEEP_THRESHOLD {
+                keyed.retain(|_, weak| weak.strong_count() > 0);
+            }
+            match keyed.get(&key).and_then(Weak::upgrade) {
+                Some(existing) => existing,
+                None => {
+                    let created = Arc::new(AsyncMutex::new(()));
+                    keyed.insert(key, Arc::downgrade(&created));
+                    created
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    /// Drop every keyed entry nobody holds any more. Production reaches this
+    /// through the threshold in `keyed_lock`; tests call it directly.
+    #[cfg(test)]
+    async fn sweep_keyed(&self) -> usize {
+        let mut keyed = self.keyed.lock().await;
+        keyed.retain(|_, weak| weak.strong_count() > 0);
+        keyed.len()
+    }
 }
 
 #[derive(Clone)]
@@ -389,10 +431,6 @@ enum SuccessorSource {
 
 impl Engine {
     pub fn open(config: EngineConfig) -> Result<Self, EngineError> {
-        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            return Err(EngineError::domain("PLATFORM_UNSUPPORTED", "never")
-                .next("use Apple Silicon macOS with an APFS Shade root"));
-        }
         let git = GitStore::system().with_content_filter(
             std::env::current_exe().map_err(EngineError::internal)?,
             config.runtime_dir(),
@@ -413,12 +451,19 @@ impl Engine {
         Self::with_components_and_git(config, filesystem, dependencies, GitStore::system())
     }
 
+    /// Sole constructor body: every other constructor funnels through here so
+    /// the platform gate cannot be bypassed. Tests must not run on a
+    /// construction path production cannot reach.
     pub fn with_components_and_git(
         config: EngineConfig,
         filesystem: Arc<dyn WorkspaceFilesystem>,
         dependencies: Arc<DependencyService>,
         git: GitStore,
     ) -> Result<Self, EngineError> {
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return Err(EngineError::domain("PLATFORM_UNSUPPORTED", "never")
+                .next("use Apple Silicon macOS with an APFS Shade root"));
+        }
         create_roots(&config).map_err(EngineError::internal)?;
         let database = Database::open(config.database_path())?;
         let secrets = SecretStore::new(config.secrets_dir()).map_err(EngineError::internal)?;
@@ -853,14 +898,7 @@ impl Engine {
     }
 
     async fn keyed_lock(&self, key: String) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.locks.keyed.lock().await;
-            locks
-                .entry(key)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        lock.lock_owned().await
+        self.locks.keyed_lock(key).await
     }
 
     async fn clone_tree_blocking(
@@ -3829,5 +3867,105 @@ fn intent_kind(intent: &Intent) -> &'static str {
         Intent::GarbageCollect => "garbage_collect",
         Intent::MaintenanceSweep => "maintenance_sweep",
         Intent::Reconcile => "reconcile",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KEYED_LOCK_SWEEP_THRESHOLD, LifecycleLocks};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn keyed_lock_serializes_concurrent_callers_on_the_same_key() {
+        let locks = Arc::new(LifecycleLocks::default());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (held, wait_for_held) = oneshot::channel();
+        let (release, wait_for_release) = oneshot::channel();
+
+        let first = tokio::spawn({
+            let locks = Arc::clone(&locks);
+            let inside = Arc::clone(&inside);
+            let peak = Arc::clone(&peak);
+            async move {
+                let guard = locks.keyed_lock("k".to_owned()).await;
+                let depth = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(depth, Ordering::SeqCst);
+                held.send(()).expect("signal that the lock is held");
+                // Only released once the contender has demonstrably queued.
+                wait_for_release.await.expect("release signal");
+                inside.fetch_sub(1, Ordering::SeqCst);
+                drop(guard);
+            }
+        });
+
+        wait_for_held.await.expect("first holder");
+        let second = tokio::spawn({
+            let locks = Arc::clone(&locks);
+            let inside = Arc::clone(&inside);
+            let peak = Arc::clone(&peak);
+            async move {
+                let guard = locks.keyed_lock("k".to_owned()).await;
+                let depth = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(depth, Ordering::SeqCst);
+                inside.fetch_sub(1, Ordering::SeqCst);
+                drop(guard);
+            }
+        });
+
+        // Give the contender every chance to break mutual exclusion.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            inside.load(Ordering::SeqCst),
+            1,
+            "second caller entered the critical section while the first held it"
+        );
+        assert_eq!(locks.keyed.lock().await.len(), 1);
+
+        release.send(()).expect("release the first holder");
+        first.await.expect("first task");
+        second.await.expect("second task");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "critical section overlapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_guards_leave_a_sweepable_entry() {
+        let locks = LifecycleLocks::default();
+
+        let first = locks.keyed_lock("k".to_owned()).await;
+        drop(first);
+        let second = locks.keyed_lock("k".to_owned()).await;
+        drop(second);
+
+        assert_eq!(
+            locks.keyed.lock().await.len(),
+            1,
+            "the dangling weak entry survives until a sweep"
+        );
+        assert_eq!(locks.sweep_keyed().await, 0, "sweep must drop dead entries");
+        assert!(locks.keyed.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crossing_the_threshold_sweeps_dead_entries() {
+        let locks = LifecycleLocks::default();
+        for index in 0..KEYED_LOCK_SWEEP_THRESHOLD {
+            drop(locks.keyed_lock(format!("k{index}")).await);
+        }
+        assert_eq!(locks.keyed.lock().await.len(), KEYED_LOCK_SWEEP_THRESHOLD);
+
+        // The next lookup crosses the threshold and reclaims every dead entry,
+        // leaving only the key it was asked for.
+        let live = locks.keyed_lock("fresh".to_owned()).await;
+        assert_eq!(locks.keyed.lock().await.len(), 1);
+        drop(live);
     }
 }

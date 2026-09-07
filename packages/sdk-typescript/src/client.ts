@@ -7,6 +7,7 @@ import {
   type CheckpointId,
   type CheckpointResult,
   type CompactContext,
+  type ConflictOutcome,
   type DependencyScriptsResult,
   type Diagnostic,
   type EventEnvelope,
@@ -779,6 +780,26 @@ export class ShadeSession {
       },
       options,
     );
+  }
+
+  /**
+   * Finish a `conflict` outcome. Fix the conflict inside the returned
+   * resolution workspace first: the daemon publishes from that workspace and
+   * hands the parent session a successor, exactly as `sync` does.
+   */
+  async resolve(
+    conflict: ConflictOutcome | { workspace: WorkspaceId },
+    options?: MutationOptions,
+  ): Promise<TerminalOutcome<ShadeSession>> {
+    this.assertLive();
+    const outcome = await this.bridge.executeAndWait<OpenedSessionPayload>(
+      {
+        kind: "resolution_complete",
+        selector: { workspace_id: conflict.workspace },
+      },
+      options,
+    );
+    return this.successor(outcome);
   }
 
   async release(options?: MutationOptions): Promise<TerminalOutcome<ReleaseResult>> {

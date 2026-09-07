@@ -71,6 +71,8 @@ Path and content detection share one local scanner. The CLI also serves Git's pe
 - GC checks the lease, operation, review, checkpoint, unmerged-index and detached-commit gates again immediately before deletion.
 - Common replies stay compact; [durable failure diagnostics](DIAGNOSTICS.md) are referenced by `diagnostics_id`. Sanitized detail commits with the failed operation and outbox event; explicit CLI/SDK queries retrieve it. The CLI can also read the existing database while the daemon is stopped.
 
+The deterministic full-copy `CopyFilesystem` exists only behind the `test-support` Cargo feature, which the crate enables for its own integration tests and never for the distribution binary; a release build has no byte-copy `WorkspaceFilesystem` to reach, so `COW_UNAVAILABLE` cannot degrade into silent copying. The Apple Silicon/APFS gate is enforced by `Engine::with_components_and_git`, the single constructor body every other constructor funnels through, so `with_components` and `open` reject an unsupported platform identically with `PLATFORM_UNSUPPORTED`: tests cannot run on a construction path production cannot reach.
+
 The `fault-injection` Cargo feature adds a test-only rendezvous at named phase boundaries. With an explicitly armed isolated directory, a selected boundary writes a marker and stops the daemon with `SIGSTOP`; the test parent sends `SIGKILL` and restarts the same pool. The distribution build compiles these calls to no-ops and does not read fault-related environment variables. The matrix checks real APFS directories, Git registrations/refs, SQLite integrity/foreign keys, predecessor contents, operation replay and final resource disposition.
 
 Incremental-base cases interrupt temporary-index creation, population, refresh,

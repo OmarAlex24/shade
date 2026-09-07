@@ -84,7 +84,7 @@ await session.publish({ branch: "agent/change", message: "agent change" });
 await session.release();
 ```
 
-The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish` and `release`. Review decisions live on `client.reviews()`.
+The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish`, `resolve` and `release`. Review decisions live on `client.reviews()`.
 
 ## Outcomes
 
@@ -95,7 +95,7 @@ Every mutation settles into one of four states.
 | `completed` | The result is durable. | Read `outcome.result` and continue. |
 | `accepted` | Execution continues on the daemon. | Retain `operation_id`, then poll it or resume events by cursor. |
 | `review_required` | A secret change needs a decision. No values are present. | Show the key-only preview, then resolve with merge, keep or discard. |
-| `conflict` | Integration could not complete. | Work only in the returned resolution workspace, then run `shade resolve`. |
+| `conflict` | Integration could not complete. | Work only in the returned resolution workspace, then run `shade resolve` or `session.resolve(...)`. |
 
 ## Status
 
@@ -136,8 +136,12 @@ bun run test:harness
 To package an accepted build:
 
 ```sh
-python3 scripts/package_release.py --binary /tmp/shade-target/release/shade
+python3 scripts/package_release.py --binary target/release/shade
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go through [SECURITY.md](SECURITY.md).
 
 ## Docs
 

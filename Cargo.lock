@@ -1008,6 +1008,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "shade-engine",
  "shade-protocol",
  "tempfile",
  "thiserror",

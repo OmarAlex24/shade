@@ -168,15 +168,28 @@ export async function runSessionHarness(): Promise<HarnessReport> {
     assert.equal(published.branch, "feature/successor");
     assert.equal(published.pushed, true);
 
-    const conflict = await sessions[1]!.publish({
+    const conflicted = sessions[1]!;
+    let resolved: ShadeSession = conflicted;
+    const conflict = await conflicted.publish({
       branch: "conflict",
       message: "exercise conflict",
     });
     assert.equal(conflict.state, "conflict");
     if (conflict.state === "conflict") {
-      assert.notEqual(conflict.result.workspace, sessions[1]!.workspace);
-      assert.notEqual(conflict.result.cwd, sessions[1]!.cwd);
+      assert.notEqual(conflict.result.workspace, conflicted.workspace);
+      assert.notEqual(conflict.result.cwd, conflicted.cwd);
       assert.deepEqual(conflict.result.paths, ["src/conflict.ts"]);
+
+      // Resolving publishes from the resolution workspace and hands the parent
+      // session a successor: same lease count, new workspace, retired handle.
+      resolved = expectCompleted(await conflicted.resolve(conflict.result));
+      assert.equal(resolved.session, conflicted.session);
+      assert.equal(resolved.workspace, conflict.result.workspace);
+      assert.equal(resolved.cwd, conflict.result.cwd);
+      assert.notEqual(resolved.lease, conflicted.lease);
+      await expectRetired(conflicted);
+      await assertHeartbeatTransferred(daemon, conflicted.lease, resolved.lease);
+      assert.equal(daemon.active_leases, 21);
     }
 
     expectCompleted(await parent.release());
@@ -205,8 +218,9 @@ export async function runSessionHarness(): Promise<HarnessReport> {
     await Promise.all([
       ...sessions
         .slice(1)
-        .filter((session) => session !== sessions[2])
+        .filter((session) => session !== sessions[2] && session !== conflicted)
         .map((session) => session.release()),
+      resolved.release(),
       successor.release(),
     ]);
     assert.equal(daemon.active_leases, 0);

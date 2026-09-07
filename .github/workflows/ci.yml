@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+# Shade builds and runs only on Apple Silicon macOS with APFS, so every job
+# uses the arm64 `macos-15` image.
+jobs:
+  rust:
+    name: Rust
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets --no-fail-fast
+
+  typescript:
+    name: TypeScript
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test packages
+      - run: bun run test:harness
+
+  real-harness:
+    name: Real session harness
+    runs-on: macos-15
+    needs: [rust, typescript]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      # The harness drives the real npm provider, so node and npm must be on
+      # PATH. It serves its own local npm registry, so no network is required.
+      # Everything else it needs (git, tar, /usr/bin/sqlite3, APFS) is already
+      # on the runner image.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: bun install --frozen-lockfile
+      - run: cargo build --release
+      - name: Run the real 20-session harness
+        timeout-minutes: 20
+        run: SHADE_BIN="$PWD/target/release/shade" bun run test:harness:real
