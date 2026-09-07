@@ -88,7 +88,9 @@ In outline, for a worktree at `$WT` on branch `$BR` belonging to `$REPO`:
 3. If it is a JavaScript repository, make sure exactly one lockfile is
    committed.
 4. `shade open $REPO --base $BR --session <id>` from the main repository, then
-   enter the returned `cwd` and export the returned `SHADE_*` environment.
+   enter the returned `cwd` and export the returned `SHADE_*` environment. `$BR`
+   does not have to be pushed: the base is resolved from `$REPO` itself, and
+   `origin` answers only for `origin/<branch>` or a ref the repository lacks.
 5. `shade context` — check `head_sha` against the old worktree's HEAD and
    `dependencies.state` is `ready`.
 6. `git -C $REPO worktree remove $WT`, then `git -C $REPO worktree prune`.
