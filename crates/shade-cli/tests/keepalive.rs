@@ -172,6 +172,37 @@ impl Fixture {
         std::fs::read_to_string(path).unwrap_or_else(|error| format!("<no log: {error}>"))
     }
 
+    /// Every event name on the log, in cursor order. The keepalive is a
+    /// detached child, so the journal is the only account of what the daemon
+    /// did on its behalf.
+    fn event_names(&self) -> Vec<String> {
+        let events = try_rpc(
+            &self.socket,
+            &json!({"type":"query","v":1,"request_id":"events",
+                "query":{"kind":"events","after_cursor":0,"limit":10000}}),
+        )
+        .unwrap();
+        events["outcome"]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["event"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// When the session's current lease runs out, in wall-clock terms.
+    fn lease_deadline(&self, session: &str) -> i64 {
+        let response = try_rpc(
+            &self.socket,
+            &json!({"type":"query","v":1,"request_id":"deadline",
+                "query":{"kind":"session","session_id":session}}),
+        )
+        .unwrap();
+        response["outcome"]["result"]["lease_expires_at_ms"]
+            .as_i64()
+            .expect("a live session reports its deadline")
+    }
+
     fn heartbeats(&self, lease: &str) -> usize {
         let events = try_rpc(
             &self.socket,
@@ -266,6 +297,13 @@ fn parent_of(pid: u32) -> u32 {
         .trim()
         .parse()
         .unwrap_or(0)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
@@ -571,14 +609,37 @@ fn dormant_session_is_reattached_by_the_running_keepalive() {
 
     // Stopping the daemon is what makes the lease genuinely expire: nothing can
     // renew it, and the sweep that marks it dormant runs on the next start.
+    // Wait out the deadline the daemon itself reported rather than a fixed
+    // number of seconds that has to be re-guessed whenever the harness TTL
+    // changes.
+    let deadline = fixture.lease_deadline("ka-dormant");
     drop(daemon);
-    std::thread::sleep(Duration::from_secs(4));
+    while now_ms() <= deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let _daemon = fixture.daemon(2);
+
+    // The dormancy is real, not assumed: the restart sweep records it before
+    // the keepalive can do anything about it.
+    wait_until("the expired lease to be swept into a dormancy", || {
+        fixture
+            .event_names()
+            .iter()
+            .any(|name| name == "session.dormant")
+    });
 
     // The owner never died, so the keepalive must bring the session back.
     wait_until("the session to return to active", || {
         fixture.session_state("ka-dormant") == "active"
     });
+    let names = fixture.event_names();
+    let dormant = names.iter().position(|name| name == "session.dormant");
+    let reattached = names.iter().rposition(|name| name == "session.reattached");
+    assert!(
+        matches!((dormant, reattached), (Some(dormant), Some(reattached)) if reattached > dormant),
+        "the keepalive reattached the session it saw go dormant; keepalive log:\n{}",
+        fixture.keepalive_log("ka-dormant")
+    );
     assert!(alive(pid), "the keepalive outlives one dormancy");
 
     // The daemon commits the reattach before the keepalive rewrites its

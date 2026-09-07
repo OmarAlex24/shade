@@ -61,10 +61,11 @@ test("session_reattach renews the lease of a dormant session over the wire", asy
 });
 
 test("an expired lease is reattached under the caller's handle", async () => {
-  daemon = new FakeShadeDaemon(60_000);
-  await daemon.start();
+  const fake = new FakeShadeDaemon(60_000);
+  daemon = fake;
+  await fake.start();
   const client = new ShadeClient({
-    socket: daemon.socket,
+    socket: fake.socket,
     actor: { kind: "agent", id: "reattach-sdk" },
     heartbeat_interval_ms: 25,
   });
@@ -75,12 +76,29 @@ test("an expired lease is reattached under the caller's handle", async () => {
     repository: { kind: "local", path: "/repo" },
   });
   const first = session.lease;
-  daemon.expire("chat-reattach");
+  const workspace = session.workspace;
+  const cwd = session.cwd;
+  fake.expire("chat-reattach");
+  const beatsOnTheDeadLease = fake.heartbeat_counts.get(first) ?? 0;
 
   await waitUntil(() => session.lease !== first);
+
+  // What changed: a new lease, exported under the same name, and the daemon
+  // renewing that one rather than the dead one.
+  expect(session.lease).not.toBe(first);
   expect(session.env.SHADE_LEASE).toBe(session.lease);
-  expect(session.workspace).toBe((await session.context()).workspace);
-  expect((await client.sessions.status("chat-reattach")).lifecycle).toBe("active");
+  await waitUntil(() => (fake.heartbeat_counts.get(session.lease) ?? 0) > 0);
+  expect(fake.heartbeat_counts.get(first) ?? 0).toBe(beatsOnTheDeadLease);
+
+  // What did not: a dormancy keeps the tree, so the handle keeps its identity
+  // and its cwd instead of being handed a successor.
+  expect(session.workspace).toBe(workspace);
+  expect(session.cwd).toBe(cwd);
+
+  const status = await client.sessions.status("chat-reattach");
+  expect(status.lifecycle).toBe("active");
+  expect(status.workspace).toBe(workspace);
+  expect(status.lease).toBe(session.lease);
 });
 
 test("reattach can be turned off and the handle retires when its lease expires", async () => {
