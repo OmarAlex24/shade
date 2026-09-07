@@ -1500,3 +1500,67 @@ async fn a_heartbeat_on_a_suspended_session_names_the_suspension_not_an_expiry()
     );
     assert_eq!(beat["lease"], serde_json::json!(woken.lease.0));
 }
+
+/// Reconciliation demotes a workspace whose tree or worktree registration no
+/// longer checks out, and `failed` is collectible. When the victim was dormant
+/// that turns work a caller was told survives a lost lease into a GC candidate,
+/// which used to happen through a bare `UPDATE` and a `workspace.failed` event
+/// naming nothing but the id.
+#[tokio::test]
+async fn demoting_a_dormant_workspace_to_failed_is_counted_and_says_why() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened) = dormant_session(directory.path()).await;
+    assert_eq!(workspace_state(&engine, &opened), "dormant");
+
+    // The tree is there but its worktree pointer is not: what an interrupted
+    // move, or a user cleaning up "a stray file", leaves behind.
+    fs::remove_file(PathBuf::from(&opened.cwd).join(".git")).unwrap();
+
+    let reconciled: serde_json::Value = completed(
+        engine
+            .execute(system("reconcile-demote", Intent::Reconcile))
+            .await,
+    );
+    assert_eq!(reconciled["invalid_workspaces"], 1);
+    assert_eq!(
+        reconciled["dormant_workspaces_failed"], 1,
+        "the reconcile report separates a dormant demotion from any other"
+    );
+    assert_eq!(workspace_state(&engine, &opened), "failed");
+
+    let health: serde_json::Value = completed(engine.query(query(Query::Doctor)).await);
+    assert_eq!(health["workspaces_failed"], 1);
+
+    let events: serde_json::Value = completed(
+        engine
+            .query(query(Query::Events {
+                after_cursor: 0,
+                limit: 1000,
+            }))
+            .await,
+    );
+    let demotion = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|event| event["event"] == "workspace.failed")
+        .expect("the demotion is on the event log");
+    assert_eq!(demotion["payload"]["workspace"], opened.workspace.0);
+    assert_eq!(
+        demotion["payload"]["from"], "dormant",
+        "the event names the state that was lost, not just the new one"
+    );
+    assert_eq!(
+        demotion["payload"]["reason"],
+        "missing_tree_or_worktree_registration"
+    );
+
+    // A second pass neither re-counts nor re-emits: the workspace is already
+    // `failed`, and reconciliation is run on every daemon start.
+    let again: serde_json::Value = completed(
+        engine
+            .execute(system("reconcile-demote-again", Intent::Reconcile))
+            .await,
+    );
+    assert_eq!(again["dormant_workspaces_failed"], 0);
+}

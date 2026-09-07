@@ -451,6 +451,9 @@ struct ReconciliationStats {
     incomplete_removed: u64,
     incomplete_failed: u64,
     invalid_workspaces: u64,
+    /// How many of those were `dormant`: work a caller was told is safe, now
+    /// collectible. Zero is the only value that needs no explanation.
+    dormant_workspaces_failed: u64,
     worktree_metadata_removed: u64,
     worktree_metadata_conflicts: u64,
     checkpoint_refs_removed: u64,
@@ -851,6 +854,7 @@ impl Engine {
                     "incomplete_removed": recovery.incomplete_removed,
                     "incomplete_failed": recovery.incomplete_failed,
                     "invalid_workspaces": recovery.invalid_workspaces,
+                    "dormant_workspaces_failed": recovery.dormant_workspaces_failed,
                     "worktree_metadata_removed": recovery.worktree_metadata_removed,
                     "worktree_metadata_conflicts": recovery.worktree_metadata_conflicts,
                     "checkpoint_refs_removed": recovery.checkpoint_refs_removed,
@@ -4106,6 +4110,31 @@ impl Engine {
         Ok(())
     }
 
+    /// Demote one workspace reconciliation could not vouch for, and count it
+    /// separately when it was dormant. A dormant workspace is work the caller
+    /// was told survives a lost lease; turning it into a GC candidate is worth
+    /// a warning and a number in the reconcile report, not a silent UPDATE.
+    fn fail_reconciled_workspace(
+        &self,
+        workspace: &WorkspaceRecord,
+        reason: &'static str,
+        stats: &mut ReconciliationStats,
+    ) -> Result<(), EngineError> {
+        if workspace.state == "failed" {
+            return Ok(());
+        }
+        let previous = self.database.fail_workspace(&workspace.id, reason)?;
+        if previous == "dormant" {
+            stats.dormant_workspaces_failed += 1;
+            tracing::warn!(
+                workspace = %workspace.id,
+                reason,
+                "a dormant workspace failed reconciliation and is now collectible"
+            );
+        }
+        Ok(())
+    }
+
     async fn reconcile_workspace_resources(
         &self,
         operation: &OperationId,
@@ -4183,10 +4212,11 @@ impl Engine {
             }
             let Some(path) = checked_workspace_path(&workspace.path, &workspace_root) else {
                 stats.invalid_workspaces += 1;
-                if workspace.state != "failed" {
-                    self.database
-                        .mark_workspace_state(&workspace.id, "failed")?;
-                }
+                self.fail_reconciled_workspace(
+                    workspace,
+                    "path_outside_workspace_pool",
+                    &mut stats,
+                )?;
                 continue;
             };
             let Some(registered) = registrations.get(&workspace.repository_id.0) else {
@@ -4207,10 +4237,11 @@ impl Engine {
                     .insert(path);
             } else {
                 stats.invalid_workspaces += 1;
-                if workspace.state != "failed" {
-                    self.database
-                        .mark_workspace_state(&workspace.id, "failed")?;
-                }
+                self.fail_reconciled_workspace(
+                    workspace,
+                    "missing_tree_or_worktree_registration",
+                    &mut stats,
+                )?;
             }
         }
 

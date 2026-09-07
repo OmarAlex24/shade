@@ -594,6 +594,35 @@ impl Database {
         Ok(())
     }
 
+    /// Mark a workspace `failed`, recording where it came from and why.
+    ///
+    /// Reconciliation demotes a workspace whose tree or registration no longer
+    /// checks out, and `failed` is collectible. Demoting a *dormant* workspace
+    /// therefore turns work a caller was told is safe into a GC candidate, so
+    /// the event has to say more than "failed": it names the state that was
+    /// lost and the check that failed. Returns the previous state.
+    pub fn fail_workspace(&self, id: &WorkspaceId, reason: &str) -> Result<String, DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: String = transaction.query_row(
+            "SELECT state FROM workspaces WHERE id=?1",
+            params![id.0],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE workspaces SET state='failed', updated_at_ms=?2 WHERE id=?1",
+            params![id.0, now_ms()],
+        )?;
+        append_event(
+            &transaction,
+            "workspace.failed",
+            &id.0,
+            &json!({"workspace": id, "from": previous, "reason": reason}),
+        )?;
+        transaction.commit()?;
+        Ok(previous)
+    }
+
     pub fn set_workspace_head(&self, id: &WorkspaceId, head_oid: &ObjectId) -> Result<(), DbError> {
         let connection = self.connection()?;
         connection.execute(
@@ -2795,6 +2824,14 @@ impl Database {
         // A suspended workspace with no sleep checkpoint has lost its content
         // pointer. Counting it makes a broken invariant visible instead of
         // silent.
+        // A `failed` workspace is collectible, so a non-zero count is the one
+        // number that says work reconciliation could not vouch for is queued
+        // for deletion.
+        let failed_workspaces: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE state='failed'",
+            [],
+            |row| row.get(0),
+        )?;
         let suspended_without_checkpoint: i64 = connection.query_row(
             "SELECT COUNT(*) FROM workspaces w WHERE w.state='suspended' \
              AND NOT EXISTS (SELECT 1 FROM checkpoints c WHERE c.workspace_id=w.id \
@@ -2810,6 +2847,7 @@ impl Database {
             "sessions_dormant": dormant_sessions,
             "sessions_suspended": suspended_sessions,
             "workspaces_suspended": suspended_workspaces,
+            "workspaces_failed": failed_workspaces,
             "suspended_without_checkpoint": suspended_without_checkpoint,
         }))
     }
