@@ -7,8 +7,9 @@ use shade_protocol::{
     SessionId, SessionStatus, ShadeError, WireRequest, WireResponse, WorkspaceId,
     WorkspaceSelector,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -143,6 +144,17 @@ pub struct ShadeClient {
     socket: PathBuf,
     actor: Actor,
     options: Arc<ShadeClientOptions>,
+    /// The session handles this client has handed out and not yet lost.
+    ///
+    /// `wake` and `reattach` are safe to call on a session that is already
+    /// live -- that is the whole point of `wake` being unconditional -- and
+    /// each call used to build a second handle with its own heartbeat task on
+    /// the same lease. Two heartbeats on one lease is not an error the daemon
+    /// can see; it is a client that renews twice as often as it says it does,
+    /// and a `retire()` on one handle that leaves the other beating. Held
+    /// weakly, so a handle the caller dropped takes its heartbeat with it
+    /// exactly as before.
+    live: Arc<Mutex<HashMap<String, Weak<SessionLifecycle>>>>,
 }
 
 impl ShadeClient {
@@ -161,6 +173,7 @@ impl ShadeClient {
             socket: socket.as_ref().to_path_buf(),
             actor,
             options: Arc::new(options),
+            live: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -737,20 +750,49 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// Take the handle this client already holds for the session, or build one.
+    ///
+    /// `wake` on a live session and `reattach` on one that never went dormant
+    /// both come back with the session a caller may already be holding. The
+    /// caller gets that same handle, refreshed with what the daemon just said,
+    /// rather than a second one heartbeating the same lease beside it. A
+    /// successor -- a different workspace under the same session id, which is
+    /// what wake, sync and restore produce -- retires the old handle first,
+    /// because that one really is finished.
     fn new(client: ShadeClient, opened: OpenedSession) -> Self {
+        let mut live = client.live.lock().expect("session registry poisoned");
+        live.retain(|_, handle| handle.strong_count() > 0);
+        if let Some(existing) = live.get(&opened.session.0).and_then(Weak::upgrade) {
+            if existing.is_active() && existing.opened().workspace == opened.workspace {
+                existing.adopt(opened.clone());
+                return Self {
+                    client: client.clone(),
+                    session_id: opened.session,
+                    selector: WorkspaceSelector {
+                        workspace_id: Some(opened.workspace),
+                        cwd: Some(opened.cwd),
+                    },
+                    lifecycle: existing,
+                };
+            }
+            existing.retire();
+        }
         let (stop, stop_receiver) = watch::channel(false);
+        let lifecycle = Arc::new(SessionLifecycle {
+            stop,
+            opened: Mutex::new(opened.clone()),
+            reason: Mutex::new(None),
+        });
+        live.insert(opened.session.0.clone(), Arc::downgrade(&lifecycle));
+        drop(live);
         let session = Self {
             client: client.clone(),
-            session_id: opened.session.clone(),
+            session_id: opened.session,
             selector: WorkspaceSelector {
-                workspace_id: Some(opened.workspace.clone()),
-                cwd: Some(opened.cwd.clone()),
+                workspace_id: Some(opened.workspace),
+                cwd: Some(opened.cwd),
             },
-            lifecycle: Arc::new(SessionLifecycle {
-                stop,
-                opened: Mutex::new(opened),
-                reason: Mutex::new(None),
-            }),
+            lifecycle,
         };
         session.spawn_heartbeat(client, stop_receiver);
         session
@@ -1897,6 +1939,109 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(heartbeats.load(Ordering::SeqCst), after);
         assert!(session.checkpoint("again").await.is_err());
+        server.abort();
+    }
+
+    /// `wake` is documented as safe to send unconditionally, and `reattach` on
+    /// a live session is idempotent in the daemon. Both used to hand back a
+    /// second handle with its own heartbeat task on the same lease: not an
+    /// error the daemon can see, just a client renewing twice as often as it
+    /// says it does, with a `retire()` on one handle leaving the other beating.
+    #[tokio::test]
+    async fn waking_a_live_session_returns_the_handle_the_caller_already_holds() {
+        let Some((temp, listener)) = test_listener() else {
+            return;
+        };
+        let socket = temp.path().join("shade.sock");
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let counted = heartbeats.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut frame = Vec::new();
+                    if reader.read_until(b'\n', &mut frame).await.is_err() {
+                        return;
+                    }
+                    let Some(newline) = frame.iter().position(|byte| *byte == b'\n') else {
+                        return;
+                    };
+                    let request: WireRequest = serde_json::from_slice(&frame[..newline]).unwrap();
+                    let request_id = wire_request_id(&request).to_owned();
+                    let outcome = match request {
+                        WireRequest::Execute(ExecuteRequest {
+                            intent: Intent::LeaseHeartbeat { lease_id, .. },
+                            ..
+                        }) => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Outcome::Completed(json!({"lease": lease_id, "expires_at_ms": 1}))
+                        }
+                        // The daemon reattaches a live session to the lease it
+                        // already holds, and wake on a session that never slept
+                        // is exactly a reattach.
+                        WireRequest::Execute(ExecuteRequest {
+                            intent: Intent::SessionWake { .. } | Intent::SessionReattach { .. },
+                            ..
+                        }) => {
+                            Outcome::Completed(serde_json::to_value(opened("lease-test")).unwrap())
+                        }
+                        _ => return,
+                    };
+                    let mut encoded = serde_json::to_vec(&response(&request_id, outcome)).unwrap();
+                    encoded.push(b'\n');
+                    let _ = writer.write_all(&encoded).await;
+                });
+            }
+        });
+        let client = ShadeClient::with_options(
+            &socket,
+            Actor {
+                kind: ActorKind::Agent,
+                id: "registry-test".into(),
+            },
+            ShadeClientOptions {
+                request_timeout: Duration::from_millis(200),
+                operation_timeout: Duration::from_millis(200),
+                heartbeat_interval: Duration::from_millis(10),
+                ..ShadeClientOptions::default()
+            },
+        )
+        .unwrap();
+        let session = Session::new(client.clone(), opened("lease-test"));
+        let woken = client
+            .sessions()
+            .wake(SessionId("session-test".into()))
+            .await
+            .unwrap();
+        let attached = client
+            .sessions()
+            .reattach(SessionId("session-test".into()))
+            .await
+            .unwrap();
+
+        // One lifecycle behind all three, so retiring any of them stops the
+        // single heartbeat rather than one of three.
+        assert!(Arc::ptr_eq(&session.lifecycle, &woken.lifecycle));
+        assert!(Arc::ptr_eq(&session.lifecycle, &attached.lifecycle));
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        assert!(heartbeats.load(Ordering::SeqCst) >= 2);
+
+        woken.retire();
+        assert!(!session.is_active());
+        assert!(!attached.is_active());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after = heartbeats.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        assert_eq!(
+            heartbeats.load(Ordering::SeqCst),
+            after,
+            "one retire stops every heartbeat this session ever started"
+        );
         server.abort();
     }
 
