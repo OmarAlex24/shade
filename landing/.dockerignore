@@ -1,0 +1,18 @@
+# Everything the builder regenerates, plus anything that would bust the install
+# layer cache without changing the output.
+node_modules/
+dist/
+.astro/
+.screenshots/
+
+# The image builds itself; it never needs its own recipe in the context.
+Dockerfile
+.dockerignore
+
+# Local-only noise.
+.git/
+.gitignore
+.env
+.env.*
+*.log
+.DS_Store

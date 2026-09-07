@@ -1,0 +1,51 @@
+# Runtime config for the Shade landing page container.
+#
+# The image serves a pre-built, pre-compressed Astro site. Everything it needs
+# is already on disk: no build step, no origin fetch, no certificate request.
+# TLS and the public hostname are Dokploy's job (Traefik terminates HTTPS and
+# forwards plain HTTP to port 80 here), so auto_https stays off.
+
+{
+	admin off
+	persist_config off
+	auto_https off
+	log {
+		format console
+	}
+}
+
+:80 {
+	root * /srv
+
+	# Content-hashed build output: the filename changes whenever the bytes do,
+	# so it can be cached forever.
+	@immutable path /_astro/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# Everything else (index.html, favicon.svg, robots.txt, the sitemaps) keeps
+	# a stable name, so it has to be revalidated to pick up a redeploy.
+	@mutable not path /_astro/*
+	header @mutable Cache-Control "public, max-age=0, must-revalidate"
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	# Serve the .br/.gz siblings written by scripts/precompress.ts; `encode`
+	# covers anything without one. Caddy skips re-encoding a response that
+	# already carries a Content-Encoding.
+	encode zstd gzip
+	file_server {
+		precompressed br gzip
+	}
+
+	# This is a single static page, not an SPA: an unknown path is a real 404,
+	# never a rewrite back to index.html. Any other error keeps Caddy's own
+	# handling, which already returns the correct status.
+	handle_errors 404 {
+		header Cache-Control "no-store"
+		respond "404 Not Found" 404
+	}
+}
