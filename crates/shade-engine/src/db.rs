@@ -1290,6 +1290,197 @@ impl Database {
         Ok(lease)
     }
 
+    /// Finish a suspension: `suspending` becomes `suspended` and the session
+    /// follows it, in one transaction with the lease release.
+    ///
+    /// Idempotent, because the reconciliation pass that finishes an
+    /// interrupted sleep calls exactly this.
+    pub fn suspend_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<(), DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let state: String = transaction
+            .query_row(
+                "SELECT state FROM workspaces WHERE id=?1",
+                params![workspace_id.0],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DbError::LeaseFenced)?;
+        if state == "suspended" {
+            return Ok(());
+        }
+        if state != "suspending" {
+            return Err(DbError::LeaseFenced);
+        }
+        transaction.execute(
+            "UPDATE leases SET released_at_ms=?2 WHERE workspace_id=?1 AND released_at_ms IS NULL",
+            params![workspace_id.0, now],
+        )?;
+        let workspace = transaction.execute(
+            "UPDATE workspaces SET state='suspended', updated_at_ms=?2 \
+             WHERE id=?1 AND state='suspending'",
+            params![workspace_id.0, now],
+        )?;
+        if workspace != 1 {
+            return Err(DbError::LeaseFenced);
+        }
+        transaction.execute(
+            "UPDATE sessions SET state='suspended', updated_at_ms=?2 \
+             WHERE workspace_id=?1 AND state IN ('active','dormant')",
+            params![workspace_id.0, now],
+        )?;
+        append_event(
+            &transaction,
+            "workspace.suspended",
+            &workspace_id.0,
+            &json!({"workspace": workspace_id, "checkpoint": checkpoint_id}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Undo a half-finished suspension, returning the workspace to Dormant.
+    ///
+    /// Used by reconciliation when a `suspending` workspace still has its tree
+    /// but no sleep checkpoint to restore from. The session and the lease move
+    /// with it so the result is a consistent Dormant workspace rather than an
+    /// active session with no lease.
+    pub fn restore_suspending_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let changed = transaction.execute(
+            "UPDATE workspaces SET state='dormant', updated_at_ms=?2 \
+             WHERE id=?1 AND state='suspending'",
+            params![workspace_id.0, now],
+        )?;
+        if changed != 1 {
+            return Ok(());
+        }
+        transaction.execute(
+            "UPDATE leases SET released_at_ms=?2 WHERE workspace_id=?1 AND released_at_ms IS NULL",
+            params![workspace_id.0, now],
+        )?;
+        transaction.execute(
+            "UPDATE sessions SET state='dormant', updated_at_ms=?2 \
+             WHERE workspace_id=?1 AND state='active'",
+            params![workspace_id.0, now],
+        )?;
+        append_event(
+            &transaction,
+            "workspace.dormant",
+            &workspace_id.0,
+            &json!({"workspace": workspace_id}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Bind a woken session to the successor materialized from its suspension
+    /// checkpoint.
+    ///
+    /// A sibling of [`Database::adopt_successor_handoff`], not a use of it:
+    /// adoption requires a live lease on the predecessor, and a suspended
+    /// workspace by definition has none. The preconditions become "session is
+    /// suspended on the predecessor, predecessor is suspended, successor was
+    /// materialized for it", and the whole swap — predecessor released,
+    /// successor bound, session active, new lease at `fence + 1` — is one
+    /// transaction, exactly like adoption.
+    #[allow(clippy::too_many_arguments)]
+    pub fn activate_woken_workspace(
+        &self,
+        session_id: &SessionId,
+        predecessor: &WorkspaceId,
+        successor: &WorkspaceId,
+        operation_id: &OperationId,
+        lease_id: &LeaseId,
+        ttl_secs: i64,
+        outcome: &Outcome,
+    ) -> Result<LeaseRecord, DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT workspace_id FROM sessions WHERE id=?1 AND state='suspended'",
+                params![session_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(predecessor.0.as_str()) {
+            return Err(DbError::LeaseFenced);
+        }
+        let previous_fence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(fence), 0) FROM leases WHERE session_id=?1",
+            params![session_id.0],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE leases SET released_at_ms=?2 WHERE session_id=?1 AND released_at_ms IS NULL",
+            params![session_id.0, now],
+        )?;
+        let old_changed = transaction.execute(
+            "UPDATE workspaces SET session_id=NULL, state='released', updated_at_ms=?2 \
+             WHERE id=?1 AND state='suspended'",
+            params![predecessor.0, now],
+        )?;
+        let new_changed = transaction.execute(
+            "UPDATE workspaces SET session_id=?2, state='ready', updated_at_ms=?3 \
+             WHERE id=?1 AND predecessor_id=?4 AND session_id IS NULL \
+               AND state IN ('materializing','handoff_pending')",
+            params![successor.0, session_id.0, now, predecessor.0],
+        )?;
+        let session_changed = transaction.execute(
+            "UPDATE sessions SET workspace_id=?2, state='active', updated_at_ms=?3 \
+             WHERE id=?1 AND workspace_id=?4 AND state='suspended'",
+            params![session_id.0, successor.0, now, predecessor.0],
+        )?;
+        if old_changed != 1 || new_changed != 1 || session_changed != 1 {
+            return Err(DbError::LeaseFenced);
+        }
+        let lease = LeaseRecord {
+            id: lease_id.clone(),
+            session_id: session_id.clone(),
+            workspace_id: successor.clone(),
+            fence: previous_fence + 1,
+            heartbeat_at_ms: now,
+            expires_at_ms: now + ttl_secs * 1000,
+            released_at_ms: None,
+        };
+        transaction.execute(
+            "INSERT INTO leases \
+             (id, session_id, workspace_id, fence, heartbeat_at_ms, expires_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                lease.id.0,
+                lease.session_id.0,
+                lease.workspace_id.0,
+                lease.fence,
+                lease.heartbeat_at_ms,
+                lease.expires_at_ms,
+            ],
+        )?;
+        finish_operation_in_transaction(&transaction, operation_id, outcome)?;
+        append_event(
+            &transaction,
+            "session.woken",
+            &session_id.0,
+            &json!({
+                "session": session_id,
+                "predecessor": predecessor,
+                "workspace": successor,
+                "lease": lease.id,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(lease)
+    }
+
     pub fn create_checkpoint(&self, record: &CheckpointRecord) -> Result<(), DbError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -1355,6 +1546,39 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// The checkpoint a suspended workspace restores from.
+    ///
+    /// It is the newest ready `sleep` checkpoint, which is deterministic: a
+    /// suspended workspace has no tree and therefore cannot produce another
+    /// one. Keeping the rule here means `wake`, `doctor` and reconciliation
+    /// all agree on which checkpoint a suspension owns.
+    pub fn suspension_checkpoint(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<Option<CheckpointRecord>, DbError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, workspace_id, head_oid, index_oid, worktree_oid, reason, state \
+                 FROM checkpoints WHERE workspace_id=?1 AND state='ready' AND reason='sleep' \
+                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                params![workspace.0],
+                |row| {
+                    Ok(CheckpointRecord {
+                        id: CheckpointId(row.get(0)?),
+                        workspace_id: WorkspaceId(row.get(1)?),
+                        head_oid: ObjectId(row.get(2)?),
+                        index_oid: ObjectId(row.get(3)?),
+                        worktree_oid: ObjectId(row.get(4)?),
+                        reason: row.get(5)?,
+                        state: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn checkpoints_for_workspace(
@@ -2127,6 +2351,58 @@ impl Database {
                  AND (h.successor_workspace_id=w.id OR h.predecessor_workspace_id=w.id))",
         )?;
         let rows = statement.query_map(params![grace_before_ms], workspace_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether a workspace carries no unfinished work of its own.
+    ///
+    /// This is the `gc_candidates` predicate list minus the lease and state
+    /// filters, so `sleep` refuses exactly what GC refuses: a pending review, a
+    /// checkpoint that is not ready, an unfinished publish, a pending handoff
+    /// or another running operation. `current_operation` is the sleep itself,
+    /// which has already bound the workspace as its resource.
+    pub fn workspace_is_quiescent(
+        &self,
+        id: &WorkspaceId,
+        current_operation: &OperationId,
+    ) -> Result<bool, DbError> {
+        let connection = self.connection()?;
+        let blocked: bool = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM reviews r WHERE r.workspace_id=?1 \
+                 AND r.state='pending') \
+               OR EXISTS (SELECT 1 FROM operations o WHERE o.resource_id=?1 \
+                 AND o.state='running' AND o.id!=?2) \
+               OR EXISTS (SELECT 1 FROM checkpoints c WHERE c.workspace_id=?1 \
+                 AND c.state!='ready') \
+               OR EXISTS (SELECT 1 FROM publish_resolutions p WHERE p.state='pending' \
+                 AND (p.workspace_id=?1 OR p.parent_workspace_id=?1)) \
+               OR EXISTS (SELECT 1 FROM publish_operations p WHERE p.workspace_id=?1 \
+                 AND p.state NOT IN ('completed','cancelled','failed')) \
+               OR EXISTS (SELECT 1 FROM handoffs h WHERE h.state='pending' \
+                 AND (h.successor_workspace_id=?1 OR h.predecessor_workspace_id=?1))",
+            params![id.0, current_operation.0],
+            |row| row.get(0),
+        )?;
+        Ok(!blocked)
+    }
+
+    /// Every workspace in `state` last touched before `updated_before_ms`.
+    ///
+    /// Drives the auto-sleep and suspension-retention sweeps, and the
+    /// reconciliation pass over interrupted suspensions (which passes
+    /// `i64::MAX` because it wants them all).
+    pub fn workspaces_in_state_before(
+        &self,
+        state: &str,
+        updated_before_ms: i64,
+    ) -> Result<Vec<WorkspaceRecord>, DbError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, repository_id, session_id, path, base_ref, base_oid, head_oid, state, \
+             predecessor_id, dependency_state FROM workspaces \
+             WHERE state=?1 AND updated_at_ms<?2 ORDER BY updated_at_ms",
+        )?;
+        let rows = statement.query_map(params![state, updated_before_ms], workspace_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
