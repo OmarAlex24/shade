@@ -5,6 +5,7 @@ import react from '@astrojs/react';
 
 // Keep this in sync with SITE_URL in src/consts.ts. Astro loads this config
 // outside the Vite graph, so importing the TypeScript module here is avoided.
+// Placeholder: set this to the domain the site is served from on Dokploy.
 const SITE_URL = 'https://omaralex24.github.io/shade';
 
 // https://astro.build/config

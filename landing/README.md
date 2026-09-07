@@ -24,9 +24,11 @@ bun run check     # astro check
 
 ## Configuration
 
-`src/consts.ts` holds the two placeholder URLs the page points at:
+`src/consts.ts` holds the two external URLs the page points at:
 
-- `REPO_URL` is the GitHub repository. Shade is not published yet, so this is a
-  placeholder. Change it there and every link on the page follows.
+- `REPO_URL` is the GitHub repository, `https://github.com/OmarAlex24/shade`.
+  Change it there and every link on the page follows.
 - `SITE_URL` is the canonical origin used for `og:url`, the canonical link and the
-  sitemap. `astro.config.mjs` reads it.
+  sitemap. It is still a placeholder (`https://omaralex24.github.io/shade`) and must
+  be set to the domain the site is served from. `astro.config.mjs` keeps its own copy
+  because Astro loads that config outside the Vite graph, so change **both**.
