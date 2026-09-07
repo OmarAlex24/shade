@@ -3988,6 +3988,29 @@ impl Engine {
     /// marked `suspended` -- and if it does not, the workspace goes back to
     /// Dormant with its tree untouched. Both branches are idempotent and
     /// neither ever deletes a record.
+    /// Whether this workspace is entitled to have no tree on disk.
+    ///
+    /// Sleeping is the only thing that takes a tree away from a workspace that
+    /// still has a record: `suspended` is the state itself, `suspending` is
+    /// one mid-flight, and `released` is where a wake leaves the predecessor
+    /// it rebuilt from until the collector takes it. Letting any of them reach
+    /// the validity check in `reconcile_workspace_resources` would mark them
+    /// `failed` on every daemon start and hand a whole suspension to the
+    /// collector, which is the single worst thing that function could do.
+    fn is_dematerialized(&self, workspace: &WorkspaceRecord) -> Result<bool, EngineError> {
+        Ok(match workspace.state.as_str() {
+            "suspended" | "suspending" => true,
+            "released" => {
+                std::fs::symlink_metadata(&workspace.path).is_err()
+                    && self
+                        .database
+                        .suspension_checkpoint(&workspace.id)?
+                        .is_some()
+            }
+            _ => false,
+        })
+    }
+
     async fn reconcile_suspending_workspaces(
         &self,
         stats: &mut ReconciliationStats,
@@ -4103,12 +4126,7 @@ impl Engine {
                 }
                 continue;
             }
-            // A suspended workspace has no tree on purpose. Falling through to
-            // the validity check below would mark every one of them `failed`
-            // on every daemon start and hand them straight to the collector,
-            // which is the single worst thing this function could do. The
-            // `suspending` pass above has already resolved anything mid-flight.
-            if matches!(workspace.state.as_str(), "suspended" | "suspending") {
+            if self.is_dematerialized(workspace)? {
                 if let Some(path) = checked_workspace_path(&workspace.path, &workspace_root)
                     && std::fs::symlink_metadata(&workspace.path).is_ok()
                 {
@@ -4388,8 +4406,7 @@ impl Engine {
             .cleanup_staging(&self.config.root)
             .map_err(dependency_error)?;
         removed += cleanup_directory_entries(&self.config.secrets_dir(), |name| {
-            name.starts_with('.')
-                && (name.ends_with(".staging") || name.ends_with(".suspend-staging"))
+            name.starts_with('.') && name.ends_with(".staging")
         })?;
         Ok(removed)
     }

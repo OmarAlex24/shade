@@ -269,9 +269,17 @@ impl Fixture {
         assert_eq!(
             count(
                 &db,
-                "SELECT count(*) FROM workspaces WHERE state NOT IN ('ready','released','dormant','handoff_pending','resolution','retained')"
+                "SELECT count(*) FROM workspaces WHERE state NOT IN ('ready','released','dormant','suspended','handoff_pending','resolution','retained')"
             ),
             0
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM workspaces w WHERE w.state='suspended' AND NOT EXISTS (SELECT 1 FROM checkpoints c WHERE c.workspace_id=w.id AND c.reason='sleep' AND c.state='ready')"
+            ),
+            0,
+            "a suspended workspace lost the checkpoint it wakes from"
         );
         assert_eq!(
             count(
@@ -281,7 +289,23 @@ impl Fixture {
             0,
             "released session left an uncollectable ready workspace"
         );
-        let paths = strings(&db, "SELECT path FROM workspaces");
+        // Sleeping is the one thing that takes the tree away from a workspace
+        // that still has a record: the suspension itself, and the predecessor
+        // a wake released out of one.
+        let dematerialized = strings(
+            &db,
+            "SELECT w.path FROM workspaces w WHERE w.state IN ('suspended','released') AND EXISTS (SELECT 1 FROM checkpoints c WHERE c.workspace_id=w.id AND c.reason='sleep' AND c.state='ready')",
+        );
+        for path in &dematerialized {
+            assert!(
+                !Path::new(path).exists(),
+                "a dematerialized workspace kept its tree: {path}"
+            );
+        }
+        let paths: BTreeSet<_> = strings(&db, "SELECT path FROM workspaces")
+            .difference(&dematerialized)
+            .cloned()
+            .collect();
         let disk_paths: BTreeSet<_> = std::fs::read_dir(self.root.join("workspaces"))
             .unwrap()
             .map(|entry| entry.unwrap().path().to_string_lossy().into_owned())
@@ -524,6 +548,8 @@ enum Scenario {
     Reconcile,
     Provider(dependency_crashes::Case),
     Release,
+    Sleep,
+    Wake,
     Gc,
     Restore,
     SecretReview,
@@ -555,6 +581,7 @@ impl Scenario {
             | "dependency-go" => {
                 matches!(self, Self::Provider(case) if group.strip_prefix("dependency-") == Some(case.manager.name()))
             }
+            "lifecycle" => matches!(self, Self::Sleep | Self::Wake),
             "resolved-publication" => matches!(self, Self::PublishResolved),
             "reconciliation" => matches!(self, Self::Reconcile),
             _ => false,
@@ -631,6 +658,11 @@ fn scenario(point: Point) -> Scenario {
         | Point::PublishResolutionIntentWritten
         | Point::PublishResolutionReady => Scenario::PublishConflict,
         Point::ReleaseLeaseReleased | Point::ReleaseRecorded => Scenario::Release,
+        Point::SleepCheckpointed
+        | Point::SleepSecretsVaulted
+        | Point::SleepRegistrationRemoved
+        | Point::SleepRecorded => Scenario::Sleep,
+        Point::WakeMaterialized | Point::WakeActivated => Scenario::Wake,
         Point::ScriptDecisionWritten | Point::ScriptDecisionCompleted => Scenario::ScriptApprove,
         Point::DependencyStaged
         | Point::DependencyFilled
@@ -828,6 +860,7 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
         selected_group.as_deref().is_none_or(|group| matches!(
             group,
             "dependencies"
+                | "lifecycle"
                 | "resolved-publication"
                 | "reconciliation"
                 | "dependency-pnpm"
@@ -978,7 +1011,10 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
                 git(&cwd, &["add", "tracked.txt"]);
                 std::fs::write(cwd.join("tracked.txt"), "working\n").unwrap();
                 std::fs::write(cwd.join("untracked.txt"), "untracked\n").unwrap();
-                if !matches!(case, Scenario::Gc | Scenario::DependencyGc) {
+                if !matches!(
+                    case,
+                    Scenario::Gc | Scenario::DependencyGc | Scenario::Sleep | Scenario::Wake
+                ) {
                     original = Some((cwd, opened["workspace"].clone()));
                 }
                 let selector = json!({"workspace_id":opened["workspace"]});
@@ -1059,6 +1095,16 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
                         }
                     }
                     Scenario::Release => json!({"kind":"workspace_release","selector":selector}),
+                    Scenario::Sleep => {
+                        json!({"kind":"workspace_sleep","selector":selector})
+                    }
+                    Scenario::Wake => {
+                        fixture.execute(
+                            json!({"kind":"workspace_sleep","selector":selector}),
+                            "setup-sleep",
+                        );
+                        json!({"kind":"session_wake","session_id":"crash-session"})
+                    }
                     Scenario::ScriptApprove | Scenario::ScriptRevoke => {
                         let report = try_rpc(
                             &fixture.socket,
@@ -1318,6 +1364,136 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
         ) == 1
         {
             fixture.execute(intent.clone(), "interrupted");
+        }
+        if matches!(case, Scenario::Sleep) {
+            let db = fixture.database();
+            let path = strings(&db, "SELECT path FROM workspaces")
+                .into_iter()
+                .next()
+                .unwrap();
+            if matches!(point, Point::SleepCheckpointed | Point::SleepSecretsVaulted) {
+                // The tree is still registered and still owned, so the honest
+                // place to leave the workspace is where it was.
+                assert_eq!(
+                    strings(&db, "SELECT state FROM workspaces"),
+                    BTreeSet::from(["ready".to_owned()])
+                );
+                assert_eq!(
+                    std::fs::read(Path::new(&path).join("untracked.txt")).unwrap(),
+                    b"untracked\n"
+                );
+                fixture.execute(intent.clone(), "retry-sleep");
+            } else {
+                // The registration or the tree is already gone; the
+                // `suspending` pass finishes the suspension at startup.
+                assert_eq!(
+                    strings(&db, "SELECT state FROM workspaces"),
+                    BTreeSet::from(["suspended".to_owned()]),
+                    "reconciliation left an interrupted suspension unfinished"
+                );
+            }
+            let db = fixture.database();
+            assert_eq!(
+                strings(&db, "SELECT state FROM workspaces"),
+                BTreeSet::from(["suspended".to_owned()])
+            );
+            assert_eq!(
+                strings(&db, "SELECT state FROM sessions"),
+                BTreeSet::from(["suspended".to_owned()])
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM leases WHERE released_at_ms IS NULL"
+                ),
+                0,
+                "a suspended session kept a live lease"
+            );
+            assert!(
+                !Path::new(&path).exists(),
+                "a suspended workspace kept its tree"
+            );
+            // The whole point of the state: everything that was on disk comes
+            // back, including the file Git never tracked.
+            let woken = fixture.execute(
+                json!({"kind":"session_wake","session_id":"crash-session"}),
+                "wake-after-sleep",
+            );
+            let cwd = PathBuf::from(woken["cwd"].as_str().unwrap());
+            assert_ne!(cwd, PathBuf::from(&path), "wake produces a successor");
+            assert_eq!(
+                std::fs::read(cwd.join("untracked.txt")).unwrap(),
+                b"untracked\n"
+            );
+            assert_eq!(
+                std::fs::read(cwd.join("tracked.txt")).unwrap(),
+                b"working\n"
+            );
+        }
+        if matches!(case, Scenario::Wake) {
+            let db = fixture.database();
+            if point == Point::WakeMaterialized {
+                // The suspension the successor was built from is untouched,
+                // and the half-built successor is an ordinary incomplete
+                // workspace that reconciliation already removed.
+                assert_eq!(
+                    strings(&db, "SELECT state FROM workspaces"),
+                    BTreeSet::from(["suspended".to_owned()]),
+                    "an interrupted wake left an orphan successor"
+                );
+                assert_eq!(
+                    strings(&db, "SELECT state FROM sessions"),
+                    BTreeSet::from(["suspended".to_owned()])
+                );
+                assert_eq!(
+                    count(
+                        &db,
+                        "SELECT count(*) FROM operations WHERE idempotency_key='interrupted' AND state='completed'"
+                    ),
+                    0
+                );
+                fixture.execute(intent.clone(), "retry-wake");
+            } else {
+                // The successor was bound in the same transaction that wrote
+                // the journal, so the replay above returned the recorded
+                // outcome instead of waking a second time.
+                assert_eq!(
+                    count(
+                        &db,
+                        "SELECT count(*) FROM operations WHERE idempotency_key='interrupted' AND state='completed'"
+                    ),
+                    1
+                );
+            }
+            let db = fixture.database();
+            assert_eq!(
+                strings(&db, "SELECT state FROM workspaces"),
+                BTreeSet::from(["ready".to_owned(), "released".to_owned()]),
+                "wake releases the predecessor as it binds the successor"
+            );
+            assert_eq!(
+                strings(&db, "SELECT state FROM sessions"),
+                BTreeSet::from(["active".to_owned()])
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM leases WHERE released_at_ms IS NULL"
+                ),
+                1
+            );
+            let cwd = strings(&db, "SELECT path FROM workspaces WHERE state='ready'")
+                .into_iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                std::fs::read(Path::new(&cwd).join("untracked.txt")).unwrap(),
+                b"untracked\n"
+            );
+            assert_eq!(
+                std::fs::read(Path::new(&cwd).join("tracked.txt")).unwrap(),
+                b"working\n"
+            );
         }
         if matches!(case, Scenario::ScriptApprove | Scenario::ScriptRevoke) {
             let committed = point == Point::ScriptDecisionCompleted;

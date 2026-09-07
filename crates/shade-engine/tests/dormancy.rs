@@ -156,7 +156,13 @@ fn workspace_state(engine: &Engine, opened: &OpenedSession) -> String {
         .state
 }
 
+/// Run the collector.
+///
+/// The zero-second harness grace is still a strict millisecond cutoff, so
+/// advance past the timestamp of whatever the test just did before asking the
+/// collector to look at it.
 async fn collect(engine: &Engine, key: &str) -> serde_json::Value {
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     completed(engine.execute(execute(key, Intent::GarbageCollect)).await)
 }
 
@@ -995,6 +1001,21 @@ async fn suspended_workspace_survives_startup_reconciliation() {
     assert_eq!(collected["deleted"], 0);
     let woken: OpenedSession =
         completed(wake(&restarted, "wake-after-restart", &opened.session).await);
+    assert!(PathBuf::from(&woken.cwd).join("tracked.txt").is_file());
+    drop(restarted);
+
+    // The predecessor a wake released kept the suspension's missing tree, so
+    // the same skip has to cover it: otherwise the first restart after every
+    // wake reports corruption and the successor's own history is collected.
+    let after_wake = engine_with(directory.path(), Vec::new());
+    let reconciled: serde_json::Value = completed(
+        after_wake
+            .execute(system("reconcile-woken", Intent::Reconcile))
+            .await,
+    );
+    assert_eq!(reconciled["invalid_workspaces"], 0);
+    assert_eq!(workspace_state(&after_wake, &opened), "released");
+    assert_eq!(session_state(&after_wake, &opened.session), "active");
     assert!(PathBuf::from(&woken.cwd).join("tracked.txt").is_file());
 }
 

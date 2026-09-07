@@ -159,7 +159,7 @@ impl SecretStore {
 
         let staging = self
             .root
-            .join(format!(".{}.suspend-staging", workspace_id.0));
+            .join(format!(".{}.suspend.staging", workspace_id.0));
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
         }
