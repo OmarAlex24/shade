@@ -108,6 +108,15 @@ impl Fixture {
         self.cli_via(Path::new(env!("CARGO_BIN_EXE_shade")), arguments)
     }
 
+    /// A private copy of the test binary, so a test can delete or replace the
+    /// file a running keepalive was launched from.
+    fn copy_of_binary(&self, name: &str) -> PathBuf {
+        let copy = self._temp.path().join(name);
+        std::fs::copy(env!("CARGO_BIN_EXE_shade"), &copy).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        copy
+    }
+
     /// A symlink to the test binary, standing in for a Homebrew shim or
     /// `~/.local/bin/shade`: the same file reached through another name.
     fn symlink_to_binary(&self) -> PathBuf {
@@ -565,10 +574,9 @@ fn stale_pidfile_is_replaced_on_reopen() {
     let _ = PidGuard(second);
 }
 
-/// Every keepalive identity check compares the running executable against this
-/// one. `shade` reached through a symlink -- which is how a PATH install is
-/// reached -- must still recognise its own child, or `stop_registered` deletes
-/// the pidfile without signalling and every `open` leaks another keepalive.
+/// `shade` reached through a symlink -- which is how a PATH install is reached
+/// -- must recognise its own child, or `stop_registered` deletes the pidfile
+/// without signalling and every `open` leaks another keepalive.
 #[test]
 fn a_keepalive_reached_through_a_symlink_is_recognised_and_replaced() {
     let fixture = Fixture::new();
@@ -618,6 +626,65 @@ fn a_keepalive_reached_through_a_symlink_is_recognised_and_replaced() {
     wait_until("the replacement keepalive to heartbeat", || {
         fixture.heartbeats(reopened["outcome"]["result"]["lease"].as_str().unwrap()) >= 1
     });
+    drop(guard);
+}
+
+/// The other half of the same identity check, and the dangerous half.
+///
+/// A symlink makes two paths for one file; an in-place upgrade makes the file
+/// itself go away. `brew upgrade`, `cargo install`, any replace-and-rename
+/// leaves the running child launched from something that no longer resolves,
+/// and a path comparison with no inconclusive answer calls that "stale". The
+/// pidfile is then unlinked without a signal and the child holds the lease
+/// until the machine reboots, invisible to `shade keepalive status`.
+#[test]
+fn a_keepalive_survives_its_binary_being_replaced_and_is_still_stoppable() {
+    let fixture = Fixture::new();
+    let _daemon = fixture.daemon(120);
+    let owner = fake_owner();
+    let upgraded = fixture.copy_of_binary("shade-old");
+    let source = fixture.source.to_str().unwrap().to_owned();
+    let owner_pid = owner.0.to_string();
+
+    let opened = fixture.cli_via(
+        &upgraded,
+        &[
+            "open",
+            source.as_str(),
+            "--session",
+            "ka-upgrade",
+            "--interval-secs",
+            "1",
+            "--owner-pid",
+            owner_pid.as_str(),
+        ],
+    );
+    assert_eq!(opened["status"], "ok", "{opened}");
+    let child = keepalive(&opened)["pid"].as_u64().unwrap() as u32;
+    let guard = PidGuard(child);
+    let lease = opened["outcome"]["result"]["lease"].as_str().unwrap();
+    wait_until("the keepalive to heartbeat", || {
+        fixture.heartbeats(lease) >= 1
+    });
+
+    // The upgrade. The child keeps running from a vnode with no name.
+    std::fs::remove_file(&upgraded).unwrap();
+    assert!(alive(child), "deleting the file does not kill the process");
+
+    let status = fixture.cli(&["keepalive", "status", "--session", "ka-upgrade"]);
+    assert_eq!(
+        status["outcome"]["result"]["running"], true,
+        "a running keepalive is not stale because its binary moved: {status}"
+    );
+    assert_eq!(status["outcome"]["result"]["pid"], child);
+
+    let stopped = fixture.cli(&["keepalive", "stop", "--session", "ka-upgrade"]);
+    assert_eq!(stopped["outcome"]["result"]["stopped"], true, "{stopped}");
+    wait_until(
+        "the keepalive to be signalled, not merely forgotten",
+        || !alive(child),
+    );
+    assert!(!fixture.pidfile("ka-upgrade").exists());
     drop(guard);
 }
 

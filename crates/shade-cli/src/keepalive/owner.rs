@@ -152,25 +152,6 @@ pub fn names_from(flags: &[String], environment: Option<String>) -> Vec<String> 
         .collect()
 }
 
-/// The absolute executable path of a live process, used to reject a pidfile
-/// whose PID now belongs to an unrelated program.
-pub fn executable_path(pid: u32) -> Option<std::path::PathBuf> {
-    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: the buffer is owned, writable and exactly the length passed in.
-    let written = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-        )
-    };
-    if written <= 0 {
-        return None;
-    }
-    buffer.truncate(written as usize);
-    Some(std::path::PathBuf::from(String::from_utf8(buffer).ok()?))
-}
-
 fn fixed_name(raw: &[libc::c_char]) -> Option<String> {
     let bytes = raw
         .iter()
@@ -275,23 +256,12 @@ mod tests {
         )
         .expect("the running test binary is its own nearest named ancestor");
         assert!(found.same_process(me.pid, me.start_tvsec, me.start_tvusec));
-        // `proc_pidpath` resolves the vnode and `current_exe` does not, so the
-        // two agree only after both are resolved. Asserting the raw strings
-        // match is exactly the mistake that made `is_live` false for every
-        // `shade` invoked through a symlink.
-        assert_eq!(
-            executable_path(std::process::id()).and_then(|path| std::fs::canonicalize(path).ok()),
-            std::env::current_exe()
-                .ok()
-                .and_then(|path| std::fs::canonicalize(path).ok())
-        );
     }
 
     #[test]
     fn an_absent_process_has_no_identity() {
         assert!(identity(0).is_none());
         assert!(identity(u32::MAX - 1).is_none());
-        assert!(executable_path(u32::MAX - 1).is_none());
     }
 
     /// The keepalive attaches to an agent, not to whatever shell happens to be

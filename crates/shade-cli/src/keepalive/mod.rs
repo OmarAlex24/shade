@@ -495,9 +495,10 @@ fn stop_registered(config: &EngineConfig, session: &str) -> Option<u32> {
         return None;
     }
     let pid = record.keepalive_pid as libc::c_int;
-    // SAFETY: `is_live` proved this pid is a live process running this same
-    // binary with the recorded start time, so the signal cannot reach an
-    // unrelated process.
+    // SAFETY: `is_live` proved this pid names a live process with the recorded
+    // start time, owned by this user, and `read` proved the record was filed
+    // for this session under this root. A recycled PID fails the start time, so
+    // the signal cannot reach an unrelated process.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let deadline = Instant::now() + STOP_GRACE;
     while Instant::now() < deadline && registry::is_live(&record) {
@@ -787,7 +788,7 @@ mod tests {
                 session: session.into(),
                 lease: "lease_1".into(),
                 socket: "/tmp/shade.sock".into(),
-                root: "/tmp/shade-root".into(),
+                root: config.root.to_string_lossy().into_owned(),
                 keepalive_pid: u32::MAX - 1,
                 keepalive_start_tvsec: 1,
                 keepalive_start_tvusec: 2,

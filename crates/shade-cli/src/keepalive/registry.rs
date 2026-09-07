@@ -95,8 +95,15 @@ pub fn write(config: &EngineConfig, record: &KeepaliveRecord) -> io::Result<()> 
     result
 }
 
+/// The record filed for this session under this root, or nothing.
+///
+/// The filename is a digest of the session id and the directory comes from the
+/// root, so a record that disagrees with either was not written for this
+/// caller: it is a collision, a copied state directory or a hand-edited file,
+/// and none of those may hand a PID to `kill`.
 pub fn read(config: &EngineConfig, session: &str) -> Option<KeepaliveRecord> {
-    read_path(&path(config, session))
+    let record = read_path(&path(config, session))?;
+    (record.session == session && Path::new(&record.root) == config.root).then_some(record)
 }
 
 pub fn read_path(path: &Path) -> Option<KeepaliveRecord> {
@@ -113,45 +120,50 @@ pub fn remove(config: &EngineConfig, session: &str) -> io::Result<()> {
     }
 }
 
-/// A record is live only when its PID still names the same process *and* that
-/// process is still this binary. Anything else is stale and safe to replace.
+/// A record is live only when its PID still names the same process, started at
+/// the same instant, and owned by the same user.
+///
+/// It used to demand more: that the process also be running this same
+/// executable, `proc_pidpath` and `current_exe` both put through
+/// `canonicalize` because one reports the resolved vnode and the other the
+/// path the process was launched through. That comparison has no inconclusive
+/// answer -- an unresolvable path on either side returned `false` -- and
+/// `false` here means "stale", which is the dangerous direction. Upgrade the
+/// binary in place (`brew upgrade`, `cargo install`, any replace-and-rename)
+/// and the file the running child was launched from is gone: every live
+/// keepalive reads as stale, `stop_registered` unlinks the pidfile without
+/// ever signalling, and the child goes on holding the lease with nothing left
+/// that knows how to stop it.
+///
+/// The identity triple is what actually defeats PID reuse, and it does so
+/// without reading a single path. The euid keeps the signal inside this user's
+/// own processes; the record's own `root` and `session` are checked where it
+/// is read, so a record only ever answers for the session it was filed under.
 pub fn is_live(record: &KeepaliveRecord) -> bool {
     let Some(identity) = super::owner::identity(record.keepalive_pid) else {
         return false;
     };
-    if !identity.same_process(
+    identity.same_process(
         record.keepalive_pid,
         record.keepalive_start_tvsec,
         record.keepalive_start_tvusec,
-    ) {
-        return false;
-    }
-    match (
-        super::owner::executable_path(record.keepalive_pid).and_then(resolved),
-        std::env::current_exe().ok().and_then(resolved),
-    ) {
-        (Some(running), Some(current)) => running == current,
-        _ => false,
-    }
-}
-
-/// Both sides of the identity check, resolved to the same real file.
-///
-/// `proc_pidpath` reports the resolved vnode while `current_exe` reports the
-/// path the process was launched through. Invoked through a symlink -- a
-/// Homebrew shim, `~/.local/bin/shade`, anything on PATH -- the two strings
-/// differ, and comparing them raw made every keepalive look like it belonged
-/// to a different program: `stop_registered` deleted pidfiles without ever
-/// signalling, so each `open` left another orphaned child behind, and
-/// `shade status` called a running keepalive `stale`.
-fn resolved(path: PathBuf) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok()
+    ) && identity.uid == super::owner::effective_uid()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A record as it would be filed under `config`: `read` checks the body
+    /// against the session and root it was filed for, so a fixture that lies
+    /// about either is not readable back.
+    fn filed(config: &EngineConfig, session: &str, pid: u32) -> KeepaliveRecord {
+        KeepaliveRecord {
+            root: config.root.to_string_lossy().into_owned(),
+            ..record(session, pid)
+        }
+    }
 
     fn record(session: &str, pid: u32) -> KeepaliveRecord {
         KeepaliveRecord {
@@ -175,7 +187,7 @@ mod tests {
     fn a_record_round_trips_through_a_private_pidfile() {
         let temporary = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temporary.path());
-        let written = record("chat/42", 4242);
+        let written = filed(&config, "chat/42", 4242);
         write(&config, &written).unwrap();
         assert_eq!(read(&config, "chat/42").as_ref(), Some(&written));
 
@@ -237,6 +249,58 @@ mod tests {
 
         mine.keepalive_start_tvsec += 1;
         assert!(!is_live(&mine), "a start-time mismatch defeats PID reuse");
+    }
+
+    /// A keepalive whose binary was replaced or deleted under it is still a
+    /// running process holding a lease, and the only thing that can stop it is
+    /// a signal. Reading it as stale is how an in-place upgrade orphaned every
+    /// keepalive it inherited.
+    #[test]
+    fn a_live_process_stays_live_when_its_executable_no_longer_matches_ours() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = super::super::owner::identity(child.id()).unwrap();
+        let mut foreign = record("foreign-binary", child.id());
+        foreign.keepalive_start_tvsec = identity.start_tvsec;
+        foreign.keepalive_start_tvusec = identity.start_tvusec;
+        assert_ne!(
+            std::env::current_exe().unwrap(),
+            std::path::Path::new("/bin/sleep")
+        );
+        assert!(
+            is_live(&foreign),
+            "the recorded process is alive, whatever file it was launched from"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!is_live(&foreign), "and dead once the process is gone");
+    }
+
+    #[test]
+    fn a_record_filed_under_another_session_or_root_is_not_this_ones() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EngineConfig::at(temporary.path());
+        let mut written = filed(&config, "mine", 4242);
+        write(&config, &written).unwrap();
+        assert!(read(&config, "mine").is_some());
+
+        // The filename is a digest, so a record whose body names another
+        // session got there by collision, copy or hand edit. None of those may
+        // hand a PID to `kill`.
+        written.session = "someone-elses".into();
+        std::fs::write(path(&config, "mine"), serde_json::to_vec(&written).unwrap()).unwrap();
+        assert!(read(&config, "mine").is_none());
+
+        written.session = "mine".into();
+        written.root = "/somewhere/else".into();
+        std::fs::write(path(&config, "mine"), serde_json::to_vec(&written).unwrap()).unwrap();
+        assert!(read(&config, "mine").is_none());
     }
 
     #[test]
