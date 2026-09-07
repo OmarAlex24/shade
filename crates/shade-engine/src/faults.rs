@@ -164,20 +164,46 @@ points! {
     ReconcileCompleted,
 }
 
-/// Failures a test arms on an engine instead of crashes it arms on a process.
+/// What a test arms on one engine instead of on the whole process.
 ///
 /// [`hit`] freezes the daemon so a harness can `SIGKILL` and restart it, which
-/// is the right shape for a crash and the wrong one for a failure: an ordinary
-/// I/O or database error at the same boundary leaves the same durable state
-/// behind and then keeps running, and that is the path the rollback decision
-/// in a sleep lives on. Held per engine rather than per process, so tests
-/// sharing a binary never arm each other's boundaries, and compiled only under
-/// `cfg(test)` or the `test-support` feature -- absent from the distribution
-/// binary exactly like `CopyFilesystem`.
+/// is the right shape for a crash and the wrong one for two things a test still
+/// needs at the same boundaries. A failure is one: an ordinary I/O or database
+/// error leaves the same durable state behind and then keeps running, and that
+/// is the path a rollback decision lives on. The other is interference -- one
+/// caller changing a record while another is mid-operation on it -- which needs
+/// the process to carry on rather than stop.
+///
+/// Held per engine rather than per process, so tests sharing a binary never arm
+/// each other's boundaries, and compiled only under `cfg(test)` or the
+/// `test-support` feature: absent from the distribution binary exactly like
+/// `CopyFilesystem`.
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
+type ArmedHooks = std::sync::Mutex<Vec<(Point, Box<dyn Fn() + Send + Sync>)>>;
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
 pub struct InjectedFailures {
     armed: std::sync::Mutex<Vec<Point>>,
+    hooks: ArmedHooks,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Debug for InjectedFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InjectedFailures")
+            .field("armed", &self.armed)
+            .field(
+                "hooks",
+                &self
+                    .hooks
+                    .lock()
+                    .map(|hooks| hooks.iter().map(|(point, _)| *point).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+            .finish()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -190,8 +216,27 @@ impl InjectedFailures {
             .push(point);
     }
 
-    /// Whether this arrival fails, consuming the arming if it does.
-    pub fn take(&self, point: Point) -> bool {
+    /// Run `action` on the next arrival at `point`, once, and carry on.
+    pub fn run_once_at(&self, point: Point, action: impl Fn() + Send + Sync + 'static) {
+        self.hooks
+            .lock()
+            .expect("fault arming poisoned")
+            .push((point, Box::new(action)));
+    }
+
+    /// Run whatever is armed here and report whether this arrival fails.
+    /// Each arming is consumed by the first arrival that sees it.
+    pub fn arrive(&self, point: Point) -> bool {
+        let hook = {
+            let mut hooks = self.hooks.lock().expect("fault arming poisoned");
+            hooks
+                .iter()
+                .position(|(candidate, _)| *candidate == point)
+                .map(|index| hooks.remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
         let mut armed = self.armed.lock().expect("fault arming poisoned");
         match armed.iter().position(|candidate| *candidate == point) {
             Some(index) => {

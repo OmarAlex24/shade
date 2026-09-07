@@ -1657,6 +1657,108 @@ async fn auto_sleep_and_suspended_retention_are_off_by_default_and_fire_when_con
     );
 }
 
+/// Give a dormant session a live lease again, the way a reattach does.
+///
+/// Written straight to the database rather than through `Intent::SessionReattach`
+/// because it runs from inside the sweep's own call stack, where the engine is
+/// already borrowed and mid-operation. The durable shape is the one a reattach
+/// leaves: workspace `ready`, session `active`, and a lease with time on it.
+fn reattach_behind_the_sweeps_back(root: &Path, opened: &OpenedSession) {
+    let connection =
+        rusqlite::Connection::open(EngineConfig::at(root.join("state")).database_path()).unwrap();
+    let deadline = shade_engine::db::now_ms() + 600_000;
+    connection
+        .execute(
+            "UPDATE leases SET expires_at_ms=?2, released_at_ms=NULL WHERE workspace_id=?1",
+            rusqlite::params![opened.workspace.0, deadline],
+        )
+        .unwrap();
+    for statement in [
+        "UPDATE workspaces SET state='ready' WHERE id=?1",
+        "UPDATE sessions SET state='active' WHERE workspace_id=?1",
+    ] {
+        connection
+            .execute(statement, rusqlite::params![opened.workspace.0])
+            .unwrap();
+    }
+}
+
+/// The idle sweep named no workspace: it took a list of dormant records and
+/// then worked through it, one full sleep at a time. A caller that reattached
+/// while that list was being drained would have had its tree deleted and its
+/// cwd unlinked underneath it, because `sleep_workspace` accepts an Active
+/// workspace -- which is right for `shade sleep`, where a person asked for it
+/// by name, and wrong for a sweep acting on a record that has since changed.
+#[tokio::test]
+async fn the_idle_sweep_skips_a_workspace_that_was_reattached_while_it_worked() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = Engine::with_components(
+        EngineConfig::at(directory.path().join("state"))
+            .with_harness_lifecycle_timing(1, 0)
+            .unwrap()
+            .with_auto_sleep_after_secs(3600)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap();
+    let mut opened = Vec::new();
+    for session in ["idle-first", "idle-second"] {
+        opened.push(completed::<OpenedSession>(
+            engine
+                .execute(execute(session, open_request(&repository, session, None)))
+                .await,
+        ));
+    }
+    engine
+        .database()
+        .mark_expired_leases(shade_engine::db::now_ms() + 10_000)
+        .unwrap();
+    // The first candidate is the older row: the sweep orders its list by
+    // `updated_at_ms`, so this fixes which workspace the hook fires inside.
+    backdate(directory.path(), &opened[0].workspace, 14_400_000);
+    backdate(directory.path(), &opened[1].workspace, 7_200_000);
+
+    let root = directory.path().to_path_buf();
+    let reattached = opened[1].clone();
+    engine
+        .injected_failures()
+        .run_once_at(shade_engine::faults::Point::SleepCheckpointed, move || {
+            reattach_behind_the_sweeps_back(&root, &reattached)
+        });
+
+    let swept: serde_json::Value = completed(
+        engine
+            .execute(system("sweep-auto-sleep", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["auto_slept"], 1, "only the still-idle one slept");
+    assert_eq!(workspace_state(&engine, &opened[0]), "suspended");
+    assert!(!PathBuf::from(&opened[0].cwd).exists());
+
+    // The workspace whose owner came back keeps its tree, its cwd and its lease.
+    assert_eq!(workspace_state(&engine, &opened[1]), "ready");
+    assert!(PathBuf::from(&opened[1].cwd).join("tracked.txt").is_file());
+    let attached: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "attach-after-sweep",
+                Intent::SessionReattach {
+                    session_id: opened[1].session.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(attached.workspace, opened[1].workspace);
+    assert_eq!(attached.cwd, opened[1].cwd);
+
+    // An explicit `shade sleep` on that same held workspace is still allowed:
+    // the guard is about the sweep acting unasked, not about a live lease.
+    let slept = sleep_workspace(&engine, "sleep-explicitly", &opened[1]).await;
+    assert!(slept.suspended);
+}
+
 /// Sleeping releases the lease, so a heartbeat on a suspended session finds
 /// nothing and used to answer `LEASE_EXPIRED` -- the code that means "dormant,
 /// reattach". Every SDK then spent a round trip on a reattach that cannot wake

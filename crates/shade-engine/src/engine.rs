@@ -564,7 +564,7 @@ impl Engine {
     /// away entirely in the distribution build.
     #[cfg(any(test, feature = "test-support"))]
     fn injected_failure(&self, point: crate::faults::Point) -> Result<(), EngineError> {
-        if self.failures.take(point) {
+        if self.failures.arrive(point) {
             return Err(EngineError::internal(std::io::Error::other(format!(
                 "injected failure at {}",
                 point.name()
@@ -860,7 +860,9 @@ impl Engine {
             Intent::WorkspaceRelease { selector } => {
                 self.release_workspace(selector, operation).await
             }
-            Intent::WorkspaceSleep { selector } => self.sleep_workspace(selector, operation).await,
+            Intent::WorkspaceSleep { selector } => {
+                self.sleep_workspace(selector, operation, false).await
+            }
             Intent::SessionWake { session_id } => self.wake_session(session_id, operation).await,
             Intent::ReviewResolve { review_id, action } => {
                 self.resolve_review(review_id, action, operation, &actor_principal)
@@ -2541,18 +2543,34 @@ impl Engine {
     /// not a dependency layer -- `target/`, `dist/`, caches -- because the
     /// sleep checkpoint records what Git tracks, the vault records the private
     /// files, and nothing records the rest.
+    /// Put one workspace to sleep.
+    ///
+    /// `require_dormant` separates the two callers. `shade sleep` is a person
+    /// or an agent naming this workspace on purpose, and it may sleep a
+    /// workspace it is actively holding. The idle sweep named nothing: it
+    /// picked this workspace off a list of dormant records and may have been
+    /// working through that list for the length of several other sleeps, so a
+    /// caller that reattached in between must not have its tree deleted and its
+    /// cwd unlinked underneath it. The re-read happens under the lifecycle
+    /// lock, which is what makes the answer current rather than merely fresh.
     async fn sleep_workspace(
         &self,
         selector: WorkspaceSelector,
         operation: &OperationId,
+        require_dormant: bool,
     ) -> Result<Outcome, EngineError> {
         let workspace = self.resolve_workspace(&selector)?;
         let _lifecycle = self
             .keyed_lock(format!("lifecycle:{}", workspace.id.0))
             .await;
+        let workspace = self
+            .database
+            .workspace(&workspace.id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
         // Sleep, like release, must keep working after a lease expires: an
         // idle workspace is exactly the one worth reclaiming disk from.
-        match self.workspace_lifecycle(&workspace)? {
+        let lifecycle = self.workspace_lifecycle(&workspace)?;
+        match lifecycle {
             Lifecycle::Active { .. } | Lifecycle::Dormant => {}
             Lifecycle::Suspended => {
                 return Err(EngineError::domain("SESSION_SUSPENDED", "never")
@@ -2562,6 +2580,10 @@ impl Engine {
                 return Err(EngineError::domain("WORKSPACE_ALREADY_RELEASED", "never")
                     .next("open a new session"));
             }
+        }
+        if require_dormant && !matches!(lifecycle, Lifecycle::Dormant) {
+            return Err(EngineError::domain("WORKSPACE_NOT_QUIESCENT", "safe")
+                .next("shade sleep --workspace <id> to sleep it while it is held"));
         }
         let session_id = workspace
             .session_id
@@ -2587,6 +2609,7 @@ impl Engine {
             .checkpoint_workspace(&workspace, "sleep", operation)
             .await?;
         crate::faults::hit(crate::faults::Point::SleepCheckpointed);
+        self.injected_failure(crate::faults::Point::SleepCheckpointed)?;
         // Measured while the tree is still there. `private_bytes` is the
         // honest number on APFS: blocks shared with the immutable base are not
         // reclaimed by removing this clone.
@@ -2773,7 +2796,7 @@ impl Engine {
                 workspace_id: Some(workspace.id.clone()),
                 cwd: None,
             };
-            match self.sleep_workspace(selector, operation).await {
+            match self.sleep_workspace(selector, operation, true).await {
                 Ok(_) => slept += 1,
                 Err(error) => tracing::warn!(
                     workspace = %workspace.id,
