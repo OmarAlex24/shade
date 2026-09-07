@@ -355,6 +355,8 @@ pub struct Engine {
     filesystem: Arc<dyn WorkspaceFilesystem>,
     dependencies: Arc<DependencyService>,
     locks: Arc<LifecycleLocks>,
+    #[cfg(any(test, feature = "test-support"))]
+    failures: Arc<crate::faults::InjectedFailures>,
 }
 
 /// Sweep threshold for the keyed-lock map. Below it the common path stays
@@ -370,6 +372,15 @@ enum Lifecycle {
     Dormant,
     Suspended,
     Released,
+}
+
+/// Which way an interrupted suspension went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// Rolled forward: tree and registration gone, record `suspended`.
+    Finished,
+    /// Rolled back: no checkpoint to wake from, so the workspace is Dormant.
+    Reverted,
 }
 
 impl Lifecycle {
@@ -538,7 +549,34 @@ impl Engine {
             filesystem,
             dependencies,
             locks: Arc::new(LifecycleLocks::default()),
+            #[cfg(any(test, feature = "test-support"))]
+            failures: Arc::new(crate::faults::InjectedFailures::default()),
         })
+    }
+
+    /// Arm a boundary to fail on this engine. Test-only, like `CopyFilesystem`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn injected_failures(&self) -> &crate::faults::InjectedFailures {
+        &self.failures
+    }
+
+    /// Turn an armed boundary into an ordinary operation failure. Compiled
+    /// away entirely in the distribution build.
+    #[cfg(any(test, feature = "test-support"))]
+    fn injected_failure(&self, point: crate::faults::Point) -> Result<(), EngineError> {
+        if self.failures.take(point) {
+            return Err(EngineError::internal(std::io::Error::other(format!(
+                "injected failure at {}",
+                point.name()
+            ))));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    #[inline(always)]
+    fn injected_failure(&self, _point: crate::faults::Point) -> Result<(), EngineError> {
+        Ok(())
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -871,6 +909,13 @@ impl Engine {
             }
             Intent::MaintenanceSweep => {
                 let sweep = self.database.mark_expired_leases(now_ms())?;
+                // A suspension interrupted by a crash used to wait for the next
+                // `Reconcile`, which is a daemon startup pass. The sweep runs
+                // every 30 seconds, so the window in which a workspace is
+                // neither reattachable nor wakeable closes on its own.
+                let mut suspensions = ReconciliationStats::default();
+                self.reconcile_suspending_workspaces(&mut suspensions)
+                    .await?;
                 // Both sweeps are no-ops unless an operator configured them.
                 let auto_slept = self.auto_sleep_dormant(operation).await?;
                 let retention_released = self.expire_suspended_retention()?;
@@ -880,6 +925,9 @@ impl Engine {
                     "expired_sessions": sweep.sessions,
                     "dormant_sessions": sweep.sessions,
                     "dormant_workspaces": sweep.workspaces,
+                    "suspensions_finished": suspensions.suspensions_finished,
+                    "suspensions_reverted": suspensions.suspensions_reverted,
+                    "suspensions_failed": suspensions.suspensions_failed,
                     "auto_slept": auto_slept,
                     "retention_released": retention_released,
                 })))
@@ -1738,6 +1786,14 @@ impl Engine {
         request: OpenSession,
         operation: &OperationId,
     ) -> Result<Outcome, EngineError> {
+        if self.database.session(&request.session_id)?.is_some() {
+            // A suspension the daemon was killed in the middle of leaves the
+            // session row saying `active` and the workspace saying
+            // `suspending`, which routes an `open` into a reattach that finds
+            // no tree. Settle it first, then read the session the settlement
+            // left behind.
+            self.settle_suspending_session(&request.session_id).await?;
+        }
         if let Some(existing) = self.database.session(&request.session_id)? {
             // `open` is the single door: an id the host already used resumes
             // the work behind it rather than failing, so a host that lost its
@@ -1841,10 +1897,29 @@ impl Engine {
             .await;
         // Re-read under the lock: a concurrent release or reattach may have
         // moved the session between the dispatch above and this point.
+        let workspace = self
+            .database
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
+        self.settle_suspending_workspace(&workspace).await;
+        let workspace = self
+            .database
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
         let session = self
             .database
             .session(&session_id)?
             .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+        // The workspace decides this, not the session row. A settlement that
+        // could not finish leaves the pair disagreeing -- workspace
+        // `suspending` or `suspended`, session still `active` -- and the
+        // caller is owed the command that ends it rather than the
+        // `WORKSPACE_NOT_MATERIALIZED` the missing tree would produce.
+        if matches!(workspace.state.as_str(), "suspended" | "suspending") {
+            return Err(
+                EngineError::domain("SESSION_SUSPENDED", "never").next("shade wake --session <id>")
+            );
+        }
         match session.state.as_str() {
             "active" | "dormant" | "orphaned" => {}
             "suspended" => {
@@ -2534,6 +2609,7 @@ impl Engine {
             self.remove_workspace_git_metadata(&workspace.repository_id, &managed, &workspace.path)
                 .await?;
             crate::faults::hit(crate::faults::Point::SleepRegistrationRemoved);
+            self.injected_failure(crate::faults::Point::SleepRegistrationRemoved)?;
             if workspace.path.exists() {
                 self.filesystem
                     .remove_tree(&workspace.path)
@@ -2545,11 +2621,18 @@ impl Engine {
         }
         .await;
         if let Err(error) = dematerialize {
-            // The tree is still there, so the honest place to leave the
-            // workspace is where it was. If it is not, the `suspending`
-            // reconciliation pass finishes the suspension from the checkpoint.
             if workspace.path.join(".git").is_file() {
+                // The tree is still whole, so the honest place to leave the
+                // workspace is where it was.
                 let _ = self.database.restore_suspending_workspace(&workspace.id);
+            } else {
+                // The registration is gone, so Dormant is no longer reachable:
+                // nothing can reattach to a tree with no `.git` pointer. The
+                // durable checkpoint and vault are what the record has to agree
+                // with, so the suspension rolls forward instead. Leaving this
+                // to the reconciliation pass is what made the workspace
+                // unwakeable until the next daemon start.
+                let _ = self.finish_suspension(&workspace, &checkpoint.id).await;
             }
             return Err(error);
         }
@@ -2589,12 +2672,28 @@ impl Engine {
         let lifecycle_guard = self
             .keyed_lock(format!("lifecycle:{}", workspace.id.0))
             .await;
+        // A suspension the daemon was killed in the middle of is finished here
+        // rather than waited on: `Intent::Reconcile` is a daemon startup pass
+        // an embedded host may never send, and a wake is exactly the moment to
+        // pay for it. Propagated, not swallowed -- `wake` is the command the
+        // caller was told to run, so its failure is the caller's answer.
+        let workspace = self
+            .database
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
+        if workspace.state == "suspending" {
+            self.settle_suspension(&workspace).await?;
+        }
         // Re-read under the lock: a concurrent sleep or release may have moved
-        // the session since dispatch.
+        // the session since dispatch, and the settlement above moves both rows.
         let session = self
             .database
             .session(&session_id)?
             .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+        let workspace = self
+            .database
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
         let suspended = match session.state.as_str() {
             // `shade wake` is safe to call unconditionally: a session that
             // never slept is simply resumed where it already is.
@@ -4049,15 +4148,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Finish or undo suspensions that a crash interrupted.
-    ///
-    /// A `suspending` workspace is deliberately not an "incomplete" one:
-    /// incomplete workspaces get deleted, and this one owns a durable
-    /// checkpoint and a durable vault. If a ready sleep checkpoint exists the
-    /// suspension is rolled forward -- registration and tree removed, record
-    /// marked `suspended` -- and if it does not, the workspace goes back to
-    /// Dormant with its tree untouched. Both branches are idempotent and
-    /// neither ever deletes a record.
     /// Whether this workspace is entitled to have no tree on disk.
     ///
     /// Sleeping is the only thing that takes a tree away from a workspace that
@@ -4081,6 +4171,15 @@ impl Engine {
         })
     }
 
+    /// Finish or undo suspensions that a crash interrupted.
+    ///
+    /// A `suspending` workspace is deliberately not an "incomplete" one:
+    /// incomplete workspaces get deleted, and this one owns a durable
+    /// checkpoint and a durable vault. If a ready sleep checkpoint exists the
+    /// suspension is rolled forward -- registration and tree removed, record
+    /// marked `suspended` -- and if it does not, the workspace goes back to
+    /// Dormant with its tree untouched. Both branches are idempotent and
+    /// neither ever deletes a record.
     async fn reconcile_suspending_workspaces(
         &self,
         stats: &mut ReconciliationStats,
@@ -4089,33 +4188,9 @@ impl Engine {
             .database
             .workspaces_in_state_before("suspending", i64::MAX)?
         {
-            let Some(checkpoint) = self.database.suspension_checkpoint(&workspace.id)? else {
-                self.database.restore_suspending_workspace(&workspace.id)?;
-                stats.suspensions_reverted += 1;
-                continue;
-            };
-            let finish = async {
-                if workspace.path.join(".git").is_file() {
-                    let (_, managed, _) = self.repository_for(&workspace)?;
-                    self.remove_workspace_git_metadata(
-                        &workspace.repository_id,
-                        &managed,
-                        &workspace.path,
-                    )
-                    .await?;
-                }
-                if workspace.path.exists() {
-                    self.filesystem
-                        .remove_tree(&workspace.path)
-                        .map_err(subsystem_error)?;
-                }
-                self.database
-                    .suspend_workspace(&workspace.id, &checkpoint.id)?;
-                Ok::<(), EngineError>(())
-            }
-            .await;
-            match finish {
-                Ok(()) => stats.suspensions_finished += 1,
+            match self.settle_suspension(&workspace).await {
+                Ok(Settled::Finished) => stats.suspensions_finished += 1,
+                Ok(Settled::Reverted) => stats.suspensions_reverted += 1,
                 Err(error) => {
                     tracing::error!(
                         workspace = %workspace.id,
@@ -4126,6 +4201,96 @@ impl Engine {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Decide what one `suspending` workspace becomes, and make it so.
+    ///
+    /// The checkpoint is the deciding fact, not the tree: a workspace with a
+    /// ready sleep checkpoint has everything a wake needs, so the suspension
+    /// rolls forward; one without has nothing to wake from, so it goes back to
+    /// Dormant. Shared by the startup reconciliation pass, the maintenance
+    /// sweep and the three doors into a session, which is what keeps an
+    /// embedded host that never reconciles from stranding a suspension.
+    async fn settle_suspension(&self, workspace: &WorkspaceRecord) -> Result<Settled, EngineError> {
+        let Some(checkpoint) = self.database.suspension_checkpoint(&workspace.id)? else {
+            self.database.restore_suspending_workspace(&workspace.id)?;
+            return Ok(Settled::Reverted);
+        };
+        self.finish_suspension(workspace, &checkpoint.id).await?;
+        Ok(Settled::Finished)
+    }
+
+    /// Take the tree and the registration away and record the suspension.
+    ///
+    /// Idempotent at every step: the registration, the tree and the state
+    /// change are each skipped when they are already done, so a crash anywhere
+    /// inside leaves work for the next call rather than a broken record.
+    async fn finish_suspension(
+        &self,
+        workspace: &WorkspaceRecord,
+        checkpoint: &CheckpointId,
+    ) -> Result<(), EngineError> {
+        if workspace.path.join(".git").is_file() {
+            let (_, managed, _) = self.repository_for(workspace)?;
+            self.remove_workspace_git_metadata(&workspace.repository_id, &managed, &workspace.path)
+                .await?;
+        }
+        if workspace.path.exists() {
+            self.filesystem
+                .remove_tree(&workspace.path)
+                .map_err(subsystem_error)?;
+        }
+        self.database.suspend_workspace(&workspace.id, checkpoint)?;
+        Ok(())
+    }
+
+    /// Settle an interrupted suspension before a caller looks at the tree.
+    ///
+    /// `reconcile_suspending_workspaces` runs from `Intent::Reconcile`, which
+    /// the daemon sends at startup and an embedded host need never send at
+    /// all. Until it runs, a `suspending` workspace answers `SESSION_SUSPENDED`
+    /// to sleep and `WORKSPACE_NOT_MATERIALIZED` to everything else: it has no
+    /// tree to reattach to and no `suspended` record to wake from, so every
+    /// door into it is shut. Each door therefore settles it on the way in.
+    ///
+    /// Never fatal. The caller's own state checks run either way, and a
+    /// settlement that fails is left for the next pass.
+    async fn settle_suspending_workspace(&self, workspace: &WorkspaceRecord) {
+        if workspace.state != "suspending" {
+            return;
+        }
+        if let Err(error) = self.settle_suspension(workspace).await {
+            tracing::warn!(
+                workspace = %workspace.id,
+                code = %error.code,
+                "interrupted suspension could not be settled on demand"
+            );
+        }
+    }
+
+    /// The same pass, addressed by session, for the door that has not yet read
+    /// a workspace record. Takes the lifecycle lock, so callers that already
+    /// hold it must use [`Engine::settle_suspending_workspace`] instead.
+    async fn settle_suspending_session(&self, session_id: &SessionId) -> Result<(), EngineError> {
+        let Some(session) = self.database.session(session_id)? else {
+            return Ok(());
+        };
+        let Some(workspace) = self.database.workspace(&session.workspace_id)? else {
+            return Ok(());
+        };
+        if workspace.state != "suspending" {
+            return Ok(());
+        }
+        let _lifecycle = self
+            .keyed_lock(format!("lifecycle:{}", workspace.id.0))
+            .await;
+        // Re-read under the lock: the pass that settles this may already have
+        // run between the read above and the lock.
+        let Some(workspace) = self.database.workspace(&session.workspace_id)? else {
+            return Ok(());
+        };
+        self.settle_suspending_workspace(&workspace).await;
         Ok(())
     }
 

@@ -164,6 +164,45 @@ points! {
     ReconcileCompleted,
 }
 
+/// Failures a test arms on an engine instead of crashes it arms on a process.
+///
+/// [`hit`] freezes the daemon so a harness can `SIGKILL` and restart it, which
+/// is the right shape for a crash and the wrong one for a failure: an ordinary
+/// I/O or database error at the same boundary leaves the same durable state
+/// behind and then keeps running, and that is the path the rollback decision
+/// in a sleep lives on. Held per engine rather than per process, so tests
+/// sharing a binary never arm each other's boundaries, and compiled only under
+/// `cfg(test)` or the `test-support` feature -- absent from the distribution
+/// binary exactly like `CopyFilesystem`.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct InjectedFailures {
+    armed: std::sync::Mutex<Vec<Point>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl InjectedFailures {
+    /// Fail the next arrival at `point`, once.
+    pub fn fail_once_at(&self, point: Point) {
+        self.armed
+            .lock()
+            .expect("fault arming poisoned")
+            .push(point);
+    }
+
+    /// Whether this arrival fails, consuming the arming if it does.
+    pub fn take(&self, point: Point) -> bool {
+        let mut armed = self.armed.lock().expect("fault arming poisoned");
+        match armed.iter().position(|candidate| *candidate == point) {
+            Some(index) => {
+                armed.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub fn hit(_point: Point) {}

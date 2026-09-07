@@ -1395,6 +1395,208 @@ async fn suspended_workspace_is_not_a_gc_candidate_and_released_one_is() {
     );
 }
 
+/// Put a workspace back in the state a crash mid-suspension leaves behind.
+///
+/// The dangerous moment in a sleep is the window after the worktree
+/// registration is gone and before `suspend_workspace` commits: the tree and
+/// the `.git` pointer are already deleted, the checkpoint and the secret vault
+/// are already durable, and the record still says `suspending`. A workspace
+/// there is unreattachable (no tree) and unwakeable (no `suspended` record).
+/// Rewinding the two rows and the lease after a clean sleep reproduces exactly
+/// that, without needing to kill the process to get there.
+fn strand_mid_suspension(root: &Path, opened: &OpenedSession) {
+    let connection =
+        rusqlite::Connection::open(EngineConfig::at(root.join("state")).database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE workspaces SET state='suspending' WHERE id=?1",
+            rusqlite::params![opened.workspace.0],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET state='active' WHERE workspace_id=?1",
+            rusqlite::params![opened.workspace.0],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE leases SET released_at_ms=NULL WHERE workspace_id=?1",
+            rusqlite::params![opened.workspace.0],
+        )
+        .unwrap();
+}
+
+/// Open a session and interrupt its sleep after the registration is removed.
+///
+/// `git worktree remove --force` deletes the working tree itself, so by the
+/// time the sleep reaches `remove_tree` there is nothing left for a filesystem
+/// fake to refuse: the only honest way to fail at this boundary is the
+/// test-only arming on the engine, which turns the crash rendezvous point into
+/// an ordinary error and lets the process keep running.
+async fn sleep_interrupted_after_registration_removal(
+    root: &Path,
+) -> (Engine, OpenedSession, ShadeError) {
+    let repository = fixture(root);
+    let engine = engine_with(root, Vec::new());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    engine
+        .injected_failures()
+        .fail_once_at(shade_engine::faults::Point::SleepRegistrationRemoved);
+    let error = failed(
+        engine
+            .execute(execute(
+                "sleep-interrupted",
+                Intent::WorkspaceSleep {
+                    selector: selector(&opened),
+                },
+            ))
+            .await,
+    );
+    (engine, opened, error)
+}
+
+#[tokio::test]
+async fn a_sleep_that_fails_after_unregistering_finishes_the_suspension() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, error) =
+        sleep_interrupted_after_registration_removal(directory.path()).await;
+
+    assert!(!error.code.is_empty(), "the sleep reports its own failure");
+    // Dormant is unreachable once the `.git` pointer is gone, so the record
+    // has to agree with the durable checkpoint and vault instead: the
+    // suspension rolls forward rather than being stranded mid-flight.
+    assert_eq!(workspace_state(&engine, &opened), "suspended");
+    assert_eq!(session_state(&engine, &opened.session), "suspended");
+    assert!(!Path::new(&opened.cwd).exists(), "the tree is gone");
+
+    // And the workspace is wakeable, with no reconciliation in between.
+    let woken: OpenedSession =
+        completed(wake(&engine, "wake-after-failure", &opened.session).await);
+    assert_eq!(woken.session, opened.session);
+    assert_ne!(woken.workspace, opened.workspace);
+    assert!(Path::new(&woken.cwd).join("tracked.txt").is_file());
+}
+
+#[tokio::test]
+async fn a_workspace_stuck_suspending_is_settled_by_the_next_caller() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+    strand_mid_suspension(directory.path(), &opened);
+    assert_eq!(workspace_state(&engine, &opened), "suspending");
+
+    let health: serde_json::Value = completed(engine.query(query(Query::Doctor)).await);
+    assert_eq!(
+        health["workspaces_suspending"], 1,
+        "doctor names the condition: {health}"
+    );
+
+    // A reattach cannot fix it, but it must still name the command that can,
+    // rather than reporting the missing tree it cannot do anything about.
+    let refused = failed(
+        engine
+            .execute(execute(
+                "attach-stuck",
+                Intent::SessionReattach {
+                    session_id: opened.session.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(refused.code, "SESSION_SUSPENDED");
+    assert_eq!(refused.next.as_deref(), Some("shade wake --session <id>"));
+
+    // Wake settles it on the way in -- no `Intent::Reconcile` anywhere.
+    let woken: OpenedSession = completed(wake(&engine, "wake-stuck", &opened.session).await);
+    assert_eq!(woken.session, opened.session);
+    assert_ne!(woken.workspace, opened.workspace);
+    assert_eq!(workspace_state(&engine, &opened), "released");
+    assert_eq!(
+        completed::<serde_json::Value>(engine.query(query(Query::Doctor)).await)["workspaces_suspending"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_maintenance_sweep_settles_an_interrupted_suspension() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+    strand_mid_suspension(directory.path(), &opened);
+
+    // The daemon's periodic sweep, not its startup reconciliation: an embedded
+    // host may never send `Intent::Reconcile` at all.
+    let swept: serde_json::Value = completed(
+        engine
+            .execute(system("sweep", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["suspensions_finished"], 1, "{swept}");
+    assert_eq!(swept["suspensions_reverted"], 0);
+    assert_eq!(swept["suspensions_failed"], 0);
+    assert_eq!(workspace_state(&engine, &opened), "suspended");
+    assert_eq!(session_state(&engine, &opened.session), "suspended");
+}
+
+#[tokio::test]
+async fn a_suspension_with_no_checkpoint_to_wake_from_is_reverted_to_dormant() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+    strand_mid_suspension(directory.path(), &opened);
+    // A crash before `SleepCheckpointed` leaves no checkpoint, and a wake needs
+    // one. With nothing to roll forward to, the only honest answer is the state
+    // the workspace was in before the sleep started.
+    rusqlite::Connection::open(EngineConfig::at(directory.path().join("state")).database_path())
+        .unwrap()
+        .execute(
+            "UPDATE checkpoints SET state='pending' WHERE workspace_id=?1",
+            rusqlite::params![opened.workspace.0],
+        )
+        .unwrap();
+
+    let swept: serde_json::Value = completed(
+        engine
+            .execute(system("sweep", Intent::MaintenanceSweep))
+            .await,
+    );
+    assert_eq!(swept["suspensions_reverted"], 1, "{swept}");
+    assert_eq!(swept["suspensions_finished"], 0);
+    assert_eq!(workspace_state(&engine, &opened), "dormant");
+}
+
+#[tokio::test]
+async fn open_wakes_a_session_whose_suspension_was_interrupted() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_with(directory.path(), Vec::new());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    sleep_workspace(&engine, "sleep", &opened).await;
+    strand_mid_suspension(directory.path(), &opened);
+    assert_eq!(workspace_state(&engine, &opened), "suspending");
+
+    // `open` is the single door, and it stays that way through a suspension a
+    // crash cut in half: it settles the workspace and wakes the session.
+    let reopened: OpenedSession = completed(
+        engine
+            .execute(execute(
+                "open-again",
+                open_request(&repository, SESSION, None),
+            ))
+            .await,
+    );
+    assert_eq!(reopened.session, opened.session);
+    assert_ne!(reopened.workspace, opened.workspace);
+    assert!(Path::new(&reopened.cwd).join("tracked.txt").is_file());
+    assert_eq!(reopened.compact_context.lifecycle, "active");
+}
+
 #[tokio::test]
 async fn auto_sleep_and_suspended_retention_are_off_by_default_and_fire_when_configured() {
     let directory = tempfile::tempdir().unwrap();

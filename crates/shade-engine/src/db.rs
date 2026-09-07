@@ -2836,6 +2836,15 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        // A workspace stuck mid-sleep can be neither reattached nor woken until
+        // something settles it. The reconciliation pass and every door into a
+        // session do settle it, so a count that stays above zero means the
+        // settlement itself keeps failing -- which is worth seeing.
+        let suspending_workspaces: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE state='suspending'",
+            [],
+            |row| row.get(0),
+        )?;
         // A suspended workspace with no sleep checkpoint has lost its content
         // pointer. Counting it makes a broken invariant visible instead of
         // silent.
@@ -2862,6 +2871,7 @@ impl Database {
             "sessions_dormant": dormant_sessions,
             "sessions_suspended": suspended_sessions,
             "workspaces_suspended": suspended_workspaces,
+            "workspaces_suspending": suspending_workspaces,
             "workspaces_failed": failed_workspaces,
             "suspended_without_checkpoint": suspended_without_checkpoint,
         }))
