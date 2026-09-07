@@ -91,7 +91,7 @@ await session.publish({ branch: "agent/change", message: "agent change" });
 await session.release();
 ```
 
-The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish`, `resolve`, `sleep` and `release`, and `client.sessions().reattach(..)` / `.wake(..)` bring an idle or suspended one back. Review decisions live on `client.reviews()`.
+The session handle heartbeats automatically and adopts successor handoffs for you, so your code normally observes only the final `cwd` and `env`. The Rust client crate `shade-client` mirrors the same facade: `client.sessions().open(..)` returns a session with `context`, `checkpoint`, `fork`, `sync`, `restore`, `refresh_dependencies`, `publish`, `resolve`, `sleep` and `release`, and `client.sessions().reattach(..)` / `.wake(..)` bring an idle or suspended one back -- on a session that is already live both hand back the handle you already hold rather than a second one heartbeating the same lease. What the daemon last said about the session is read through the handle, never cached: `session.lease()` and `session.workspace_id()` take one field, `session.opened_ref()` shares the whole snapshot as an `Arc` so `&session.opened_ref().env` outlives the expression, and `session.opened()` copies it when an owned value is what you want. Review decisions live on `client.reviews()`.
 
 ## Outcomes
 

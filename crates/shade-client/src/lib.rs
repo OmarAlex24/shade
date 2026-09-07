@@ -684,7 +684,11 @@ struct SessionLifecycle {
     /// handle the caller already holds, so the snapshot has to move with it:
     /// a caller who re-reads `SHADE_LEASE` after a dormancy must get the lease
     /// the daemon is actually renewing, not the one the handle was born with.
-    opened: Mutex<OpenedSession>,
+    /// Held behind an `Arc` so a caller can take a stable reference to the
+    /// whole snapshot -- `opened_ref()` -- without deep-copying a struct that
+    /// carries the environment map and the compact context, and without
+    /// holding the mutex across its own work.
+    opened: Mutex<Arc<OpenedSession>>,
     /// The daemon's own answer for why this handle stopped, when there was
     /// one. A handle that retires because the caller released or slept it has
     /// no reason to give; one that retires because the session was suspended
@@ -718,12 +722,17 @@ impl SessionLifecycle {
         !*self.stop.borrow()
     }
 
-    fn opened(&self) -> OpenedSession {
+    fn opened(&self) -> Arc<OpenedSession> {
         self.opened.lock().expect("session mutex poisoned").clone()
     }
 
+    /// One field out of the snapshot, without copying the rest of it.
+    fn read<T>(&self, field: impl FnOnce(&OpenedSession) -> T) -> T {
+        field(&self.opened.lock().expect("session mutex poisoned"))
+    }
+
     fn adopt(&self, opened: OpenedSession) {
-        *self.opened.lock().expect("session mutex poisoned") = opened;
+        *self.opened.lock().expect("session mutex poisoned") = Arc::new(opened);
     }
 }
 
@@ -763,7 +772,7 @@ impl Session {
         let mut live = client.live.lock().expect("session registry poisoned");
         live.retain(|_, handle| handle.strong_count() > 0);
         if let Some(existing) = live.get(&opened.session.0).and_then(Weak::upgrade) {
-            if existing.is_active() && existing.opened().workspace == opened.workspace {
+            if existing.is_active() && existing.read(|live| live.workspace == opened.workspace) {
                 existing.adopt(opened.clone());
                 return Self {
                     client: client.clone(),
@@ -780,7 +789,7 @@ impl Session {
         let (stop, stop_receiver) = watch::channel(false);
         let lifecycle = Arc::new(SessionLifecycle {
             stop,
-            opened: Mutex::new(opened.clone()),
+            opened: Mutex::new(Arc::new(opened.clone())),
             reason: Mutex::new(None),
         });
         live.insert(opened.session.0.clone(), Arc::downgrade(&lifecycle));
@@ -879,13 +888,41 @@ impl Session {
     /// lease, the working directory, the environment to export and the compact
     /// context. A reattach after a dormancy refreshes all of it, so read this
     /// again rather than caching the value across an await.
+    ///
+    /// This hands back an owned copy. For one field, [`Session::lease`] and
+    /// [`Session::workspace_id`] read it without copying the rest; for the
+    /// whole snapshot, [`Session::opened_ref`] shares it instead of copying
+    /// it, which is what `&session.opened_ref().env` needs to be a reference
+    /// to something that outlives the expression.
     pub fn opened(&self) -> OpenedSession {
+        (*self.lifecycle.opened()).clone()
+    }
+
+    /// The same snapshot, shared rather than copied.
+    ///
+    /// The handle replaces the snapshot on a reattach; it never edits one in
+    /// place, so what this returns stays exactly as it was read and a caller
+    /// comparing it against a later read sees the rotation.
+    ///
+    /// ```ignore
+    /// let opened = session.opened_ref();
+    /// spawn_agent(&opened.cwd, &opened.env).await?;
+    /// ```
+    pub fn opened_ref(&self) -> Arc<OpenedSession> {
         self.lifecycle.opened()
     }
 
     /// The lease currently held. A reattach rotates it, and this follows.
     pub fn lease(&self) -> LeaseId {
-        self.lifecycle.opened().lease
+        self.lifecycle.read(|opened| opened.lease.clone())
+    }
+
+    /// The workspace this session is currently bound to. A wake, a fork
+    /// handoff, a sync or a restore moves the session to a successor, and this
+    /// follows -- a host that cached the id it opened with is naming a
+    /// workspace that may already be released.
+    pub fn workspace_id(&self) -> WorkspaceId {
+        self.lifecycle.read(|opened| opened.workspace.clone())
     }
 
     /// Stop automatic heartbeats for this handle and every clone.
@@ -2169,6 +2206,18 @@ mod tests {
             Some("lease-second"),
             "a caller re-exporting the environment must export the live lease"
         );
+        assert_eq!(
+            session.workspace_id(),
+            refreshed.workspace,
+            "the workspace accessor reads the same snapshot the lease does"
+        );
+        // A shared snapshot, not a copy: two reads are the same allocation, so
+        // `&session.opened_ref().env` is a reference to something that
+        // outlives the expression, and a snapshot taken before a rotation
+        // stays exactly as it was read.
+        let shared = session.opened_ref();
+        assert!(Arc::ptr_eq(&shared, &session.opened_ref()));
+        assert_eq!(shared.lease.0, "lease-second");
         assert_eq!(reattachments.load(Ordering::SeqCst), 1);
         let renewed = leases
             .lock()
