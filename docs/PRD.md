@@ -53,7 +53,7 @@ Fingerprints include semantic inputs, workspace graph, host tool identity, OS/AB
 
 ## Secret workflow
 
-Shade never imports, anchors, publishes or pushes trees containing paths whose basename begins with `.env`; fetch, checkpoint and publish fail closed before Shade moves a ref. It stores a private `0600` baseline and exposes only file paths, key names and merge classifications. Merge, keep and discard require an explicit review decision; merge writes a successor. Because V1 deliberately combines raw Git access, linked worktrees and one macOS login UID, its clean filter is a porcelain guardrail rather than isolation from malicious same-UID plumbing; [Security](SECURITY.md) defines that boundary precisely.
+Shade never imports, anchors, publishes or pushes trees containing paths whose basename begins with `.env`, other than the committed templates whose final suffix is `example`, `sample`, `template`, `dist` or `defaults`; fetch, checkpoint and publish fail closed before Shade moves a ref. It stores a private `0600` baseline and exposes only file paths, key names and merge classifications. Merge, keep and discard require an explicit review decision; merge writes a successor. Because V1 deliberately combines raw Git access, linked worktrees and one macOS login UID, its clean filter is a porcelain guardrail rather than isolation from malicious same-UID plumbing; [Security](SECURITY.md) defines that boundary precisely.
 
 ## Scope boundary
 
