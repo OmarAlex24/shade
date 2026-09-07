@@ -187,10 +187,13 @@ impl SecretStore {
         )?;
 
         let destination = self.suspension_root(workspace_id);
-        if destination.exists() {
-            fs::remove_dir_all(&destination)?;
-        }
-        fs::rename(staging, destination)?;
+        replace_directory(&staging, &destination)?;
+        // The vault is the only copy of these files once the tree is gone, and
+        // the rename that publishes it lives in a directory entry: without this
+        // the entry can still be in the volume's cache when the machine loses
+        // power, and the wake that follows finds no vault at all.
+        sync_directory(&workspace_root)?;
+        sync_directory(&self.root)?;
         Ok(SecretManifest {
             workspace_id: workspace_id.clone(),
             files,
@@ -638,6 +641,64 @@ fn relative(root: &Path, path: &Path) -> Result<String, SecretError> {
         .to_str()
         .map(str::to_owned)
         .ok_or_else(|| SecretError::UnsafePath("secret path is not UTF-8".into()))
+}
+
+/// Put `staging` where `destination` is, without a moment in between where
+/// there is nothing there.
+///
+/// This used to be `remove_dir_all` followed by `rename`, which has a window
+/// -- short, but a crash lands in it eventually -- where the old vault is
+/// already gone and the new one has not arrived. A vault is the only copy of a
+/// workspace's private files once its tree is removed, and `session_wake`
+/// refuses outright when it finds none, so that window turns a power cut into
+/// a workspace whose `.env.local` has to be restored by hand.
+///
+/// `renamex_np(RENAME_SWAP)` exchanges the two directory entries in one
+/// operation: every reader sees the old vault or the new one, never neither.
+/// Elsewhere the two-rename sequence is the closest available: the old vault
+/// moves aside first and comes back if the second rename fails, so a failure
+/// never costs the vault either.
+fn replace_directory(staging: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    if !destination.exists() {
+        return fs::rename(staging, destination);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        swap_paths(staging, destination)?;
+        // The swap left the previous vault at the staging path.
+        fs::remove_dir_all(staging)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let aside = destination.with_extension("previous");
+        if aside.exists() {
+            fs::remove_dir_all(&aside)?;
+        }
+        fs::rename(destination, &aside)?;
+        if let Err(error) = fs::rename(staging, destination) {
+            let _ = fs::rename(&aside, destination);
+            return Err(error);
+        }
+        fs::remove_dir_all(&aside)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn swap_paths(one: &Path, other: &Path) -> Result<(), std::io::Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let one = CString::new(one.as_os_str().as_bytes())?;
+    let other = CString::new(other.as_os_str().as_bytes())?;
+    let result = unsafe { libc::renamex_np(one.as_ptr(), other.as_ptr(), libc::RENAME_SWAP) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Persist a directory's entries, so a rename into it survives a power cut.
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -1157,6 +1218,48 @@ fn merge_structured(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replacing a vault must never leave the workspace with none. The old
+    /// sequence removed the vault and then renamed the new one in, so any
+    /// failure in between -- and any crash in the window -- took the only copy
+    /// of the workspace's private files with it, and `session_wake` refuses
+    /// when it finds no vault.
+    #[test]
+    fn a_vault_that_cannot_be_replaced_is_left_exactly_as_it_was() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("secrets");
+        let workspace_root = root.join("ws_replace");
+        let staging = root.join(".ws_replace.suspend.staging");
+        let destination = workspace_root.join("suspended");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        write_private(&staging.join("manifest.json"), b"{\"files\":[\"new\"]}").unwrap();
+        write_private(&destination.join("manifest.json"), b"{\"files\":[\"old\"]}").unwrap();
+
+        // Both the swap and the two-rename fallback move `staging` out of the
+        // secrets root, which a read-only root refuses. The removal the old
+        // sequence began with needed no permission there at all.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = replace_directory(&staging, &destination);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.is_err(), "the replacement cannot have succeeded");
+        assert_eq!(
+            fs::read_to_string(destination.join("manifest.json")).unwrap(),
+            "{\"files\":[\"old\"]}",
+            "a failed replacement leaves the vault the workspace already had"
+        );
+
+        replace_directory(&staging, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("manifest.json")).unwrap(),
+            "{\"files\":[\"new\"]}"
+        );
+        assert!(!staging.exists(), "and takes the staging directory with it");
+        assert!(
+            !destination.with_extension("previous").exists(),
+            "leaving nothing aside"
+        );
+    }
 
     #[test]
     fn previews_key_names_without_values_and_merges_to_successor() {
