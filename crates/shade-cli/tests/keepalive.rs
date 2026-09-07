@@ -105,7 +105,21 @@ impl Fixture {
 
     /// Run one `shade` command and return the single JSON value it printed.
     fn cli(&self, arguments: &[&str]) -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_shade"))
+        self.cli_via(Path::new(env!("CARGO_BIN_EXE_shade")), arguments)
+    }
+
+    /// A symlink to the test binary, standing in for a Homebrew shim or
+    /// `~/.local/bin/shade`: the same file reached through another name.
+    fn symlink_to_binary(&self) -> PathBuf {
+        let link = self._temp.path().join("shade-link");
+        if !link.exists() {
+            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_shade"), &link).unwrap();
+        }
+        link
+    }
+
+    fn cli_via(&self, binary: &Path, arguments: &[&str]) -> Value {
+        let output = Command::new(binary)
             .arg("--socket")
             .arg(&self.socket)
             .args(arguments)
@@ -424,6 +438,62 @@ fn stale_pidfile_is_replaced_on_reopen() {
         fixture.heartbeats(reopened["outcome"]["result"]["lease"].as_str().unwrap()) >= 1
     });
     let _ = PidGuard(second);
+}
+
+/// Every keepalive identity check compares the running executable against this
+/// one. `shade` reached through a symlink -- which is how a PATH install is
+/// reached -- must still recognise its own child, or `stop_registered` deletes
+/// the pidfile without signalling and every `open` leaks another keepalive.
+#[test]
+fn a_keepalive_reached_through_a_symlink_is_recognised_and_replaced() {
+    let fixture = Fixture::new();
+    let _daemon = fixture.daemon(120);
+    let owner = fake_owner();
+    let link = fixture.symlink_to_binary();
+    let source = fixture.source.to_str().unwrap().to_owned();
+    let owner_pid = owner.0.to_string();
+    let open = [
+        "open",
+        source.as_str(),
+        "--session",
+        "ka-link",
+        "--interval-secs",
+        "1",
+        "--owner-pid",
+        owner_pid.as_str(),
+    ];
+
+    let opened = fixture.cli_via(&link, &open);
+    assert_eq!(opened["status"], "ok", "{opened}");
+    let first = keepalive(&opened)["pid"].as_u64().unwrap() as u32;
+    let guard = PidGuard(first);
+
+    let status = fixture.cli_via(&link, &["keepalive", "status", "--session", "ka-link"]);
+    let running = &status["outcome"]["result"];
+    assert_eq!(running["running"], true, "{status}");
+    assert_eq!(running["pid"], first);
+
+    // The real path and the symlink must agree about the same child.
+    let direct = fixture.cli(&["keepalive", "status", "--session", "ka-link"]);
+    assert_eq!(direct["outcome"]["result"]["pid"], first, "{direct}");
+
+    // Exactly one keepalive may observe a session: a second open replaces the
+    // first child rather than leaving two heartbeating the same lease.
+    let reopened = fixture.cli_via(&link, &open);
+    let second = keepalive(&reopened)["pid"].as_u64().unwrap() as u32;
+    let _second_guard = PidGuard(second);
+    assert_ne!(second, first);
+    wait_until(
+        "the first keepalive to be signalled, not merely forgotten",
+        || !alive(first),
+    );
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(fixture.pidfile("ka-link")).unwrap()).unwrap();
+    assert_eq!(record["keepalive_pid"], second);
+    wait_until("the replacement keepalive to heartbeat", || {
+        fixture.heartbeats(reopened["outcome"]["result"]["lease"].as_str().unwrap()) >= 1
+    });
+    drop(guard);
 }
 
 #[test]

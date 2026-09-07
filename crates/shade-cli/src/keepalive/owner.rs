@@ -275,9 +275,15 @@ mod tests {
         )
         .expect("the running test binary is its own nearest named ancestor");
         assert!(found.same_process(me.pid, me.start_tvsec, me.start_tvusec));
+        // `proc_pidpath` resolves the vnode and `current_exe` does not, so the
+        // two agree only after both are resolved. Asserting the raw strings
+        // match is exactly the mistake that made `is_live` false for every
+        // `shade` invoked through a symlink.
         assert_eq!(
-            executable_path(std::process::id()),
-            std::env::current_exe().ok()
+            executable_path(std::process::id()).and_then(|path| std::fs::canonicalize(path).ok()),
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| std::fs::canonicalize(path).ok())
         );
     }
 
@@ -286,6 +292,38 @@ mod tests {
         assert!(identity(0).is_none());
         assert!(identity(u32::MAX - 1).is_none());
         assert!(executable_path(u32::MAX - 1).is_none());
+    }
+
+    /// The keepalive attaches to an agent, not to whatever shell happens to be
+    /// up the chain. A plain `bash`/`make`/CI ancestry must decline under the
+    /// shipped defaults rather than adopt one of them.
+    #[test]
+    fn a_plain_shell_ancestry_is_not_an_owner_under_the_default_names() {
+        let defaults = names_from(&[], None);
+        assert_eq!(defaults, names(&DEFAULT_OWNER_NAMES));
+        for shell in ["sh", "bash", "zsh", "make", "runner", "login"] {
+            let lookup = chain(vec![
+                synthetic(100, 90, shell, 501),
+                synthetic(90, 80, "make", 501),
+                synthetic(80, 1, "sshd-session", 501),
+            ]);
+            assert!(
+                nearest_named_ancestor(100, lookup, &defaults, 501).is_none(),
+                "{shell} must not be adopted as an agent owner"
+            );
+        }
+        // The same chain with a recognised agent above it is adopted.
+        let lookup = chain(vec![
+            synthetic(100, 90, "zsh", 501),
+            synthetic(90, 80, "make", 501),
+            synthetic(80, 1, "codex", 501),
+        ]);
+        assert_eq!(
+            nearest_named_ancestor(100, lookup, &defaults, 501)
+                .unwrap()
+                .name,
+            "codex"
+        );
     }
 
     #[test]

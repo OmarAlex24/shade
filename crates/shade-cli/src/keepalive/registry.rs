@@ -119,12 +119,25 @@ pub fn is_live(record: &KeepaliveRecord) -> bool {
         return false;
     }
     match (
-        super::owner::executable_path(record.keepalive_pid),
-        std::env::current_exe().ok(),
+        super::owner::executable_path(record.keepalive_pid).and_then(resolved),
+        std::env::current_exe().ok().and_then(resolved),
     ) {
         (Some(running), Some(current)) => running == current,
         _ => false,
     }
+}
+
+/// Both sides of the identity check, resolved to the same real file.
+///
+/// `proc_pidpath` reports the resolved vnode while `current_exe` reports the
+/// path the process was launched through. Invoked through a symlink -- a
+/// Homebrew shim, `~/.local/bin/shade`, anything on PATH -- the two strings
+/// differ, and comparing them raw made every keepalive look like it belonged
+/// to a different program: `stop_registered` deleted pidfiles without ever
+/// signalling, so each `open` left another orphaned child behind, and
+/// `shade status` called a running keepalive `stale`.
+fn resolved(path: PathBuf) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 #[cfg(test)]
