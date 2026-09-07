@@ -340,6 +340,64 @@ fn release_stops_the_keepalive() {
 }
 
 #[test]
+fn sleep_stops_the_keepalive_and_wake_starts_a_new_one() {
+    let fixture = Fixture::new();
+    let _daemon = fixture.daemon(120);
+    let owner = fake_owner();
+
+    let opened = fixture.open("ka-sleep", &["--owner-pid", &owner.0.to_string()]);
+    let first = keepalive(&opened)["pid"].as_u64().unwrap() as u32;
+    let workspace = opened["outcome"]["result"]["workspace"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let slept = fixture.cli(&["sleep", "--workspace", &workspace]);
+    assert_eq!(slept["outcome"]["result"]["suspended"], true, "{slept}");
+    // Sleep reclaims the process as well as the disk: a child heartbeating a
+    // suspended session would be renewing a lease nobody holds.
+    wait_until("the keepalive to stop on sleep", || !alive(first));
+    assert!(!fixture.pidfile("ka-sleep").exists());
+    assert!(alive(owner.0), "sleep must not touch the owning agent");
+    assert_eq!(fixture.session_state("ka-sleep"), "suspended");
+
+    let woken = fixture.cli(&[
+        "wake",
+        "--session",
+        "ka-sleep",
+        "--owner-pid",
+        &owner.0.to_string(),
+        "--interval-secs",
+        "1",
+    ]);
+    let result = &woken["outcome"]["result"];
+    assert_eq!(result["session"], "ka-sleep", "{woken}");
+    assert_ne!(result["workspace"], workspace.as_str());
+    let second = keepalive(&woken)["pid"].as_u64().unwrap() as u32;
+    assert_ne!(second, first);
+    let guard = PidGuard(second);
+    assert_eq!(
+        std::fs::metadata(fixture.pidfile("ka-sleep"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    // The new child renews the new lease, not the one sleep gave up.
+    let lease = result["lease"].as_str().unwrap().to_owned();
+    let beating = wait_for(|| fixture.heartbeats(&lease) >= 2);
+    assert!(
+        beating,
+        "wake must leave a keepalive that heartbeats; keepalive log:\n{}",
+        fixture.keepalive_log("ka-sleep")
+    );
+    assert_eq!(fixture.session_state("ka-sleep"), "active");
+    drop(guard);
+}
+
+#[test]
 fn stale_pidfile_is_replaced_on_reopen() {
     let fixture = Fixture::new();
     let _daemon = fixture.daemon(120);
