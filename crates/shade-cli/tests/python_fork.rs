@@ -97,7 +97,8 @@ async fn real_python_fork_runs_independently_with_agent_edited_packages_and_entr
         })
         .await
         .unwrap();
-    let parent_root = Path::new(&parent.opened.cwd);
+    let parent_opened = parent.opened();
+    let parent_root = Path::new(&parent_opened.cwd);
     let parent_venv = parent_root.join(".venv");
     let library = PathBuf::from(command(
         parent_root,
@@ -125,7 +126,8 @@ async fn real_python_fork_runs_independently_with_agent_edited_packages_and_entr
         TerminalOutcome::Completed(child) => child,
         other => panic!("{other:?}"),
     };
-    let child_root = Path::new(&child.opened.cwd);
+    let child_opened = child.opened();
+    let child_root = Path::new(&child_opened.cwd);
     let child_venv = child_root.join(".venv");
     assert_eq!(
         fs::read_to_string(child_root.join(module.strip_prefix(parent_root).unwrap())).unwrap(),

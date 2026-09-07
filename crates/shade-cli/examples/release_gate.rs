@@ -675,7 +675,7 @@ async fn latency_evidence(
         let started = Instant::now();
         let response = client
             .context(WorkspaceSelector {
-                workspace_id: Some(session.opened.workspace.clone()),
+                workspace_id: Some(session.opened().workspace.clone()),
                 cwd: None,
             })
             .await

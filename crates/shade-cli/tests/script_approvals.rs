@@ -110,7 +110,7 @@ async fn public_script_approval_is_durable_and_refresh_creates_an_independent_su
         .await
         .unwrap();
     assert!(registry.requests() > 0);
-    let original = PathBuf::from(&session.opened.cwd);
+    let original = PathBuf::from(&session.opened().cwd);
     let reports = session.dependency_scripts().await.unwrap();
     assert_eq!(reports.scripts.len(), 1);
     let approval = reports.scripts[0].script.approval.clone();
@@ -120,7 +120,8 @@ async fn public_script_approval_is_durable_and_refresh_creates_an_independent_su
     let mut wrong = approval.clone();
     wrong.integrity.push('x');
     assert!(session.approve_script(wrong).await.is_err());
-    let workspace = &session.opened.workspace.0;
+    let workspace = session.opened().workspace.0;
+    let workspace = workspace.as_str();
     let args = [
         "--idempotency-key",
         "approve-once",
@@ -152,7 +153,7 @@ async fn public_script_approval_is_durable_and_refresh_creates_an_independent_su
     else {
         panic!("expected successor")
     };
-    let built = PathBuf::from(&successor.opened.cwd);
+    let built = PathBuf::from(&successor.opened().cwd);
     assert_ne!(built, original);
     assert!(
         !original
@@ -179,7 +180,7 @@ async fn public_script_approval_is_durable_and_refresh_creates_an_independent_su
         panic!("expected revoked successor")
     };
     assert!(
-        !Path::new(&revoked.opened.cwd)
+        !Path::new(&revoked.opened().cwd)
             .join("node_modules/approved-alias/built.txt")
             .exists()
     );
@@ -193,7 +194,7 @@ async fn public_script_approval_is_durable_and_refresh_creates_an_independent_su
             "deps",
             "scripts",
             "--workspace",
-            &revoked.opened.workspace.0,
+            &revoked.opened().workspace.0,
         ],
     );
     assert_eq!(report["scripts"][0]["allowed"], false);

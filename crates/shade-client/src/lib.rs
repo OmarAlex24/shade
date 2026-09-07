@@ -666,10 +666,12 @@ impl Sessions {
 
 struct SessionLifecycle {
     stop: watch::Sender<bool>,
-    /// The lease this session is currently renewing. It is not
-    /// `opened.lease`: a reattach rotates the lease under a handle the caller
-    /// already holds, and that handle must keep working.
-    lease: Mutex<LeaseId>,
+    /// What the daemon last told us about this session. A reattach rotates the
+    /// lease -- and with it the environment and the compact context -- under a
+    /// handle the caller already holds, so the snapshot has to move with it:
+    /// a caller who re-reads `SHADE_LEASE` after a dormancy must get the lease
+    /// the daemon is actually renewing, not the one the handle was born with.
+    opened: Mutex<OpenedSession>,
 }
 
 impl SessionLifecycle {
@@ -681,12 +683,12 @@ impl SessionLifecycle {
         !*self.stop.borrow()
     }
 
-    fn lease(&self) -> LeaseId {
-        self.lease.lock().expect("lease mutex poisoned").clone()
+    fn opened(&self) -> OpenedSession {
+        self.opened.lock().expect("session mutex poisoned").clone()
     }
 
-    fn adopt(&self, lease: LeaseId) {
-        *self.lease.lock().expect("lease mutex poisoned") = lease;
+    fn adopt(&self, opened: OpenedSession) {
+        *self.opened.lock().expect("session mutex poisoned") = opened;
     }
 }
 
@@ -698,7 +700,6 @@ pub struct Session {
     lifecycle: Arc<SessionLifecycle>,
     pub session_id: SessionId,
     pub selector: WorkspaceSelector,
-    pub opened: OpenedSession,
 }
 
 impl std::fmt::Debug for Session {
@@ -706,8 +707,8 @@ impl std::fmt::Debug for Session {
         formatter
             .debug_struct("Session")
             .field("session_id", &self.session_id)
-            .field("workspace", &self.opened.workspace)
-            .field("lease", &self.opened.lease)
+            .field("workspace", &self.selector.workspace_id)
+            .field("lease", &self.lease())
             .field("active", &self.lifecycle.is_active())
             .finish_non_exhaustive()
     }
@@ -718,16 +719,15 @@ impl Session {
         let (stop, stop_receiver) = watch::channel(false);
         let session = Self {
             client: client.clone(),
-            lifecycle: Arc::new(SessionLifecycle {
-                stop,
-                lease: Mutex::new(opened.lease.clone()),
-            }),
             session_id: opened.session.clone(),
             selector: WorkspaceSelector {
                 workspace_id: Some(opened.workspace.clone()),
                 cwd: Some(opened.cwd.clone()),
             },
-            opened,
+            lifecycle: Arc::new(SessionLifecycle {
+                stop,
+                opened: Mutex::new(opened),
+            }),
         };
         session.spawn_heartbeat(client, stop_receiver);
         session
@@ -735,7 +735,7 @@ impl Session {
 
     fn spawn_heartbeat(&self, client: ShadeClient, mut stop: watch::Receiver<bool>) {
         let session_id = self.session_id.clone();
-        let mut lease_id = self.opened.lease.clone();
+        let mut lease_id = self.lease();
         let lifecycle = Arc::downgrade(&self.lifecycle);
         let heartbeat_interval = client.options.heartbeat_interval;
         let reattach_on_expiry = client.options.reattach_on_expiry;
@@ -769,7 +769,7 @@ impl Session {
                             Ok(opened) => {
                                 lease_id = opened.lease.clone();
                                 if let Some(lifecycle) = lifecycle.upgrade() {
-                                    lifecycle.adopt(opened.lease);
+                                    lifecycle.adopt(opened);
                                 } else {
                                     break;
                                 }
@@ -798,10 +798,17 @@ impl Session {
         self.lifecycle.is_active()
     }
 
-    /// The lease currently held. `opened.lease` records the lease this handle
-    /// was created with; a reattach replaces it, and this follows.
+    /// What the daemon last told us about this session: the workspace, the
+    /// lease, the working directory, the environment to export and the compact
+    /// context. A reattach after a dormancy refreshes all of it, so read this
+    /// again rather than caching the value across an await.
+    pub fn opened(&self) -> OpenedSession {
+        self.lifecycle.opened()
+    }
+
+    /// The lease currently held. A reattach rotates it, and this follows.
     pub fn lease(&self) -> LeaseId {
-        self.lifecycle.lease()
+        self.lifecycle.opened().lease
     }
 
     /// Stop automatic heartbeats for this handle and every clone.
@@ -1795,9 +1802,15 @@ mod tests {
         }
         assert!(session.is_active(), "a dormancy must not retire the handle");
         assert_eq!(session.lease().0, "lease-second");
+        let refreshed = session.opened();
         assert_eq!(
-            session.opened.lease.0, "lease-first",
-            "`opened` still records the lease the handle was created with"
+            refreshed.lease.0, "lease-second",
+            "the snapshot follows the reattach instead of pinning the first lease"
+        );
+        assert_eq!(
+            refreshed.env.get("SHADE_LEASE").map(String::as_str),
+            Some("lease-second"),
+            "a caller re-exporting the environment must export the live lease"
         );
         assert_eq!(reattachments.load(Ordering::SeqCst), 1);
         let renewed = leases

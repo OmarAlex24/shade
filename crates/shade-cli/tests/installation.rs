@@ -168,7 +168,7 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
         "launchd could not use the real host npm"
     );
     assert!(
-        !Path::new(&session.opened.cwd)
+        !Path::new(&session.opened().cwd)
             .join("node_modules/approved-alias/built.txt")
             .exists()
     );
@@ -223,7 +223,7 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
     );
     assert_eq!(
         session.context().await.unwrap().workspace,
-        session.opened.workspace
+        session.opened().workspace
     );
     let collision = install();
     assert!(

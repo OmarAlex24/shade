@@ -203,7 +203,8 @@ async fn default_daemon_prepares_polyglot_dependencies_with_external_config_isol
         })
         .await
         .unwrap();
-    let workspace = Path::new(&session.opened.cwd);
+    let opened = session.opened();
+    let workspace = Path::new(&opened.cwd);
     assert!(registry.requests() > 0);
     assert!(
         workspace
