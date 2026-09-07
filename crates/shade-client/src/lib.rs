@@ -1779,8 +1779,16 @@ mod tests {
         )
         .unwrap();
         let session = Session::new(client, opened("lease-first"));
+        // Wait for the renewal, not just for the swap: the handle adopts the
+        // new lease the moment the reattach answers, one heartbeat interval
+        // before it first uses it.
         for _ in 0..200 {
-            if session.lease().0 == "lease-second" {
+            let renewed = leases
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|lease| lease == "lease-second");
+            if session.lease().0 == "lease-second" && renewed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
