@@ -45,6 +45,14 @@ fn service_pid(service: &str) -> Option<u32> {
         })
 }
 
+fn kill(args: &[&str]) -> bool {
+    Command::new("/bin/kill")
+        .args(args)
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(root)
@@ -78,8 +86,11 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
     let label = format!("com.shade.daemon.acceptance.{}", ulid::Ulid::new());
     let service = Service(format!("gui/{}/{label}", unsafe { libc::geteuid() }));
     assert!(service_pid(&service.0).is_none());
-    let install = || {
-        Command::new(&binary)
+    // `--harness-upgrade` is the only way to aim a second install at a service
+    // that already exists; without it the harness label rejects a collision.
+    let install = |upgrade: bool| {
+        let mut command = Command::new(&binary);
+        command
             .args([
                 "--socket",
                 socket.to_str().unwrap(),
@@ -90,11 +101,13 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
                 "--harness-label",
                 &label,
             ])
-            .env("SHADE_ROOT", &state)
-            .output()
-            .unwrap()
+            .env("SHADE_ROOT", &state);
+        if upgrade {
+            command.arg("--harness-upgrade");
+        }
+        command.output().unwrap()
     };
-    let output = install();
+    let output = install(false);
     assert!(
         output.status.success(),
         "install failed: {} {}",
@@ -105,6 +118,7 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
     assert_eq!(response["status"], "ok");
     let result = &response["outcome"]["result"];
     assert_eq!(result["label"], label);
+    assert_eq!(result["restarted"], false);
     let installed = PathBuf::from(result["installed"].as_str().unwrap());
     let plist = PathBuf::from(result["launch_agent"].as_str().unwrap());
     assert!(installed.starts_with(&root) && plist.starts_with(&root));
@@ -225,12 +239,77 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
         session.context().await.unwrap().workspace,
         session.opened().workspace
     );
-    let collision = install();
+    let collision = install(false);
     assert!(
         !collision.status.success(),
         "acceptance install replaced an existing service"
     );
     assert_eq!(service_pid(&service.0), Some(restarted_pid));
+
+    // Upgrading in place over a running service. launchd acknowledges a bootout
+    // when it accepts the request, not when the job is gone, and it rejects a
+    // bootstrap that arrives inside that window -- leaving the domain with no
+    // service at all. A daemon that cannot answer SIGTERM at once holds that
+    // window open, which is the state a busy installation is in, so the test
+    // stops the process for long enough to make the window certain instead of
+    // waiting for a machine slow enough to produce it by chance.
+    let stalled_pid = service_pid(&service.0).expect("no service to upgrade");
+    assert!(kill(&["-STOP", &stalled_pid.to_string()]));
+    let resumed = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1_500));
+        kill(&["-CONT", &stalled_pid.to_string()])
+    });
+    let upgrade_started = Instant::now();
+    let upgrade = install(true);
+    let upgrade_ms = upgrade_started.elapsed().as_millis();
+    assert!(
+        resumed.join().unwrap(),
+        "the stopped daemon was not resumed"
+    );
+    assert!(
+        upgrade.status.success(),
+        "upgrade install failed: {} {}",
+        String::from_utf8_lossy(&upgrade.stdout),
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    let upgraded: Value = serde_json::from_slice(&upgrade.stdout).unwrap();
+    assert_eq!(upgraded["status"], "ok");
+    let upgraded_result = &upgraded["outcome"]["result"];
+    assert_eq!(upgraded_result["label"], label);
+    assert_eq!(upgraded_result["restarted"], true);
+    assert_eq!(
+        hex::encode(Sha256::digest(fs::read(&installed).unwrap())),
+        binary_digest
+    );
+    let upgraded_pid = service_pid(&service.0).expect("upgraded service is not running");
+    assert_ne!(upgraded_pid, restarted_pid);
+    assert!(
+        fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    let upgraded_doctor = Command::new(&installed)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("doctor")
+        .env("SHADE_ROOT", &state)
+        .output()
+        .unwrap();
+    assert!(
+        upgraded_doctor.status.success(),
+        "doctor failed after the upgrade: {} {}",
+        String::from_utf8_lossy(&upgraded_doctor.stdout),
+        String::from_utf8_lossy(&upgraded_doctor.stderr)
+    );
+    let upgraded_doctor: Value = serde_json::from_slice(&upgraded_doctor.stdout).unwrap();
+    assert_eq!(upgraded_doctor["status"], "ok");
+    assert_eq!(upgraded_doctor["outcome"]["result"]["state"], "ok");
+    assert_eq!(
+        fs::metadata(state.join("state.sqlite")).unwrap().ino(),
+        sqlite_inode
+    );
+
     session.release().await.unwrap();
     let doctor = client.query(Query::Doctor).await.unwrap();
     assert!(matches!(
@@ -262,6 +341,6 @@ async fn isolated_launchagent_installs_opens_and_restarts_the_same_runtime() {
     );
     eprintln!(
         "SHADE_INSTALL_EVIDENCE {}",
-        json!({"binary_sha256":binary_digest,"label":label,"initial_pid":original_pid,"restarted_pid":restarted_pid,"open_ms":open_ms,"restart_ms":restart_ms,"checks":["single_binary_install","private_plist_and_socket","launchagent_ready_before_success","real_host_npm_from_launchd","unapproved_scripts_blocked","keepalive_sigkill_restart","same_database_and_workspace","private_durable_diagnostic","diagnostic_survives_restart","offline_diagnostic_after_unload","reserved_label_collision_rejected","service_unloaded"],"status":"passed"})
+        json!({"binary_sha256":binary_digest,"label":label,"initial_pid":original_pid,"restarted_pid":restarted_pid,"upgraded_pid":upgraded_pid,"open_ms":open_ms,"restart_ms":restart_ms,"upgrade_ms":upgrade_ms,"checks":["single_binary_install","private_plist_and_socket","launchagent_ready_before_success","real_host_npm_from_launchd","unapproved_scripts_blocked","keepalive_sigkill_restart","same_database_and_workspace","private_durable_diagnostic","diagnostic_survives_restart","offline_diagnostic_after_unload","reserved_label_collision_rejected","upgrade_in_place_over_a_running_service","service_unloaded"],"status":"passed"})
     );
 }
