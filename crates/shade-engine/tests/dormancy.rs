@@ -758,6 +758,53 @@ async fn context_reports_lifecycle_dormant_and_active() {
     assert!(status.lease_expires_at_ms.is_some());
 }
 
+/// The `session` query's optional fields track the record, not liveness.
+/// Before the sweep runs, a dormant session still has an unreleased lease row
+/// and still hands its id back -- so a caller reading field presence as
+/// "the lease is live" reads a dormant session as active. `lifecycle` and the
+/// deadline are the answer; the fields are only ever "is there a row".
+#[tokio::test]
+async fn the_session_query_reports_an_expired_lease_row_it_has_not_swept_yet() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_at(directory.path());
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    expire_lease_without_sweeping(directory.path(), &opened.session);
+
+    let status: SessionStatus = completed(
+        engine
+            .query(query(Query::Session {
+                session_id: opened.session.clone(),
+            }))
+            .await,
+    );
+    assert_eq!(status.lifecycle, "dormant");
+    assert_eq!(
+        status.lease.as_ref(),
+        Some(&opened.lease),
+        "an unswept lease row is still reported"
+    );
+    let expires = status.lease_expires_at_ms.expect("a row means a deadline");
+    assert!(
+        expires
+            < std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        "and the deadline, not the presence, is what says it is over"
+    );
+    assert!(status.materialized);
+    assert_eq!(
+        status.cwd.as_deref(),
+        Some(opened.cwd.as_str()),
+        "the tree is still there, so the cwd is still answerable"
+    );
+}
+
 #[tokio::test]
 async fn startup_normalizes_legacy_orphaned_rows_to_dormant() {
     let directory = tempfile::tempdir().unwrap();
