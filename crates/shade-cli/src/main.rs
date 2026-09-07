@@ -292,7 +292,24 @@ impl SelectorArgs {
     fn selector(&self) -> anyhow::Result<WorkspaceSelector> {
         let cwd = match &self.cwd {
             Some(path) => Some(std::fs::canonicalize(absolutize(path)?)?),
-            None if self.workspace.is_none() => Some(std::env::current_dir()?),
+            // `getcwd` fails when the directory was removed under the shell,
+            // which is exactly what `shade sleep` does to a caller standing in
+            // its own workspace. That used to surface as `CLI_FAILED` with
+            // `retry: safe` -- "run doctor, then retry" -- for a condition no
+            // retry has ever fixed and doctor cannot see. Name it, and name
+            // the two flags that answer it.
+            None if self.workspace.is_none() => Some(std::env::current_dir().map_err(|_| {
+                ClientError::Domain(ShadeError {
+                    code: "SELECTOR_CWD_UNAVAILABLE".into(),
+                    retry: "never".into(),
+                    operation: None,
+                    next: Some(
+                        "cd to an existing directory, or pass --workspace <id> or --cwd <path>"
+                            .into(),
+                    ),
+                    diagnostics_id: None,
+                })
+            })?),
             None => None,
         };
         Ok(WorkspaceSelector {

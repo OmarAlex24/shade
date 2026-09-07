@@ -372,4 +372,12 @@ export interface SleepResult {
   suspended: boolean;
   /** Disk reclaimed by removing the tree, measured before removal. */
   reclaimed_bytes: number;
+  /**
+   * The directory that no longer exists. A caller that slept from inside its
+   * own workspace is now sitting in a deleted directory, and every later
+   * selector command fails on `getcwd` before it reaches the daemon.
+   */
+  cwd: string;
+  /** What to do next, in one line: leave the deleted directory, then wake. */
+  next: string;
 }

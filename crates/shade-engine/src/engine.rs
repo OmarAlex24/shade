@@ -2662,11 +2662,13 @@ impl Engine {
         crate::faults::hit(crate::faults::Point::SleepRecorded);
         Ok(Outcome::Completed(
             serde_json::to_value(SleepResult {
+                next: format!("cd to another directory, then: shade wake --session {session_id}"),
                 session: session_id,
                 workspace: workspace.id.clone(),
                 checkpoint_id: checkpoint.id,
                 suspended: true,
                 reclaimed_bytes,
+                cwd: workspace.path.to_string_lossy().into_owned(),
             })
             .map_err(EngineError::internal)?,
         ))

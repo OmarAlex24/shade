@@ -123,6 +123,12 @@ describe("Rust v1 wire contract", () => {
     });
     expect(slept.outcome.result.checkpoint_id).toBeString();
     expect(slept.outcome.result.reclaimed_bytes).toBeNumber();
+    // The caller may be standing in the directory sleep just removed, so the
+    // result names it and the one line that recovers from it.
+    expect(slept.outcome.result.cwd).toBe(suspended.cwd);
+    expect(slept.outcome.result.next).toBe(
+      "cd to another directory, then: shade wake --session session-suspends",
+    );
     expect("compact_context" in slept.outcome.result).toBe(false);
     expect("context" in slept.outcome.result).toBe(false);
 

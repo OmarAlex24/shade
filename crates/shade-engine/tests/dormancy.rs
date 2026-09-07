@@ -1102,6 +1102,18 @@ async fn sleep_checkpoints_dematerializes_and_preserves_every_record() {
         slept.reclaimed_bytes > 0,
         "sleeping a materialized tree reclaims disk"
     );
+    // A caller that slept from inside its own workspace is standing in a
+    // directory that no longer exists, and every later selector command fails
+    // on `getcwd` before it reaches the daemon. The result names the path that
+    // went and the one line that recovers from it.
+    assert_eq!(slept.cwd, opened.cwd);
+    assert_eq!(
+        slept.next,
+        format!(
+            "cd to another directory, then: shade wake --session {}",
+            opened.session.0
+        )
+    );
 
     assert!(!tree.exists(), "the tree is what sleep gives up");
     let worktrees = registered_worktrees(&engine, &opened);

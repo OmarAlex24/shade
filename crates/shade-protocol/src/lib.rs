@@ -349,6 +349,15 @@ pub struct SleepResult {
     pub suspended: bool,
     /// Disk reclaimed by removing the tree, measured before removal.
     pub reclaimed_bytes: u64,
+    /// The directory that no longer exists.
+    ///
+    /// A caller that ran `shade sleep` from inside its own workspace is now
+    /// sitting in a deleted directory, and every later selector command fails
+    /// on `getcwd` before it reaches the daemon. Naming the path is what lets a
+    /// shell wrapper or an agent notice and move out of it.
+    pub cwd: String,
+    /// What to do next, in one line: leave the deleted directory, then wake.
+    pub next: String,
 }
 
 /// Reported by the CLI only. The daemon and the SDKs never populate it: SDK

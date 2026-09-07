@@ -355,6 +355,9 @@ export class FakeShadeDaemon {
         // daemon is free to answer 0 for a workspace whose blocks are all
         // shared with the immutable base.
         const reclaimedBytes = treeBytes(session.opened.cwd);
+        // The caller may be standing in this directory; the result names it so
+        // a shell wrapper or an agent can notice and move out.
+        const sleptCwd = session.opened.cwd;
         session.suspended = true;
         session.suspension_checkpoint = checkpointId;
         session.expires_at_ms = 0;
@@ -384,6 +387,8 @@ export class FakeShadeDaemon {
               checkpoint_id: checkpointId,
               suspended: true,
               reclaimed_bytes: reclaimedBytes,
+              cwd: sleptCwd,
+              next: `cd to another directory, then: shade wake --session ${session.opened.session}`,
             },
           },
           intent.kind,

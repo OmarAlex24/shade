@@ -130,3 +130,36 @@ fn daemon_socket_timeout_recovery_and_sigterm_are_durable() {
     }
     assert!(!socket.exists());
 }
+
+/// `shade sleep` removes the tree the caller may be standing in, and the shell
+/// keeps the deleted directory as its cwd. Every later selector command then
+/// fails in `getcwd`, before it reaches the daemon, and that used to arrive as
+/// `CLI_FAILED` with `retry: safe`: "run `shade doctor`, then retry" -- for a
+/// condition no retry has ever fixed and doctor cannot see. The answer has to
+/// name itself and the two flags that get past it.
+#[test]
+fn a_command_run_from_a_deleted_directory_names_the_condition_and_the_way_out() {
+    let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let gone = temp.path().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let script = format!(
+        "cd {gone} && rm -rf {gone} && exec \"$0\" --socket {socket} context",
+        gone = gone.display(),
+        socket = temp.path().join("s.sock").display(),
+    );
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script, env!("CARGO_BIN_EXE_shade")])
+        .env("SHADE_ROOT", temp.path().join("state"))
+        .env_remove("SHADE_WORKSPACE")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["status"], "error", "{response}");
+    assert_eq!(response["error"]["code"], "SELECTOR_CWD_UNAVAILABLE");
+    assert_eq!(response["error"]["retry"], "never");
+    assert_eq!(
+        response["error"]["next"],
+        "cd to an existing directory, or pass --workspace <id> or --cwd <path>"
+    );
+}
