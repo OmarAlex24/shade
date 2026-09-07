@@ -168,6 +168,14 @@ pub enum Intent {
     SessionReattach {
         session_id: SessionId,
     },
+    /// Check the workspace in and free its tree, keeping every record.
+    WorkspaceSleep {
+        selector: WorkspaceSelector,
+    },
+    /// Rematerialize a suspended session as a successor workspace.
+    SessionWake {
+        session_id: SessionId,
+    },
     GarbageCollect,
     MaintenanceSweep,
     Reconcile,
@@ -328,6 +336,19 @@ pub struct SessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub materialized: bool,
+}
+
+/// The result of `workspace_sleep`. The workspace keeps its identity, its
+/// checkpoints and its secrets; only the tree is gone, and `wake` rebuilds it
+/// as a successor from `checkpoint_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleepResult {
+    pub session: SessionId,
+    pub workspace: WorkspaceId,
+    pub checkpoint_id: CheckpointId,
+    pub suspended: bool,
+    /// Disk reclaimed by removing the tree, measured before removal.
+    pub reclaimed_bytes: u64,
 }
 
 /// Reported by the CLI only. The daemon and the SDKs never populate it: SDK

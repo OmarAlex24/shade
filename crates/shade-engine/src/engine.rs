@@ -20,7 +20,7 @@ use shade_protocol::{
     DependencyContext as ProtocolDependencyContext, EventEnvelope, ExecuteRequest, HandoffId,
     Intent, LeaseId, ObjectId, OpenSession, OpenedSession, OperationId, Outcome, PROTOCOL_VERSION,
     Query, QueryRequest, RepositoryId, RepositoryLocator, ResponseBody, ReviewAction, ReviewId,
-    ReviewRequired, SessionId, SessionStatus, ShadeError, WireResponse, WorkspaceId,
+    ReviewRequired, SessionId, SessionStatus, ShadeError, SleepResult, WireResponse, WorkspaceId,
     WorkspaceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -454,6 +454,9 @@ struct ReconciliationStats {
     worktree_metadata_removed: u64,
     worktree_metadata_conflicts: u64,
     checkpoint_refs_removed: u64,
+    suspensions_finished: u64,
+    suspensions_reverted: u64,
+    suspensions_failed: u64,
 }
 
 struct PublishResolutionInput<'a> {
@@ -468,6 +471,17 @@ struct PublishResolutionInput<'a> {
 enum SuccessorSource {
     ImmutableBase,
     ParentWorkspace,
+}
+
+/// Where a successor's private files come from.
+///
+/// Restore, sync and refresh read them out of the parent's working tree.
+/// A wake has no parent tree left to read -- that is what being suspended
+/// means -- so it reads the vault sleep wrote instead.
+#[derive(Clone, Copy)]
+enum SuccessorSecrets {
+    ParentTree,
+    SuspensionVault,
 }
 
 impl Engine {
@@ -782,6 +796,8 @@ impl Engine {
             Intent::WorkspaceRelease { selector } => {
                 self.release_workspace(selector, operation).await
             }
+            Intent::WorkspaceSleep { selector } => self.sleep_workspace(selector, operation).await,
+            Intent::SessionWake { session_id } => self.wake_session(session_id, operation).await,
             Intent::ReviewResolve { review_id, action } => {
                 self.resolve_review(review_id, action, operation, &actor_principal)
                     .await
@@ -820,17 +836,25 @@ impl Engine {
                     "worktree_metadata_removed": recovery.worktree_metadata_removed,
                     "worktree_metadata_conflicts": recovery.worktree_metadata_conflicts,
                     "checkpoint_refs_removed": recovery.checkpoint_refs_removed,
+                    "suspensions_finished": recovery.suspensions_finished,
+                    "suspensions_reverted": recovery.suspensions_reverted,
+                    "suspensions_failed": recovery.suspensions_failed,
                     "staging_removed": staging,
                 })))
             }
             Intent::MaintenanceSweep => {
                 let sweep = self.database.mark_expired_leases(now_ms())?;
+                // Both sweeps are no-ops unless an operator configured them.
+                let auto_slept = self.auto_sleep_dormant(operation).await?;
+                let retention_released = self.expire_suspended_retention()?;
                 Ok(Outcome::Completed(json!({
                     // `expired_sessions` is load-bearing for existing hosts;
                     // the dormancy counters are additive.
                     "expired_sessions": sweep.sessions,
                     "dormant_sessions": sweep.sessions,
                     "dormant_workspaces": sweep.workspaces,
+                    "auto_slept": auto_slept,
+                    "retention_released": retention_released,
                 })))
             }
             Intent::GarbageCollect => self.garbage_collect(operation).await,
@@ -1540,26 +1564,36 @@ impl Engine {
             None => "released",
         };
         let lifecycle = self.workspace_lifecycle(workspace)?;
+        // A suspended workspace has no tree to interrogate. Report the last
+        // thing recorded about it instead of failing a read-only query.
+        if matches!(lifecycle, Lifecycle::Suspended) {
+            return Ok(CompactContext {
+                workspace: workspace.id.clone(),
+                session,
+                base_ref: workspace.base_ref.clone(),
+                base_sha: workspace.base_oid.clone(),
+                head_sha: workspace.head_oid.clone(),
+                remote_sha: None,
+                changes: CompactChanges {
+                    staged: 0,
+                    unstaged: 0,
+                    untracked: 0,
+                },
+                lease: lease_state.to_owned(),
+                lifecycle: lifecycle.label().to_owned(),
+                dependencies: self.dependency_context(workspace)?,
+            });
+        }
         self.compact_context_for(workspace, session, lease_state, lifecycle.label())
             .await
     }
 
-    async fn compact_context_for(
+    /// The dependency half of a compact context, which is answerable from
+    /// receipts alone and therefore survives losing the tree.
+    fn dependency_context(
         &self,
         workspace: &WorkspaceRecord,
-        session: SessionId,
-        lease_state: &str,
-        lifecycle: &str,
-    ) -> Result<CompactContext, EngineError> {
-        // `context` is observational: one porcelain-v2 invocation returns
-        // both the counters and detached HEAD. Content retention boundaries
-        // (checkpoint/fork/sync/publish/release/GC) keep using the fully
-        // policy-bearing GitStore methods.
-        let (status, head) = self
-            .git
-            .context_state(&workspace.path)
-            .await
-            .map_err(subsystem_error)?;
+    ) -> Result<ProtocolDependencyContext, EngineError> {
         let receipts = self.database.dependency_receipts(&workspace.id)?;
         let providers = receipts
             .iter()
@@ -1579,6 +1613,30 @@ impl Engine {
             .collect::<Vec<_>>();
         blocked_builds.sort();
         blocked_builds.dedup();
+        Ok(ProtocolDependencyContext {
+            state: workspace.dependency_state.clone(),
+            providers,
+            blocked_builds,
+        })
+    }
+
+    async fn compact_context_for(
+        &self,
+        workspace: &WorkspaceRecord,
+        session: SessionId,
+        lease_state: &str,
+        lifecycle: &str,
+    ) -> Result<CompactContext, EngineError> {
+        // `context` is observational: one porcelain-v2 invocation returns
+        // both the counters and detached HEAD. Content retention boundaries
+        // (checkpoint/fork/sync/publish/release/GC) keep using the fully
+        // policy-bearing GitStore methods.
+        let (status, head) = self
+            .git
+            .context_state(&workspace.path)
+            .await
+            .map_err(subsystem_error)?;
+        let dependencies = self.dependency_context(workspace)?;
         Ok(CompactContext {
             workspace: workspace.id.clone(),
             session,
@@ -1593,11 +1651,7 @@ impl Engine {
             },
             lease: lease_state.to_owned(),
             lifecycle: lifecycle.to_owned(),
-            dependencies: ProtocolDependencyContext {
-                state: workspace.dependency_state.clone(),
-                providers,
-                blocked_builds,
-            },
+            dependencies,
         })
     }
 
@@ -1660,8 +1714,10 @@ impl Engine {
                     self.reattach_session(request.session_id, request.base.as_deref(), operation)
                         .await
                 }
-                "suspended" => Err(EngineError::domain("SESSION_SUSPENDED", "never")
-                    .next("shade wake --session <id>")),
+                // `open` is still the single door: a suspended session is
+                // woken rather than refused, so a host that only ever calls
+                // `open` never has to know that suspension exists either.
+                "suspended" => self.wake_session(request.session_id, operation).await,
                 _ => Err(EngineError::domain("SESSION_ALREADY_RELEASED", "never")
                     .next("open with a new stable session id")),
             };
@@ -2231,6 +2287,7 @@ impl Engine {
         checkpoint_record: &CheckpointRecord,
         operation: &OperationId,
         source: SuccessorSource,
+        secrets: SuccessorSecrets,
     ) -> Result<WorkspaceRecord, EngineError> {
         let (checkpoint_workspace, managed, checkpoint) =
             self.load_git_checkpoint(checkpoint_record).await?;
@@ -2303,9 +2360,18 @@ impl Engine {
                 .await
                 .map_err(subsystem_error)?;
             crate::faults::hit(crate::faults::Point::SuccessorRestored);
-            self.secrets
-                .copy_workspace_secrets(&parent.path, &successor.path)
-                .map_err(EngineError::internal)?;
+            match secrets {
+                SuccessorSecrets::ParentTree => {
+                    self.secrets
+                        .copy_workspace_secrets(&parent.path, &successor.path)
+                        .map_err(EngineError::internal)?;
+                }
+                SuccessorSecrets::SuspensionVault => {
+                    self.secrets
+                        .restore_suspension(&parent.id, &successor.path)
+                        .map_err(EngineError::internal)?;
+                }
+            }
             self.prepare_dependencies(&successor).await?;
             self.secrets
                 .capture(&successor.id, &successor.path)
@@ -2343,9 +2409,268 @@ impl Engine {
                 &checkpoint,
                 operation,
                 SuccessorSource::ImmutableBase,
+                SuccessorSecrets::ParentTree,
             )
             .await?;
         self.prepare_handoff(&parent, &successor, operation, actor_id)
+    }
+
+    /// Check a workspace in: keep every record, give the disk back.
+    ///
+    /// Sleep is the opposite of release, not a softer version of it. Release
+    /// is the only door to deletion; sleep is the door to costing nothing
+    /// while still existing. What it gives up is the gitignored output that is
+    /// not a dependency layer -- `target/`, `dist/`, caches -- because the
+    /// sleep checkpoint records what Git tracks, the vault records the private
+    /// files, and nothing records the rest.
+    async fn sleep_workspace(
+        &self,
+        selector: WorkspaceSelector,
+        operation: &OperationId,
+    ) -> Result<Outcome, EngineError> {
+        let workspace = self.resolve_workspace(&selector)?;
+        let _lifecycle = self
+            .keyed_lock(format!("lifecycle:{}", workspace.id.0))
+            .await;
+        // Sleep, like release, must keep working after a lease expires: an
+        // idle workspace is exactly the one worth reclaiming disk from.
+        match self.workspace_lifecycle(&workspace)? {
+            Lifecycle::Active { .. } | Lifecycle::Dormant => {}
+            Lifecycle::Suspended => {
+                return Err(EngineError::domain("SESSION_SUSPENDED", "never")
+                    .next("shade wake --session <id>"));
+            }
+            Lifecycle::Released => {
+                return Err(EngineError::domain("WORKSPACE_ALREADY_RELEASED", "never")
+                    .next("open a new session"));
+            }
+        }
+        let session_id = workspace
+            .session_id
+            .clone()
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_LEASED", "never"))?;
+        self.database
+            .bind_operation_resource(operation, &workspace.id.0, "sleep")?;
+        // A workspace mid-handoff, mid-review or mid-publish has a second
+        // owner that is still going to want the tree.
+        if matches!(workspace.state.as_str(), "resolution" | "handoff_pending")
+            || !self
+                .database
+                .workspace_is_quiescent(&workspace.id, operation)?
+        {
+            return Err(EngineError::domain("WORKSPACE_NOT_QUIESCENT", "safe")
+                .next("finish or cancel the pending work, then shade sleep"));
+        }
+        if !workspace.path.join(".git").is_file() {
+            return Err(EngineError::domain("WORKSPACE_NOT_MATERIALIZED", "never")
+                .next("shade wake --session <id>"));
+        }
+        let checkpoint = self
+            .checkpoint_workspace(&workspace, "sleep", operation)
+            .await?;
+        crate::faults::hit(crate::faults::Point::SleepCheckpointed);
+        // Measured while the tree is still there. `private_bytes` is the
+        // honest number on APFS: blocks shared with the immutable base are not
+        // reclaimed by removing this clone.
+        let reclaimed_bytes = self
+            .filesystem
+            .usage(&workspace.path)
+            .map(|usage| usage.private_bytes.unwrap_or(usage.referenced_bytes))
+            .unwrap_or_default();
+        // Deliberately not `secret_cleanup_review`: sleep preserves the
+        // private files instead of deleting them, and there is nothing for a
+        // human to decide when nothing leaves the machine.
+        self.secrets
+            .capture_suspension(&workspace.id, &workspace.path)
+            .map_err(EngineError::internal)?;
+        crate::faults::hit(crate::faults::Point::SleepSecretsVaulted);
+        self.database
+            .mark_workspace_state(&workspace.id, "suspending")?;
+        let dematerialize = async {
+            let (_, managed, _) = self.repository_for(&workspace)?;
+            self.remove_workspace_git_metadata(&workspace.repository_id, &managed, &workspace.path)
+                .await?;
+            crate::faults::hit(crate::faults::Point::SleepRegistrationRemoved);
+            if workspace.path.exists() {
+                self.filesystem
+                    .remove_tree(&workspace.path)
+                    .map_err(subsystem_error)?;
+            }
+            self.database
+                .suspend_workspace(&workspace.id, &checkpoint.id)?;
+            Ok::<(), EngineError>(())
+        }
+        .await;
+        if let Err(error) = dematerialize {
+            // The tree is still there, so the honest place to leave the
+            // workspace is where it was. If it is not, the `suspending`
+            // reconciliation pass finishes the suspension from the checkpoint.
+            if workspace.path.join(".git").is_file() {
+                let _ = self.database.restore_suspending_workspace(&workspace.id);
+            }
+            return Err(error);
+        }
+        crate::faults::hit(crate::faults::Point::SleepRecorded);
+        Ok(Outcome::Completed(
+            serde_json::to_value(SleepResult {
+                session: session_id,
+                workspace: workspace.id.clone(),
+                checkpoint_id: checkpoint.id,
+                suspended: true,
+                reclaimed_bytes,
+            })
+            .map_err(EngineError::internal)?,
+        ))
+    }
+
+    /// Rematerialize a suspended session.
+    ///
+    /// Wake produces a successor workspace, exactly like restore: a new
+    /// workspace id and a new cwd under the same session id. That is not a
+    /// compromise, it is what keeps every crash-recovery path already proven
+    /// -- a half-built successor is an ordinary incomplete workspace, and the
+    /// suspension it was built from is untouched until the final transaction.
+    async fn wake_session(
+        &self,
+        session_id: SessionId,
+        operation: &OperationId,
+    ) -> Result<Outcome, EngineError> {
+        let session = self
+            .database
+            .session(&session_id)?
+            .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+        let workspace = self
+            .database
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_FOUND", "never"))?;
+        let lifecycle_guard = self
+            .keyed_lock(format!("lifecycle:{}", workspace.id.0))
+            .await;
+        // Re-read under the lock: a concurrent sleep or release may have moved
+        // the session since dispatch.
+        let session = self
+            .database
+            .session(&session_id)?
+            .ok_or_else(|| EngineError::domain("SESSION_NOT_FOUND", "never"))?;
+        let suspended = match session.state.as_str() {
+            // `shade wake` is safe to call unconditionally: a session that
+            // never slept is simply resumed where it already is.
+            "active" | "dormant" | "orphaned" => false,
+            "suspended" => true,
+            _ => {
+                return Err(EngineError::domain("SESSION_ALREADY_RELEASED", "never")
+                    .next("open with a new stable session id"));
+            }
+        };
+        if !suspended {
+            // `reattach_session` takes the same lifecycle lock.
+            drop(lifecycle_guard);
+            return self.reattach_session(session_id, None, operation).await;
+        }
+        let checkpoint = self
+            .database
+            .suspension_checkpoint(&workspace.id)?
+            .ok_or_else(|| {
+                EngineError::domain("SUSPENSION_CHECKPOINT_MISSING", "safe")
+                    .next("shade doctor, then release the workspace if it stays missing")
+            })?;
+        self.database
+            .bind_operation_resource(operation, &workspace.id.0, "wake")?;
+        let successor = self
+            .materialize_checkpoint_successor(
+                &workspace,
+                &checkpoint,
+                operation,
+                SuccessorSource::ImmutableBase,
+                SuccessorSecrets::SuspensionVault,
+            )
+            .await?;
+        crate::faults::hit(crate::faults::Point::WakeMaterialized);
+        let lease_id = LeaseId(format!("lease_{}", ulid::Ulid::new()));
+        let opened = self
+            .opened_session_with_lease(session_id.clone(), &successor, lease_id.clone())
+            .await?;
+        let outcome =
+            Outcome::Completed(serde_json::to_value(opened).map_err(EngineError::internal)?);
+        // Not `prepare_handoff`/`adopt_successor`: adoption requires a live
+        // lease on the predecessor, and a suspended workspace has none.
+        if let Err(error) = self.database.activate_woken_workspace(
+            &session_id,
+            &workspace.id,
+            &successor.id,
+            operation,
+            &lease_id,
+            self.config.lease_ttl_secs,
+            &outcome,
+        ) {
+            // Only the successor is wasted; the suspension is still whole and
+            // a second wake works.
+            let _ = self.database.mark_workspace_state(&successor.id, "failed");
+            return Err(error.into());
+        }
+        crate::faults::hit(crate::faults::Point::WakeActivated);
+        Ok(outcome)
+    }
+
+    /// Sleep dormant workspaces idle for longer than the configured span.
+    ///
+    /// Off unless an operator sets `SHADE_AUTO_SLEEP_DAYS`. Candidates go
+    /// through `sleep_workspace`, so every gate a manual sleep keeps applies
+    /// here too, and one workspace refusing to sleep never stops the sweep.
+    async fn auto_sleep_dormant(&self, operation: &OperationId) -> Result<u64, EngineError> {
+        let Some(after_secs) = self.config.auto_sleep_after_secs else {
+            return Ok(0);
+        };
+        let idle_before = now_ms().saturating_sub(after_secs.saturating_mul(1000));
+        let mut slept = 0_u64;
+        for workspace in self
+            .database
+            .workspaces_in_state_before("dormant", idle_before)?
+        {
+            let selector = WorkspaceSelector {
+                workspace_id: Some(workspace.id.clone()),
+                cwd: None,
+            };
+            match self.sleep_workspace(selector, operation).await {
+                Ok(_) => slept += 1,
+                Err(error) => tracing::warn!(
+                    workspace = %workspace.id,
+                    code = %error.code,
+                    "automatic sleep skipped this workspace"
+                ),
+            }
+        }
+        Ok(slept)
+    }
+
+    /// Release suspended workspaces older than the configured retention.
+    ///
+    /// Releasing is not deleting. This only moves a workspace into the state
+    /// the collector is allowed to look at; GC still applies every one of its
+    /// own gates, and `orphan_grace_secs` still has to elapse afterwards.
+    fn expire_suspended_retention(&self) -> Result<u64, EngineError> {
+        let Some(retention_secs) = self.config.suspended_retention_secs else {
+            return Ok(0);
+        };
+        let suspended_before = now_ms().saturating_sub(retention_secs.saturating_mul(1000));
+        let mut released = 0_u64;
+        for workspace in self
+            .database
+            .workspaces_in_state_before("suspended", suspended_before)?
+        {
+            let Some(session_id) = workspace.session_id.clone() else {
+                continue;
+            };
+            match self.database.release_session(&session_id, &workspace.id) {
+                Ok(()) => released += 1,
+                Err(error) => tracing::warn!(
+                    workspace = %workspace.id,
+                    error = %error,
+                    "suspended workspace could not be released by retention"
+                ),
+            }
+        }
+        Ok(released)
     }
 
     async fn refresh_dependencies(
@@ -2366,6 +2691,7 @@ impl Engine {
                 &checkpoint,
                 operation,
                 SuccessorSource::ParentWorkspace,
+                SuccessorSecrets::ParentTree,
             )
             .await?;
         self.prepare_handoff(&parent, &successor, operation, actor_id)
@@ -2867,16 +3193,34 @@ impl Engine {
         // Release is the one command that must keep working after a lease
         // expires: it is the only door to deletion, so requiring an unexpired
         // lease would make idle work permanently unreleasable.
-        match self.workspace_lifecycle(&workspace)? {
-            Lifecycle::Active { .. } | Lifecycle::Dormant => {}
-            Lifecycle::Suspended => {
-                return Err(EngineError::domain("SESSION_SUSPENDED", "never")
-                    .next("shade wake --session <id>"));
-            }
+        let suspended = match self.workspace_lifecycle(&workspace)? {
+            Lifecycle::Active { .. } | Lifecycle::Dormant => false,
+            Lifecycle::Suspended => true,
             Lifecycle::Released => {
                 return Err(EngineError::domain("WORKSPACE_ALREADY_RELEASED", "never")
                     .next("open a new session"));
             }
+        };
+        // A suspended workspace has no tree, so there is nothing to inspect,
+        // checkpoint or scan for secrets: the sleep checkpoint and the
+        // suspension vault already hold everything it had. Go straight to the
+        // release transaction, which is what makes GC eligible to reclaim both.
+        if suspended {
+            let session_id = workspace
+                .session_id
+                .clone()
+                .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_LEASED", "never"))?;
+            self.database.release_session(&session_id, &workspace.id)?;
+            crate::faults::hit(crate::faults::Point::ReleaseRecorded);
+            return Ok(Outcome::Completed(json!({
+                "session": session_id,
+                "workspace": workspace.id,
+                "checkpoint_id": self
+                    .database
+                    .suspension_checkpoint(&workspace.id)?
+                    .map(|checkpoint| checkpoint.id),
+                "released": true,
+            })));
         }
         let status = self
             .git
@@ -3104,6 +3448,7 @@ impl Engine {
                         &checkpoint,
                         operation,
                         SuccessorSource::ParentWorkspace,
+                        SuccessorSecrets::ParentTree,
                     )
                     .await?;
                 self.secrets
@@ -3634,11 +3979,73 @@ impl Engine {
         Ok(())
     }
 
+    /// Finish or undo suspensions that a crash interrupted.
+    ///
+    /// A `suspending` workspace is deliberately not an "incomplete" one:
+    /// incomplete workspaces get deleted, and this one owns a durable
+    /// checkpoint and a durable vault. If a ready sleep checkpoint exists the
+    /// suspension is rolled forward -- registration and tree removed, record
+    /// marked `suspended` -- and if it does not, the workspace goes back to
+    /// Dormant with its tree untouched. Both branches are idempotent and
+    /// neither ever deletes a record.
+    async fn reconcile_suspending_workspaces(
+        &self,
+        stats: &mut ReconciliationStats,
+    ) -> Result<(), EngineError> {
+        for workspace in self
+            .database
+            .workspaces_in_state_before("suspending", i64::MAX)?
+        {
+            let Some(checkpoint) = self.database.suspension_checkpoint(&workspace.id)? else {
+                self.database.restore_suspending_workspace(&workspace.id)?;
+                stats.suspensions_reverted += 1;
+                continue;
+            };
+            let finish = async {
+                if workspace.path.join(".git").is_file() {
+                    let (_, managed, _) = self.repository_for(&workspace)?;
+                    self.remove_workspace_git_metadata(
+                        &workspace.repository_id,
+                        &managed,
+                        &workspace.path,
+                    )
+                    .await?;
+                }
+                if workspace.path.exists() {
+                    self.filesystem
+                        .remove_tree(&workspace.path)
+                        .map_err(subsystem_error)?;
+                }
+                self.database
+                    .suspend_workspace(&workspace.id, &checkpoint.id)?;
+                Ok::<(), EngineError>(())
+            }
+            .await;
+            match finish {
+                Ok(()) => stats.suspensions_finished += 1,
+                Err(error) => {
+                    tracing::error!(
+                        workspace = %workspace.id,
+                        code = %error.code,
+                        "interrupted suspension could not be finished"
+                    );
+                    stats.suspensions_failed += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn reconcile_workspace_resources(
         &self,
         operation: &OperationId,
     ) -> Result<ReconciliationStats, EngineError> {
         let mut stats = ReconciliationStats::default();
+        // Resolve interrupted suspensions before inventorying anything: after
+        // this every workspace is either cleanly `suspended` or cleanly back
+        // to `dormant`, and the loops below need no special case for the
+        // in-between state.
+        self.reconcile_suspending_workspaces(&mut stats).await?;
         let workspace_root =
             std::fs::canonicalize(self.config.workspaces_dir()).map_err(EngineError::internal)?;
         let repositories = self.database.repositories()?;
@@ -3691,6 +4098,19 @@ impl Engine {
             if is_incomplete_workspace_state(&workspace.state) {
                 if !recovery_claims.contains(&workspace.id.0)
                     && let Some(path) = checked_workspace_path(&workspace.path, &workspace_root)
+                {
+                    preserved_paths.insert(path);
+                }
+                continue;
+            }
+            // A suspended workspace has no tree on purpose. Falling through to
+            // the validity check below would mark every one of them `failed`
+            // on every daemon start and hand them straight to the collector,
+            // which is the single worst thing this function could do. The
+            // `suspending` pass above has already resolved anything mid-flight.
+            if matches!(workspace.state.as_str(), "suspended" | "suspending") {
+                if let Some(path) = checked_workspace_path(&workspace.path, &workspace_root)
+                    && std::fs::symlink_metadata(&workspace.path).is_ok()
                 {
                     preserved_paths.insert(path);
                 }
@@ -4087,6 +4507,8 @@ fn intent_kind(intent: &Intent) -> &'static str {
         Intent::SuccessorAdopt { .. } => "successor_adopt",
         Intent::GarbageCollect => "garbage_collect",
         Intent::SessionReattach { .. } => "session_reattach",
+        Intent::WorkspaceSleep { .. } => "workspace_sleep",
+        Intent::SessionWake { .. } => "session_wake",
         Intent::MaintenanceSweep => "maintenance_sweep",
         Intent::Reconcile => "reconcile",
     }
