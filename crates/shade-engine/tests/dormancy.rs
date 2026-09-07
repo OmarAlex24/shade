@@ -572,6 +572,111 @@ async fn an_unswept_dormant_session_can_still_be_reattached() {
     assert_eq!(session_state(&engine, &opened.session), "active");
 }
 
+/// A long enough lease that a multi-step test still holds a live one, without
+/// leaving the collectability assertions to a timer.
+fn engine_with_lease_ttl(root: &Path, ttl_secs: i64) -> Engine {
+    Engine::with_components(
+        EngineConfig::at(root.join("state"))
+            .with_harness_lifecycle_timing(ttl_secs, 0)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(Vec::new())),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_failed_workspace_with_a_live_lease_can_still_checkpoint_and_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_with_lease_ttl(directory.path(), 120);
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    fs::write(Path::new(&opened.cwd).join("tracked.txt"), "edited\n").unwrap();
+
+    // Reconciliation's verdict, planted directly: the record says `failed`
+    // while the tree is intact and the lease is still live.
+    engine
+        .database()
+        .mark_workspace_state(&opened.workspace, "failed")
+        .unwrap();
+
+    let checkpoint: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "checkpoint-failed",
+                Intent::WorkspaceCheckpoint {
+                    selector: selector(&opened),
+                    reason: "salvage".into(),
+                },
+            ))
+            .await,
+    );
+    assert!(
+        checkpoint["checkpoint_id"].is_string(),
+        "a live lease still owns its workspace: {checkpoint}"
+    );
+
+    let released: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "release-failed",
+                Intent::WorkspaceRelease {
+                    selector: selector(&opened),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(released["released"], true);
+    assert!(
+        released["checkpoint_id"].is_string(),
+        "the release checkpoint still captures the edit: {released}"
+    );
+    assert_eq!(workspace_state(&engine, &opened), "released");
+    assert_eq!(session_state(&engine, &opened.session), "released");
+}
+
+#[tokio::test]
+async fn a_failed_workspace_that_lost_its_tree_is_still_releasable() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture(directory.path());
+    let engine = engine_with_lease_ttl(directory.path(), 120);
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open", open_request(&repository, SESSION, None)))
+            .await,
+    );
+    // The reason reconciliation marks a workspace `failed` in the first place.
+    fs::remove_dir_all(&opened.cwd).unwrap();
+    engine
+        .database()
+        .mark_workspace_state(&opened.workspace, "failed")
+        .unwrap();
+
+    let released: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "release-lost-tree",
+                Intent::WorkspaceRelease {
+                    selector: selector(&opened),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(released["released"], true);
+    assert!(
+        released["checkpoint_id"].is_null(),
+        "there is no tree left to checkpoint: {released}"
+    );
+    assert_eq!(workspace_state(&engine, &opened), "released");
+
+    let collected = collect(&engine, "gc-failed-release").await;
+    assert_eq!(collected["deleted"], 1);
+}
+
 #[tokio::test]
 async fn context_reports_lifecycle_dormant_and_active() {
     let directory = tempfile::tempdir().unwrap();

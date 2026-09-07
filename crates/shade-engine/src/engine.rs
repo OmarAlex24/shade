@@ -2030,10 +2030,20 @@ impl Engine {
     /// another workspace is still a fence — the caller is holding a stale
     /// handle, which is a different failure from simply having gone idle.
     fn workspace_lifecycle(&self, workspace: &WorkspaceRecord) -> Result<Lifecycle, EngineError> {
-        if matches!(workspace.state.as_str(), "released" | "retained" | "failed") {
+        // Only the two states a caller reached on purpose are Released.
+        // `failed` is something reconciliation decided about a workspace whose
+        // owner may still be holding a live lease on it; calling that
+        // "released" took `release` and `checkpoint` away from the one caller
+        // able to salvage the work, and reported data the tree may still hold
+        // as gone. It stays collectible either way.
+        if matches!(workspace.state.as_str(), "released" | "retained") {
             return Ok(Lifecycle::Released);
         }
-        if workspace.state == "suspended" {
+        // `suspending` is a suspension the daemon was killed in the middle of.
+        // Its tree may already be gone, which is exactly what `is_dematerialized`
+        // says about it, so it answers like the suspension it is about to be
+        // rather than like a workspace with a tree to mutate.
+        if matches!(workspace.state.as_str(), "suspended" | "suspending") {
             return Ok(Lifecycle::Suspended);
         }
         let session_id = workspace
@@ -3219,6 +3229,25 @@ impl Engine {
                     .database
                     .suspension_checkpoint(&workspace.id)?
                     .map(|checkpoint| checkpoint.id),
+                "released": true,
+            })));
+        }
+        // A workspace reconciliation marked `failed` has no tree worth
+        // interrogating, and `git status` against it would fail. Release is
+        // the only door to deletion, so a missing tree must not close it:
+        // there is nothing to checkpoint or scan, and everything already
+        // captured stays captured.
+        if !workspace.path.join(".git").is_file() {
+            let session_id = workspace
+                .session_id
+                .clone()
+                .ok_or_else(|| EngineError::domain("WORKSPACE_NOT_LEASED", "never"))?;
+            self.database.release_session(&session_id, &workspace.id)?;
+            crate::faults::hit(crate::faults::Point::ReleaseRecorded);
+            return Ok(Outcome::Completed(json!({
+                "session": session_id,
+                "workspace": workspace.id,
+                "checkpoint_id": Value::Null,
                 "released": true,
             })));
         }
