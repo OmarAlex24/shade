@@ -560,6 +560,13 @@ impl ShadeClient {
             .await?;
         completed_only(outcome, "session reattach")
     }
+
+    async fn wake_session(&self, session_id: SessionId) -> ClientResult<OpenedSession> {
+        let outcome = self
+            .execute_typed::<OpenedSession>(Intent::SessionWake { session_id })
+            .await?;
+        completed_only(outcome, "session wake")
+    }
 }
 
 #[derive(Debug)]
@@ -610,6 +617,15 @@ pub struct HeartbeatResult {
     pub expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SleepResult {
+    pub session: SessionId,
+    pub workspace: WorkspaceId,
+    pub checkpoint_id: CheckpointId,
+    pub suspended: bool,
+    pub reclaimed_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct Sessions {
     client: ShadeClient,
@@ -629,6 +645,15 @@ impl Sessions {
     /// same in-process heartbeat `open` starts.
     pub async fn reattach(&self, session_id: SessionId) -> ClientResult<Session> {
         let opened = self.client.reattach_session(session_id).await?;
+        Ok(Session::new(self.client.clone(), opened))
+    }
+
+    /// Rebuild a suspended session's workspace and take a fresh lease. The
+    /// returned handle has a new workspace id and a new cwd, like restore; the
+    /// session id is the one that went to sleep. Safe to call on a session
+    /// that never slept, which is simply resumed.
+    pub async fn wake(&self, session_id: SessionId) -> ClientResult<Session> {
+        let opened = self.client.wake_session(session_id).await?;
         Ok(Session::new(self.client.clone(), opened))
     }
 
@@ -936,6 +961,22 @@ impl Session {
             self.retire();
         }
         Ok(outcome)
+    }
+
+    /// Free the workspace's disk and keep everything in it. The handle
+    /// retires, exactly as it does on `release`: there is no lease left to
+    /// heartbeat. `sessions.wake(session_id)` brings the work back.
+    pub async fn sleep(&self) -> ClientResult<SleepResult> {
+        self.require_active()?;
+        let outcome = self
+            .client
+            .execute_typed(Intent::WorkspaceSleep {
+                selector: self.selector.clone(),
+            })
+            .await?;
+        let result = completed_only(outcome, "workspace sleep")?;
+        self.retire();
+        Ok(result)
     }
 
     pub async fn heartbeat(&self) -> ClientResult<HeartbeatResult> {

@@ -97,6 +97,8 @@ export type Intent =
   | { kind: "resolution_complete"; selector: WorkspaceSelector }
   | { kind: "workspace_release"; selector: WorkspaceSelector }
   | { kind: "session_reattach"; session_id: SessionId }
+  | { kind: "workspace_sleep"; selector: WorkspaceSelector }
+  | { kind: "session_wake"; session_id: SessionId }
   | { kind: "review_resolve"; review_id: ReviewId; action: ReviewAction }
   | { kind: "successor_adopt"; handoff_id: HandoffId }
   | { kind: "garbage_collect" }
@@ -342,4 +344,18 @@ export type ReviewResolutionResult =
 export interface HeartbeatResult {
   lease: LeaseId;
   expires_at_ms: number;
+}
+
+/**
+ * The result of `workspace_sleep`. The workspace keeps its identity, its
+ * checkpoints and its secrets; only the tree is gone, and `sessions.wake()`
+ * rebuilds it as a successor from `checkpoint_id`.
+ */
+export interface SleepResult {
+  session: SessionId;
+  workspace: WorkspaceId;
+  checkpoint_id: CheckpointId;
+  suspended: boolean;
+  /** Disk reclaimed by removing the tree, measured before removal. */
+  reclaimed_bytes: number;
 }

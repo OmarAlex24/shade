@@ -34,6 +34,8 @@ import {
 interface FakeSession {
   opened: OpenedSessionPayload;
   released: boolean;
+  /** Slept: the record is whole, the tree is gone, there is no lease. */
+  suspended: boolean;
   expires_at_ms: number;
   secret_review: boolean;
 }
@@ -307,6 +309,80 @@ export class FakeShadeDaemon {
           session: opened.session,
           lease: opened.lease,
         });
+        this.completeOperation(
+          socket,
+          requestId,
+          { state: "completed", result: opened },
+          intent.kind,
+          idempotencyKey,
+          actor.id,
+        );
+        return;
+      }
+      case "workspace_sleep": {
+        const session = this.select(intent.selector);
+        const checkpointId = this.next("ckpt", ++this.checkpoint_sequence);
+        session.suspended = true;
+        session.expires_at_ms = 0;
+        // The tree is what sleep gives up; everything else survives.
+        rmSync(session.opened.cwd, { recursive: true, force: true });
+        session.opened = {
+          ...session.opened,
+          compact_context: {
+            ...session.opened.compact_context,
+            lease: "released",
+            lifecycle: "suspended",
+            changes: { staged: 0, unstaged: 0, untracked: 0 },
+          },
+        };
+        this.emit("workspace_suspended", session.opened.workspace, {
+          session: session.opened.session,
+          checkpoint: checkpointId,
+        });
+        this.completeOperation(
+          socket,
+          requestId,
+          {
+            state: "completed",
+            result: {
+              session: session.opened.session,
+              workspace: session.opened.workspace,
+              checkpoint_id: checkpointId,
+              suspended: true,
+              reclaimed_bytes: 4096,
+            },
+          },
+          intent.kind,
+          idempotencyKey,
+          actor.id,
+        );
+        return;
+      }
+      case "session_wake": {
+        const session = this.sessions.get(intent.session_id);
+        if (session === undefined) {
+          throw new FakeRequestError({
+            code: "SESSION_NOT_FOUND",
+            retry: "never",
+          });
+        }
+        if (session.released) {
+          throw new FakeRequestError({
+            code: "SESSION_ALREADY_RELEASED",
+            retry: "never",
+          });
+        }
+        // Waking a session that never slept just resumes it, which is what
+        // makes `wake` safe to call unconditionally.
+        const opened = session.suspended
+          ? this.wakeSuspended(session)
+          : this.renewLease(session);
+        this.emit(
+          session.suspended ? "session_woken" : "session_reattached",
+          opened.workspace,
+          { session: opened.session, lease: opened.lease },
+        );
+        session.suspended = false;
         this.completeOperation(
           socket,
           requestId,
@@ -610,6 +686,7 @@ export class FakeShadeDaemon {
           this.sessions.set(handoff.successor.session, {
             opened: handoff.successor,
             released: false,
+            suspended: false,
             expires_at_ms: Date.now() + this.lease_ttl_ms,
             secret_review: false,
           });
@@ -787,6 +864,7 @@ export class FakeShadeDaemon {
     this.sessions.set(sessionId, {
       opened,
       released: false,
+      suspended: false,
       expires_at_ms: Date.now() + this.lease_ttl_ms,
       secret_review: false,
     });
@@ -810,11 +888,35 @@ export class FakeShadeDaemon {
     return opened;
   }
 
+  /**
+   * Waking produces a successor workspace with a new id and a new cwd under
+   * the session id that went to sleep, exactly as the engine's
+   * `activate_woken_workspace` transaction does.
+   */
+  private wakeSuspended(session: FakeSession): OpenedSessionPayload {
+    const opened = this.buildSession(
+      session.opened.session,
+      session.opened.compact_context.base_sha,
+    );
+    session.opened = opened;
+    session.expires_at_ms = Date.now() + this.lease_ttl_ms;
+    return opened;
+  }
+
   private describeSession(session: FakeSession): SessionStatus {
-    const live = !session.released && session.expires_at_ms >= Date.now();
+    const live =
+      !session.released && !session.suspended && session.expires_at_ms >= Date.now();
+    const lifecycle = session.released
+      ? "released"
+      : session.suspended
+        ? "suspended"
+        : live
+          ? "active"
+          : "dormant";
+    const materialized = existsSync(session.opened.cwd);
     return {
       session: session.opened.session,
-      lifecycle: session.released ? "released" : live ? "active" : "dormant",
+      lifecycle,
       workspace: session.opened.workspace,
       ...(live
         ? {
@@ -822,8 +924,8 @@ export class FakeShadeDaemon {
             lease_expires_at_ms: session.expires_at_ms,
           }
         : {}),
-      cwd: session.opened.cwd,
-      materialized: existsSync(session.opened.cwd),
+      ...(materialized ? { cwd: session.opened.cwd } : {}),
+      materialized,
     };
   }
 

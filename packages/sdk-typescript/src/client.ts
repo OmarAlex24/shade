@@ -28,6 +28,7 @@ import {
   type ReviewResolutionResult,
   type SessionId,
   type SessionStatus,
+  type SleepResult,
   type ScriptApproval,
   type ScriptDecisionResult,
   type TerminalOutcome,
@@ -79,6 +80,12 @@ export interface SessionsApi {
   open(input: OpenSessionInput, options?: MutationOptions): Promise<ShadeSession>;
   /** Renews the lease of a dormant session and returns its live handle. */
   reattach(session_id: SessionId, options?: MutationOptions): Promise<ShadeSession>;
+  /**
+   * Rebuilds a suspended session's workspace and takes a fresh lease. The
+   * handle has a new workspace id and a new cwd, like restore; the session id
+   * is the one that went to sleep. Safe on a session that never slept.
+   */
+  wake(session_id: SessionId, options?: MutationOptions): Promise<ShadeSession>;
   status(session_id: SessionId, options?: CallOptions): Promise<SessionStatus>;
 }
 
@@ -180,6 +187,8 @@ export class ShadeClient {
         this.openSession(input, call),
       reattach: (session_id: SessionId, call?: MutationOptions) =>
         this.reattachSession(session_id, call),
+      wake: (session_id: SessionId, call?: MutationOptions) =>
+        this.wakeSession(session_id, call),
       status: (session_id: SessionId, call?: CallOptions) =>
         this.sessionStatus(session_id, call),
     });
@@ -286,6 +295,20 @@ export class ShadeClient {
     );
     return this.sessionBridge.session(
       completed(outcome, "SESSION_REATTACH_INCOMPLETE"),
+    );
+  }
+
+  private async wakeSession(
+    session_id: SessionId,
+    options?: MutationOptions,
+  ): Promise<ShadeSession> {
+    const outcome = await this.executeAndWait<OpenedSessionPayload>(
+      { kind: "session_wake", session_id },
+      this.deadline(options),
+      this.idempotencyKey(options),
+    );
+    return this.sessionBridge.session(
+      completed(outcome, "SESSION_WAKE_INCOMPLETE"),
     );
   }
 
@@ -857,6 +880,22 @@ export class ShadeSession {
     );
     if (outcome.state === "completed") this.bridge.retire(this);
     return outcome;
+  }
+
+  /**
+   * Frees the workspace's disk and keeps everything in it. The handle retires
+   * exactly as it does on `release`: there is no lease left to heartbeat.
+   * `client.sessions.wake(session_id)` brings the work back.
+   */
+  async sleep(options?: MutationOptions): Promise<SleepResult> {
+    this.assertLive();
+    const outcome = await this.bridge.executeAndWait<SleepResult>(
+      { kind: "workspace_sleep", selector: this.selector() },
+      options,
+    );
+    const result = completed(outcome, "WORKSPACE_SLEEP_INCOMPLETE");
+    this.bridge.retire(this);
+    return result;
   }
 
   private selector() {
