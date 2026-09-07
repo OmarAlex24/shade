@@ -4024,6 +4024,57 @@ impl Engine {
         }
     }
 
+    /// Whether deleting a `failed` workspace's tree would lose a private file.
+    ///
+    /// Nothing was ever leased here -- the open or the wake failed before a
+    /// session existed -- so no agent wrote in this tree. What it holds is the
+    /// base checkout, whatever the checkpoint restored, and the private files
+    /// Shade copied in from the predecessor's tree or its suspension vault.
+    /// The first two are recorded by the repository at these very bytes; the
+    /// third is a duplicate whose source is untouched. A path that is neither
+    /// is the only copy of something, and the caller keeps the workspace and
+    /// asks for a decision exactly as before.
+    async fn failed_workspace_is_preserved_elsewhere(
+        &self,
+        workspace: &WorkspaceRecord,
+    ) -> Result<bool, EngineError> {
+        let discovered = crate::secrets::discover_secret_paths(&workspace.path)
+            .map_err(EngineError::internal)?;
+        if discovered.is_empty() {
+            return Ok(true);
+        }
+        let mut carried = discovered;
+        if workspace.path.join(".git").is_file() {
+            let recorded = self
+                .git
+                .paths_recorded_at_head(&workspace.path, &carried)
+                .await
+                .map_err(subsystem_error)?;
+            carried.retain(|path| !recorded.contains(path));
+        }
+        if carried.is_empty() {
+            return Ok(true);
+        }
+        let Some(predecessor) = workspace.predecessor_id.as_ref() else {
+            return Ok(false);
+        };
+        let record = self.database.workspace(predecessor)?;
+        let tree = record
+            .as_ref()
+            .map(|record| record.path.as_path())
+            .filter(|path| path.exists());
+        for path in &carried {
+            if !self
+                .secrets
+                .is_preserved_elsewhere(predecessor, tree, path, &workspace.path)
+                .map_err(EngineError::internal)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn garbage_collect(&self, operation: &OperationId) -> Result<Outcome, EngineError> {
         let grace_before = now_ms() - self.config.orphan_grace_secs * 1000;
         let candidates = self.database.gc_candidates(grace_before)?;
@@ -4044,7 +4095,24 @@ impl Engine {
                 }
             };
             let registered_worktree = workspace.path.join(".git").is_file();
+            // A `failed` workspace never reached `capture`: it is the last step
+            // of an open and of successor materialization, after the
+            // dependency preparation and the checkpoint restore that are what
+            // fail. Judging its tree against the baseline it therefore does not
+            // have reads every file the content detector recognizes as newly
+            // added private material, committed source included, and opens a
+            // `secret_cleanup` review for a tree that holds nothing anyone has
+            // to decide about. Ask the question that is actually load-bearing
+            // instead, and fall through to the review for anything it cannot
+            // answer -- including its own failure to read the tree.
+            let preserved = workspace.state == "failed"
+                && workspace.path.exists()
+                && self
+                    .failed_workspace_is_preserved_elsewhere(&workspace)
+                    .await
+                    .unwrap_or(false);
             if workspace.path.exists()
+                && !preserved
                 && !matches!(self.secret_cleanup_review(&workspace, true), Ok(None))
             {
                 skipped += 1;

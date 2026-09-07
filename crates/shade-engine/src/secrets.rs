@@ -245,6 +245,38 @@ impl SecretStore {
         Ok(manifest.files)
     }
 
+    /// Whether a private file a workspace is holding is already held for it
+    /// somewhere the workspace's deletion does not reach.
+    ///
+    /// Every private file a workspace did not create arrives by copy:
+    /// `copy_workspace_secrets` reads the predecessor's tree and
+    /// `restore_suspension` reads its vault, and neither consumes the source.
+    /// A failed successor is therefore holding a duplicate of bytes that are
+    /// still where they came from -- which is why a failed wake leaves the
+    /// suspension whole and a second wake works -- and deleting it loses
+    /// nothing. Bytes that match neither source are the only copy and are not
+    /// this function's to give away.
+    pub fn is_preserved_elsewhere(
+        &self,
+        predecessor: &WorkspaceId,
+        predecessor_tree: Option<&Path>,
+        path: &str,
+        workspace: &Path,
+    ) -> Result<bool, SecretError> {
+        let held = secure_workspace_path(workspace, path, false)?;
+        if let Some(tree) = predecessor_tree
+            && let Ok(candidate) = secure_workspace_path(tree, path, false)
+            && same_contents(&held, &candidate)?
+        {
+            return Ok(true);
+        }
+        let vaulted = self
+            .suspension_root(predecessor)
+            .join("files")
+            .join(Path::new(path));
+        same_contents(&held, &vaulted)
+    }
+
     pub fn preview_current(
         &self,
         baseline_id: &WorkspaceId,
@@ -919,6 +951,39 @@ fn parse_private_json(bytes: &[u8]) -> Result<serde_json::Value, serde_json::Err
     let Unique(value) = Unique::deserialize(&mut deserializer)?;
     deserializer.end()?;
     Ok(value)
+}
+
+/// Whether two files hold the same bytes, without holding either whole.
+///
+/// A detected secret is usually a few hundred bytes, but the content scanner
+/// matches on any file's contents and this comparison must not become the
+/// place where a large one is read into memory.
+fn same_contents(left: &Path, right: &Path) -> Result<bool, SecretError> {
+    let (Ok(left_metadata), Ok(right_metadata)) =
+        (fs::symlink_metadata(left), fs::symlink_metadata(right))
+    else {
+        return Ok(false);
+    };
+    if !left_metadata.is_file() || !right_metadata.is_file() {
+        return Ok(false);
+    }
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    let mut left = std::io::BufReader::new(fs::File::open(left)?);
+    let mut right = std::io::BufReader::new(fs::File::open(right)?);
+    let mut left_chunk = [0_u8; 64 * 1024];
+    let mut right_chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut left, &mut left_chunk)?;
+        if read == 0 {
+            return Ok(std::io::Read::read(&mut right, &mut right_chunk)? == 0);
+        }
+        std::io::Read::read_exact(&mut right, &mut right_chunk[..read])?;
+        if left_chunk[..read] != right_chunk[..read] {
+            return Ok(false);
+        }
+    }
 }
 
 fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, SecretError> {

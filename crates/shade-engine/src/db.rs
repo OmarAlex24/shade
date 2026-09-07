@@ -2873,6 +2873,19 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        // Queued for deletion is not the same as leaving on its own. A pending
+        // review takes a workspace out of GC candidacy entirely and only a
+        // person can put it back, so a `failed` workspace waiting on one is
+        // the disk nothing will reclaim until someone answers. Counting it
+        // separately is what turns "GC keeps skipping these" into a number
+        // with a command attached to it.
+        let failed_awaiting_review: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM workspaces w WHERE w.state='failed' \
+             AND EXISTS (SELECT 1 FROM reviews r WHERE r.workspace_id=w.id \
+               AND r.state='pending')",
+            [],
+            |row| row.get(0),
+        )?;
         let suspended_without_checkpoint: i64 = connection.query_row(
             "SELECT COUNT(*) FROM workspaces w WHERE w.state='suspended' \
              AND NOT EXISTS (SELECT 1 FROM checkpoints c WHERE c.workspace_id=w.id \
@@ -2899,6 +2912,7 @@ impl Database {
             "workspaces_suspended": suspended_workspaces,
             "workspaces_suspending": suspending_workspaces,
             "workspaces_failed": failed_workspaces,
+            "workspaces_failed_awaiting_review": failed_awaiting_review,
             "suspended_without_checkpoint": suspended_without_checkpoint,
             "tracked_secret_matches": tracked_secret_matches,
         }))

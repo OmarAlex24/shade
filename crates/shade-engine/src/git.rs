@@ -2130,6 +2130,71 @@ impl GitStore {
         parse_status(&output.stdout)
     }
 
+    /// The paths this worktree holds exactly as its HEAD commit records them.
+    ///
+    /// Committed content is the repository owner's decision, not private
+    /// material Shade is holding for someone: a file the repository already
+    /// carries at these very bytes survives the deletion of any working copy,
+    /// because the copy is not where it lives. `validate_checkout_policy` says
+    /// the same thing about blob contents, and the clean filter admits bytes
+    /// whose object ID the repository already records.
+    ///
+    /// Tracked is not enough on its own -- a modification is new content, and
+    /// so is a file that only the index holds -- so a path is reported only
+    /// when Git tracks it and neither the index nor the working tree differs
+    /// from HEAD. Both listings are read whole rather than by pathspec: a
+    /// candidate list long enough to matter is also long enough to overrun the
+    /// argument limit, and the names cost less than the traversal `status`
+    /// already pays on the same tree. The clean filter is disabled for the
+    /// same reason `status` disables it.
+    pub async fn paths_recorded_at_head(
+        &self,
+        worktree: &Path,
+        candidates: &[String],
+    ) -> anyhow::Result<BTreeSet<String>> {
+        if candidates.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let filter = [
+            OsString::from("-c"),
+            OsString::from("filter.shade-content.process="),
+            OsString::from("-c"),
+            OsString::from("filter.shade-content.required=false"),
+        ];
+        let mut tracked_args = filter.to_vec();
+        tracked_args.extend([
+            OsString::from("ls-files"),
+            OsString::from("--cached"),
+            OsString::from("-z"),
+        ]);
+        let tracked = self
+            .run_raw(Some(worktree), &tracked_args, &[], None)
+            .await?;
+        self.require_success(&tracked)?;
+        let mut recorded = utf8_paths(&tracked.stdout);
+
+        let mut changed_args = filter.to_vec();
+        changed_args.extend([
+            OsString::from("diff"),
+            OsString::from("--name-only"),
+            OsString::from("-z"),
+            OsString::from("--ignore-submodules=none"),
+            OsString::from("HEAD"),
+        ]);
+        let changed = self
+            .run_raw(Some(worktree), &changed_args, &[], None)
+            .await?;
+        self.require_success(&changed)?;
+        for path in utf8_paths(&changed.stdout) {
+            recorded.remove(&path);
+        }
+        Ok(candidates
+            .iter()
+            .filter(|path| recorded.contains(*path))
+            .cloned()
+            .collect())
+    }
+
     /// Capture the detached HEAD, the user's real index, and the working tree
     /// as three independently recoverable states. Two consecutive complete
     /// captures must agree before any retention ref is created. That
@@ -3985,6 +4050,18 @@ fn reject_filter_attributes(bytes: &[u8]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The NUL-separated paths of a Git listing, dropping any name Git could not
+/// give us as UTF-8. A non-UTF-8 name simply fails to match a candidate, which
+/// is the conservative answer everywhere this is used.
+fn utf8_paths(stdout: &[u8]) -> BTreeSet<String> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_status(bytes: &[u8]) -> anyhow::Result<WorktreeStatus> {
