@@ -579,3 +579,302 @@ async fn stale_secret_decisions_cannot_discard_later_edits() {
             .exists()
     );
 }
+
+/// A provider that refuses preparation the way a stale lockfile does.
+///
+/// `open` and successor materialization both prepare dependencies before
+/// capturing the workspace's secret baseline, so a refusal here reproduces the
+/// exact shape a real `DEPENDENCY_LOCK_STALE` leaves behind: a `failed`
+/// workspace with a registered worktree, a clean tree at its base commit and
+/// no baseline of its own.
+struct RefusingDependencies {
+    ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl shade_engine::dependencies::DependencyProvider for RefusingDependencies {
+    fn name(&self) -> &'static str {
+        "fixture-lock"
+    }
+    fn applies(&self, _root: &Path) -> bool {
+        true
+    }
+    async fn ensure_ready(
+        &self,
+        _context: &shade_engine::dependencies::DependencyContext<'_>,
+    ) -> Result<
+        shade_engine::dependencies::DependencyReceipt,
+        shade_engine::dependencies::DependencyError,
+    > {
+        if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(shade_engine::dependencies::DependencyError::LockStale(
+                "fixture lockfile does not match its manifest".into(),
+            ));
+        }
+        Ok(shade_engine::dependencies::DependencyReceipt {
+            provider: "fixture-lock".into(),
+            fingerprint: "b".repeat(64),
+            state: "ready".into(),
+            materialized_paths: vec![],
+            blocked_builds: vec![],
+            scripts: vec![],
+        })
+    }
+}
+
+/// A repository whose committed source matches the local secret detector.
+///
+/// This is the ordinary shape, not a contrived one: a client that names its
+/// bearer token in a literal. `survey_tracked_secrets` records such a base and
+/// admits it -- committed content is the repository owner's decision -- so
+/// nothing downstream may treat it as private material the workspace produced.
+fn fixture_with_committed_credential(root: &Path) -> PathBuf {
+    let repository = fixture(root);
+    fs::write(
+        repository.join("client.rs"),
+        "let token = \"7fbz3qkxWr92Ldv6\";\n",
+    )
+    .unwrap();
+    git(&repository, &["add", "client.rs"]);
+    git(&repository, &["commit", "-m", "committed credential"]);
+    repository
+}
+
+fn engine_with(root: &Path, ready: &Arc<std::sync::atomic::AtomicBool>) -> Engine {
+    Engine::with_components(
+        EngineConfig::at(root.join("state"))
+            .with_harness_lifecycle_timing(120, 0)
+            .unwrap(),
+        Arc::new(CopyFilesystem),
+        Arc::new(DependencyService::new(vec![Box::new(
+            RefusingDependencies {
+                ready: Arc::clone(ready),
+            },
+        )])),
+    )
+    .unwrap()
+}
+
+fn failed_workspaces(engine: &Engine) -> Vec<shade_engine::db::WorkspaceRecord> {
+    engine
+        .database()
+        .workspaces_in_state_before("failed", i64::MAX)
+        .unwrap()
+}
+
+fn open_intent(session: &str, repository: &Path) -> Intent {
+    Intent::SessionOpen(OpenSession {
+        session_id: SessionId(session.into()),
+        repository: RepositoryLocator::Local {
+            path: repository.to_string_lossy().into_owned(),
+        },
+        base: Some("main".into()),
+        intent: None,
+    })
+}
+
+/// A dependency failure leaves a workspace GC has to be able to reclaim.
+///
+/// `open` refuses a stale lockfile after the worktree is registered and before
+/// the secret baseline is captured, so the tree it abandons is a clean
+/// checkout of the base commit and nothing more. GC kept every one of them:
+/// with no baseline to compare against, every committed file the detector
+/// recognizes read as newly added private material, and the collector opened
+/// a `secret_cleanup` review for a tree holding only committed source.
+#[tokio::test]
+async fn a_failed_dependency_open_is_reclaimed() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture_with_committed_credential(directory.path());
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine = engine_with(directory.path(), &ready);
+
+    let response = engine
+        .execute(execute(
+            "open-stale",
+            open_intent("stale-lock", &repository),
+        ))
+        .await;
+    let ResponseBody::Error { error } = response.body else {
+        panic!("a stale lockfile must refuse the open");
+    };
+    assert_eq!(error.code, "DEPENDENCY_LOCK_STALE");
+
+    let [workspace] = failed_workspaces(&engine).try_into().unwrap();
+    assert!(workspace.path.join(".git").is_file());
+    assert!(workspace.path.join("client.rs").is_file());
+    std::thread::sleep(Duration::from_millis(2));
+
+    let result: serde_json::Value =
+        completed(engine.execute(execute("gc", Intent::GarbageCollect)).await);
+    assert_eq!(result["eligible"].as_u64(), Some(1));
+    assert_eq!(result["deleted"].as_u64(), Some(1), "{result}");
+    assert!(!workspace.path.exists(), "the tree survived collection");
+    assert!(
+        engine
+            .database()
+            .workspace(&workspace.id)
+            .unwrap()
+            .is_none(),
+        "the record survived collection"
+    );
+    assert!(
+        engine
+            .database()
+            .latest_secret_review(&workspace.id)
+            .unwrap()
+            .is_none(),
+        "committed content asked a human for a decision"
+    );
+    let registrations = engine
+        .database()
+        .repository_by_id(&workspace.repository_id)
+        .unwrap()
+        .unwrap()
+        .bare_path
+        .join("worktrees");
+    assert!(
+        !registrations.join(workspace.id.0.as_str()).exists(),
+        "the worktree registration survived collection"
+    );
+}
+
+/// A wake that fails after restoring the vault leaves private files behind.
+///
+/// The successor holds a copy of what the predecessor vaulted, and the vault
+/// is the original: `restore_suspension` reads it and the failed wake leaves
+/// the suspension whole, which is why a second wake works. Collecting the
+/// successor therefore loses nothing -- but GC kept it, for the same missing
+/// baseline as above.
+#[tokio::test]
+async fn a_failed_wake_successor_is_reclaimed_while_its_vault_stays_whole() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture_with_committed_credential(directory.path());
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let engine = engine_with(directory.path(), &ready);
+
+    let opened: OpenedSession = completed(
+        engine
+            .execute(execute("open-wake", open_intent("waking", &repository)))
+            .await,
+    );
+    let workspace_path = PathBuf::from(&opened.cwd);
+    fs::write(workspace_path.join(".env.local"), "TOKEN=vaulted-value\n").unwrap();
+    let _: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "sleep",
+                Intent::WorkspaceSleep {
+                    selector: WorkspaceSelector {
+                        workspace_id: Some(opened.workspace.clone()),
+                        cwd: None,
+                    },
+                },
+            ))
+            .await,
+    );
+    let vault = directory
+        .path()
+        .join("state/secrets")
+        .join(&opened.workspace.0)
+        .join("suspended");
+    assert!(vault.join("manifest.json").is_file());
+
+    ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    let response = engine
+        .execute(execute(
+            "wake",
+            Intent::SessionWake {
+                session_id: opened.session.clone(),
+            },
+        ))
+        .await;
+    let ResponseBody::Error { error } = response.body else {
+        panic!("a stale lockfile must refuse the wake");
+    };
+    assert_eq!(error.code, "DEPENDENCY_LOCK_STALE");
+
+    let [successor] = failed_workspaces(&engine).try_into().unwrap();
+    assert_eq!(successor.predecessor_id.as_ref(), Some(&opened.workspace));
+    assert_eq!(
+        fs::read_to_string(successor.path.join(".env.local")).unwrap(),
+        "TOKEN=vaulted-value\n",
+        "the successor must be holding the restored vault"
+    );
+    std::thread::sleep(Duration::from_millis(2));
+
+    let result: serde_json::Value =
+        completed(engine.execute(execute("gc", Intent::GarbageCollect)).await);
+    assert_eq!(result["deleted"].as_u64(), Some(1), "{result}");
+    assert!(!successor.path.exists());
+    assert!(
+        engine
+            .database()
+            .workspace(&successor.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fs::read_to_string(vault.join("files/.env.local")).unwrap(),
+        "TOKEN=vaulted-value\n",
+        "collecting the successor took the vault with it"
+    );
+    assert_eq!(
+        engine
+            .database()
+            .workspace(&opened.workspace)
+            .unwrap()
+            .unwrap()
+            .state,
+        "suspended",
+        "the suspension must survive its successor"
+    );
+}
+
+/// A private file nothing else holds still stops the collector.
+///
+/// The reclaim above is licensed by preservation, not by the `failed` state:
+/// bytes that are neither committed content nor a copy of something the
+/// predecessor still holds are the workspace's only copy, and they get the
+/// same actionable review any other undecided secret gets.
+#[tokio::test]
+async fn a_failed_workspace_keeps_a_private_file_nothing_else_holds() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = fixture_with_committed_credential(directory.path());
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine = engine_with(directory.path(), &ready);
+    let _ = engine
+        .execute(execute(
+            "open-stale",
+            open_intent("stale-lock", &repository),
+        ))
+        .await;
+    let [workspace] = failed_workspaces(&engine).try_into().unwrap();
+    fs::write(workspace.path.join(".env.local"), "TOKEN=only-copy\n").unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+
+    let result: serde_json::Value =
+        completed(engine.execute(execute("gc", Intent::GarbageCollect)).await);
+    assert_eq!(result["deleted"].as_u64(), Some(0), "{result}");
+    assert_eq!(result["skipped"].as_u64(), Some(1));
+    assert_eq!(
+        fs::read_to_string(workspace.path.join(".env.local")).unwrap(),
+        "TOKEN=only-copy\n"
+    );
+    let review = engine
+        .database()
+        .latest_secret_review(&workspace.id)
+        .unwrap()
+        .expect("an unpreserved private file must ask for a decision");
+    assert_eq!(review.state, "pending");
+    // The review takes the workspace out of GC candidacy until a person
+    // answers it, which is disk nothing reclaims on its own. `doctor` names it.
+    let health = engine.database().doctor().unwrap();
+    assert_eq!(health["workspaces_failed"], 1);
+    assert_eq!(health["workspaces_failed_awaiting_review"], 1);
+    let again: serde_json::Value = completed(
+        engine
+            .execute(execute("gc-again", Intent::GarbageCollect))
+            .await,
+    );
+    assert_eq!(again["eligible"].as_u64(), Some(0), "{again}");
+}
