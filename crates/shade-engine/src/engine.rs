@@ -705,12 +705,30 @@ impl Engine {
                 session_id,
                 lease_id,
             } => {
-                let lease = self
-                    .database
-                    .heartbeat(&session_id, &lease_id, self.config.lease_ttl_secs)?
-                    .ok_or_else(|| {
-                        EngineError::domain("LEASE_EXPIRED", "never").next("open a new session")
-                    })?;
+                let lease = match self.database.heartbeat(
+                    &session_id,
+                    &lease_id,
+                    self.config.lease_ttl_secs,
+                )? {
+                    Some(lease) => lease,
+                    // Sleeping releases the lease, so a suspended session
+                    // looks exactly like an expired one from here. Saying
+                    // `LEASE_EXPIRED` would send the caller into a reattach
+                    // that cannot succeed; name the suspension and the command
+                    // that ends it instead.
+                    None => {
+                        let suspended =
+                            self.database.session(&session_id)?.is_some_and(|session| {
+                                matches!(session.state.as_str(), "suspended" | "suspending")
+                            });
+                        return Err(if suspended {
+                            EngineError::domain("SESSION_SUSPENDED", "never")
+                                .next(format!("shade wake --session {}", session_id.0))
+                        } else {
+                            EngineError::domain("LEASE_EXPIRED", "never").next("open a new session")
+                        });
+                    }
+                };
                 Ok(Outcome::Completed(json!({
                     "lease": lease.id,
                     "expires_at_ms": lease.expires_at_ms,

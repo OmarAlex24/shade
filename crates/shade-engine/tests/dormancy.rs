@@ -1365,3 +1365,49 @@ async fn auto_sleep_and_suspended_retention_are_off_by_default_and_fire_when_con
         "retention releases; only GC ever deletes"
     );
 }
+
+/// Sleeping releases the lease, so a heartbeat on a suspended session finds
+/// nothing and used to answer `LEASE_EXPIRED` -- the code that means "dormant,
+/// reattach". Every SDK then spent a round trip on a reattach that cannot wake
+/// anything. The heartbeat names the suspension instead, and the codes both
+/// SDKs treat as terminal now include it.
+#[tokio::test]
+async fn a_heartbeat_on_a_suspended_session_names_the_suspension_not_an_expiry() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, opened, _) = suspended_session(directory.path(), Vec::new()).await;
+
+    let error = failed(
+        engine
+            .execute(execute(
+                "heartbeat-suspended",
+                Intent::LeaseHeartbeat {
+                    session_id: opened.session.clone(),
+                    lease_id: opened.lease.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(error.code, "SESSION_SUSPENDED");
+    assert_eq!(error.retry, "never");
+    assert_eq!(
+        error.next.as_deref(),
+        Some(format!("shade wake --session {}", opened.session.0).as_str()),
+        "the error carries the one command that ends the suspension"
+    );
+
+    // A woken session heartbeats again, so the code really is about the
+    // suspension and not about the lease id being unknown.
+    let woken: OpenedSession = completed(wake(&engine, "wake-then-beat", &opened.session).await);
+    let beat: serde_json::Value = completed(
+        engine
+            .execute(execute(
+                "heartbeat-woken",
+                Intent::LeaseHeartbeat {
+                    session_id: woken.session.clone(),
+                    lease_id: woken.lease.clone(),
+                },
+            ))
+            .await,
+    );
+    assert_eq!(beat["lease"], serde_json::json!(woken.lease.0));
+}

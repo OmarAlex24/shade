@@ -40,6 +40,25 @@ import { NdjsonUnixTransport } from "./transport.ts";
 const retireHandle = Symbol("shade.retireHandle");
 const refreshHandle = Symbol("shade.refreshHandle");
 
+/**
+ * Codes that no amount of heartbeating recovers from. `LEASE_EXPIRED` is in
+ * the set because it reaches the check only after the one reattach attempt has
+ * been declined or has failed; every other code names a session or workspace
+ * that is gone, superseded, or asleep. `SESSION_SUSPENDED` belongs here too: a
+ * sleeping workspace has no tree to heartbeat for, and only an explicit
+ * `wake()` brings it back.
+ */
+const TERMINAL_LEASE_ERRORS = new Set([
+  "LEASE_EXPIRED",
+  "LEASE_FENCED",
+  "WORKSPACE_RELEASED",
+  "WORKSPACE_ALREADY_RELEASED",
+  "WORKSPACE_NOT_MATERIALIZED",
+  "SESSION_ALREADY_RELEASED",
+  "SESSION_NOT_FOUND",
+  "SESSION_SUSPENDED",
+]);
+
 export interface ShadeClientOptions {
   socket: string;
   actor: Actor;
@@ -932,12 +951,7 @@ export class ShadeSession {
     } catch (error) {
       const code = asShadeError(error).code;
       if (code === "LEASE_EXPIRED" && (await this.reattachOnce())) return;
-      if (
-        code === "LEASE_EXPIRED" ||
-        code === "LEASE_FENCED" ||
-        code === "WORKSPACE_RELEASED" ||
-        code === "SESSION_ALREADY_RELEASED"
-      ) {
+      if (TERMINAL_LEASE_ERRORS.has(code)) {
         this.bridge.retire(this);
       }
     } finally {

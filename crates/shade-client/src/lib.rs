@@ -1204,10 +1204,23 @@ fn completed_only<T>(outcome: TerminalOutcome<T>, operation: &'static str) -> Cl
     }
 }
 
+/// Codes that no amount of heartbeating recovers from. `LEASE_EXPIRED` is in
+/// the list because it reaches here only after the one reattach attempt has
+/// been declined or has failed; every other code names a session or workspace
+/// that is gone, superseded, or asleep. `SESSION_SUSPENDED` belongs here too:
+/// a sleeping workspace has no tree to heartbeat for, and only `session_wake`
+/// -- an explicit call the host has to make -- brings it back.
 fn terminal_lease_error(code: &str) -> bool {
     matches!(
         code,
-        "LEASE_EXPIRED" | "LEASE_FENCED" | "WORKSPACE_RELEASED" | "SESSION_ALREADY_RELEASED"
+        "LEASE_EXPIRED"
+            | "LEASE_FENCED"
+            | "WORKSPACE_RELEASED"
+            | "WORKSPACE_ALREADY_RELEASED"
+            | "WORKSPACE_NOT_MATERIALIZED"
+            | "SESSION_ALREADY_RELEASED"
+            | "SESSION_NOT_FOUND"
+            | "SESSION_SUSPENDED"
     )
 }
 
@@ -1900,6 +1913,94 @@ mod tests {
         }
         assert!(!session.is_active());
         assert_eq!(reattachments.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    /// A slept workspace has no tree to heartbeat for. The handle has to stop
+    /// on `SESSION_SUSPENDED` -- and without trying a reattach, which is the
+    /// dormancy recovery and cannot wake anything.
+    #[tokio::test]
+    async fn a_suspension_retires_the_handle_without_attempting_a_reattach() {
+        let Some((temp, listener)) = test_listener() else {
+            return;
+        };
+        let socket = temp.path().join("shade.sock");
+        let reattachments = Arc::new(AtomicUsize::new(0));
+        let counted = reattachments.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut frame = Vec::new();
+                    if reader.read_until(b'\n', &mut frame).await.is_err() {
+                        return;
+                    }
+                    let Some(newline) = frame.iter().position(|byte| *byte == b'\n') else {
+                        return;
+                    };
+                    let request: WireRequest = serde_json::from_slice(&frame[..newline]).unwrap();
+                    let request_id = wire_request_id(&request).to_owned();
+                    if let WireRequest::Execute(ExecuteRequest {
+                        intent: Intent::SessionReattach { .. },
+                        ..
+                    }) = request
+                    {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let mut encoded = serde_json::to_vec(&WireResponse {
+                        v: PROTOCOL_VERSION,
+                        request_id,
+                        body: ResponseBody::Error {
+                            error: ShadeError {
+                                code: "SESSION_SUSPENDED".into(),
+                                retry: "never".into(),
+                                operation: None,
+                                next: Some("shade wake --session <id>".into()),
+                                diagnostics_id: None,
+                            },
+                        },
+                    })
+                    .unwrap();
+                    encoded.push(b'\n');
+                    let _ = writer.write_all(&encoded).await;
+                });
+            }
+        });
+        let client = ShadeClient::with_options(
+            &socket,
+            Actor {
+                kind: ActorKind::Agent,
+                id: "suspend-test".into(),
+            },
+            ShadeClientOptions {
+                request_timeout: Duration::from_millis(200),
+                operation_timeout: Duration::from_millis(200),
+                heartbeat_interval: Duration::from_millis(10),
+                ..ShadeClientOptions::default()
+            },
+        )
+        .unwrap();
+        let session = Session::new(client, opened("lease-first"));
+        for _ in 0..200 {
+            if !session.is_active() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !session.is_active(),
+            "a suspended session must stop the heartbeat"
+        );
+        assert_eq!(
+            reattachments.load(Ordering::SeqCst),
+            0,
+            "a reattach cannot wake a suspension and must not be attempted"
+        );
         server.abort();
     }
 

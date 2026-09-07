@@ -714,6 +714,16 @@ export class FakeShadeDaemon {
         if (session.opened.lease !== intent.lease_id) {
           throw new FakeRequestError({ code: "LEASE_FENCED", retry: "never" });
         }
+        // Sleeping releases the lease too, so a suspension would otherwise be
+        // indistinguishable from a dormancy -- and send the caller into a
+        // reattach that cannot succeed. Name it, and the command that ends it.
+        if (session.suspended) {
+          throw new FakeRequestError({
+            code: "SESSION_SUSPENDED",
+            retry: "never",
+            next: `shade wake --session ${intent.session_id}`,
+          });
+        }
         // An expired lease leaves the session dormant, not released: the
         // workspace survives and a `session_reattach` brings it back.
         if (session.expires_at_ms < Date.now()) {
