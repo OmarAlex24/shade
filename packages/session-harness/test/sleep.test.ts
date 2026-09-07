@@ -234,6 +234,39 @@ test("the fake daemon refuses a sleep exactly where the daemon refuses one", asy
   expect(unwakeable.error.retry).toBe("never");
 });
 
+test("a suspension whose vault is gone refuses to wake instead of losing it", async () => {
+  daemon = new FakeShadeDaemon(60_000);
+  await daemon.start();
+  const client = new ShadeClient({
+    socket: daemon.socket,
+    actor: { kind: "agent", id: "vault-missing" },
+    heartbeat_interval_ms: 3_600_000,
+  });
+
+  const session = await client.sessions.open({
+    session_id: "chat-vault-missing",
+    repository: { kind: "local", path: "/repo" },
+  });
+  await session.sleep();
+  // Every sleep writes a vault, with a manifest even for a workspace that had
+  // no private files, so its absence is a loss rather than an empty vault.
+  daemon.loseSuspensionVault("chat-vault-missing");
+
+  // The refusal names the vault rather than rebuilding the workspace without
+  // its secrets, and it is terminal: nothing the host retries restores a
+  // directory that is gone.
+  await expect(client.sessions.wake("chat-vault-missing")).rejects.toMatchObject({
+    code: "SUSPENSION_VAULT_MISSING",
+    retry: "never",
+  });
+
+  // The suspension is still there to release or restore by hand, so the
+  // refusal costs the caller nothing it had before.
+  expect((await client.sessions.status("chat-vault-missing")).lifecycle).toBe(
+    "suspended",
+  );
+});
+
 test("a released workspace and a superseded lease answer in the daemon's words", async () => {
   daemon = new FakeShadeDaemon(60_000);
   await daemon.start();

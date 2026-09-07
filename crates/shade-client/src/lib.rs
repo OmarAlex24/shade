@@ -1877,8 +1877,14 @@ mod tests {
         // `SESSION_SUSPENDED` was already terminal; `WORKSPACE_NOT_LEASED` is
         // sent by seven engine paths with `retry: never` and was in neither
         // SDK's set, so a handle kept heartbeating into an answer that will
-        // never change.
-        for code in ["SESSION_SUSPENDED", "WORKSPACE_NOT_LEASED"] {
+        // never change. `SUSPENSION_VAULT_MISSING` is the newest of them: a
+        // suspension whose vaulted private files are gone cannot be woken by
+        // anything the SDK can do on its own.
+        for code in [
+            "SESSION_SUSPENDED",
+            "WORKSPACE_NOT_LEASED",
+            "SUSPENSION_VAULT_MISSING",
+        ] {
             terminal_answer_retires_the_handle(code).await;
         }
     }

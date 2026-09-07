@@ -41,6 +41,11 @@ interface FakeSession {
   /** The `sleep` checkpoint a wake rebuilds from. A suspension without one is
    * unwakeable, which is what `SUSPENSION_CHECKPOINT_MISSING` names. */
   suspension_checkpoint?: string | undefined;
+  /** The vault holding the private files the tree took with it. Every sleep
+   * writes one, so its absence is a loss and not an empty vault, and the wake
+   * refuses with `SUSPENSION_VAULT_MISSING` rather than handing back a tree
+   * whose `.env.local` has quietly gone. */
+  suspension_vault: boolean;
   expires_at_ms: number;
   secret_review: boolean;
 }
@@ -134,6 +139,18 @@ export class FakeShadeDaemon {
     const session = this.sessions.get(session_id);
     if (session === undefined) throw new Error(`no session ${session_id}`);
     session.suspension_checkpoint = undefined;
+  }
+
+  /**
+   * Take away the vault a suspension restores its private files from, which
+   * is the shape a suspended workspace is in when something outside Shade
+   * removed it. The daemon refuses the wake outright rather than rebuilding
+   * the tree without them.
+   */
+  loseSuspensionVault(session_id: string): void {
+    const session = this.sessions.get(session_id);
+    if (session === undefined) throw new Error(`no session ${session_id}`);
+    session.suspension_vault = false;
   }
 
   get active_leases(): number {
@@ -360,6 +377,9 @@ export class FakeShadeDaemon {
         const sleptCwd = session.opened.cwd;
         session.suspended = true;
         session.suspension_checkpoint = checkpointId;
+        // Written before the tree goes, and written even when there was
+        // nothing private to put in it.
+        session.suspension_vault = true;
         session.expires_at_ms = 0;
         // The tree is what sleep gives up; everything else survives.
         rmSync(session.opened.cwd, { recursive: true, force: true });
@@ -421,6 +441,13 @@ export class FakeShadeDaemon {
             next: "shade release --session <id>",
           });
         }
+        if (session.suspended && !session.suspension_vault) {
+          throw new FakeRequestError({
+            code: "SUSPENSION_VAULT_MISSING",
+            retry: "never",
+            next: "restore the vault from backup, or shade release --session <id> to give the work up",
+          });
+        }
         // Waking a session that never slept just resumes it, which is what
         // makes `wake` safe to call unconditionally.
         const opened = session.suspended
@@ -433,6 +460,7 @@ export class FakeShadeDaemon {
         );
         session.suspended = false;
         session.suspension_checkpoint = undefined;
+        session.suspension_vault = false;
         this.completeOperation(
           socket,
           requestId,
@@ -740,6 +768,7 @@ export class FakeShadeDaemon {
             opened: handoff.successor,
             released: false,
             suspended: false,
+            suspension_vault: false,
             expires_at_ms: Date.now() + this.lease_ttl_ms,
             secret_review: false,
           });
@@ -936,6 +965,7 @@ export class FakeShadeDaemon {
       opened,
       released: false,
       suspended: false,
+      suspension_vault: false,
       expires_at_ms: Date.now() + this.lease_ttl_ms,
       secret_review: false,
     });
