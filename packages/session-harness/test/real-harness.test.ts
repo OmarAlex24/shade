@@ -3,7 +3,8 @@ import { createServer } from "node:net";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { ShadeClient, type WireRequest } from "../../sdk-typescript/src/index.ts";
 
-import { runGc, runRealSessionHarness } from "../src/real-harness.ts";
+import { runGc } from "../src/real-daemon.ts";
+import { runRealSessionHarness } from "../src/real-harness.ts";
 
 describe("real session lifecycle harness", () => {
   test("continues the durable GC operation after CLI exit 75", async () => {

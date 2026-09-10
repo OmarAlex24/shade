@@ -20,8 +20,8 @@ use shade_protocol::{
     DependencyContext as ProtocolDependencyContext, EventEnvelope, ExecuteRequest, HandoffId,
     Intent, LeaseId, ObjectId, OpenSession, OpenedSession, OperationId, Outcome, PROTOCOL_VERSION,
     Query, QueryRequest, RepositoryId, RepositoryLocator, ResponseBody, ReviewAction, ReviewId,
-    ReviewRequired, SessionId, SessionStatus, ShadeError, SleepResult, WireResponse, WorkspaceId,
-    WorkspaceSelector,
+    ReviewRequired, SessionId, SessionStatus, ShadeError, SleepResult, WakeResult, WireResponse,
+    WorkspaceId, WorkspaceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+/// Everything the parked tier decides, kept out of this file. Only the call
+/// sites in `sleep`, `wake` and the collector live here.
+mod park_tier;
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{code}")]
@@ -373,6 +377,28 @@ impl EngineError {
             retry: "safe".into(),
             operation: None,
             next: Some("shade doctor".into()),
+            diagnostics_id: None,
+            diagnostic: Some(Box::new(diagnostic)),
+        }
+    }
+
+    /// A parked-tier failure.
+    ///
+    /// The park volume is external and removable, so this is a condition of
+    /// the moment rather than of the workspace: nothing about the workspace
+    /// changed and the same call is worth making again once the volume is
+    /// back. The detail goes to a diagnostic; the caller is told where to look.
+    pub fn park(error: impl std::fmt::Display) -> Self {
+        let diagnostic = crate::diagnostics::new(
+            shade_protocol::DiagnosticOrigin::Daemon,
+            crate::park::PARK_FAILED,
+            error,
+        );
+        Self {
+            code: crate::park::PARK_FAILED.into(),
+            retry: "safe".into(),
+            operation: None,
+            next: Some("check that SHADE_PARK_ROOT is mounted and writable".into()),
             diagnostics_id: None,
             diagnostic: Some(Box::new(diagnostic)),
         }
@@ -1113,6 +1139,21 @@ impl Engine {
                 if let Value::Object(ref mut object) = health {
                     object.insert("protocol".into(), json!(PROTOCOL_VERSION));
                     object.insert("root".into(), json!(self.config.root));
+                    // Asked of the volume, not of the config: the answer a
+                    // person wants from `doctor` is whether the disk is there
+                    // right now.
+                    object.insert(
+                        "park_root".into(),
+                        json!(
+                            self.config
+                                .park_root()
+                                .map(|root| root.to_string_lossy().into_owned())
+                        ),
+                    );
+                    object.insert(
+                        "park_mounted".into(),
+                        json!(self.config.park_root_mounted()),
+                    );
                 }
                 Ok(Outcome::Completed(health))
             }
@@ -2877,6 +2918,11 @@ impl Engine {
             .usage(&workspace.path)
             .map(|usage| usage.private_bytes.unwrap_or(usage.referenced_bytes))
             .unwrap_or_default();
+        // Last chance at the private build output: it is about to go with the
+        // tree, and the tree is still whole. A park that cannot happen -- no
+        // volume configured, the disk unplugged, too little to be worth the
+        // copy, or a failure on the way -- never stops a sleep.
+        let park = park_tier::park_on_sleep(self, &workspace, &checkpoint, reclaimed_bytes).await;
         // Deliberately not `secret_cleanup_review`: sleep preserves the
         // private files instead of deleting them, and there is nothing for a
         // human to decide when nothing leaves the machine.
@@ -2928,6 +2974,10 @@ impl Engine {
                 suspended: true,
                 reclaimed_bytes,
                 cwd: workspace.path.to_string_lossy().into_owned(),
+                parked: park.parked,
+                parked_bytes: park.bytes,
+                park_path: park.path,
+                park_reason: park.reason,
             })
             .map_err(EngineError::internal)?,
         ))
@@ -3024,12 +3074,25 @@ impl Engine {
             )
             .await?;
         crate::faults::hit(crate::faults::Point::WakeMaterialized);
+        // The successor tree is whole and its dependency layers are refilled,
+        // and it is not yet a session anyone can reach. Nothing else will ever
+        // have a better moment to put the build output back.
+        let park =
+            park_tier::restore_on_wake(self, &workspace.id, &checkpoint, &successor.path).await;
         let lease_id = LeaseId(format!("lease_{}", ulid::Ulid::new()));
         let opened = self
             .opened_session_with_lease(session_id.clone(), &successor, lease_id.clone())
             .await?;
-        let outcome =
-            Outcome::Completed(serde_json::to_value(opened).map_err(EngineError::internal)?);
+        let outcome = Outcome::Completed(
+            serde_json::to_value(WakeResult {
+                next: park.next(),
+                session: opened,
+                park_restored: park.restored,
+                park_restored_bytes: park.bytes,
+                park_reason: park.reason,
+            })
+            .map_err(EngineError::internal)?,
+        );
         // Not `prepare_handoff`/`adopt_successor`: adoption requires a live
         // lease on the predecessor, and a suspended workspace has none.
         if let Err(error) = self.database.activate_woken_workspace(
@@ -4238,6 +4301,9 @@ impl Engine {
             crate::faults::hit(crate::faults::Point::GcRecordDeleted);
             deleted += 1;
         }
+        // After the candidate loop, so a park whose workspace record this very
+        // pass deleted is garbage by the time the sweep looks at it.
+        let parks = park_tier::sweep_parks(self).await?;
         let _dependency_gc = self.locks.dependency_artifacts.write().await;
         // Read protection only after all in-flight preparations have recorded
         // their receipts, never from a snapshot taken before awaiting the lock.
@@ -4258,6 +4324,10 @@ impl Engine {
             "skipped": skipped,
             "layers_deleted": dependency_gc.removed.len(),
             "layers_reclaimed": dependency_gc.removed_bytes,
+            "parks_deleted": parks.deleted,
+            "parks_retained": parks.retained,
+            "parks_orphans_removed": parks.orphans,
+            "park_records_dropped": parks.dropped,
         })))
     }
 

@@ -32,11 +32,30 @@ cargo build --release
 SHADE_BIN="$PWD/target/release/shade" bun run test:harness:real
 ```
 
-The harness starts its isolated daemon with the hidden, explicit
+A third set of cases drives the parked tier end to end, one real daemon per
+case, on a fixture repository whose `.gitignore` claims `build/`:
+
+```bash
+cargo build -p shade
+SHADE_BIN="$PWD/target/debug/shade" bun test packages/session-harness/test/park.test.ts
+```
+
+A mebibyte of build output is written into a workspace and slept onto a park
+volume the harness owns, then the volume is left alone, unplugged, or rewritten
+to describe another tree before the wake. The cases assert what a host sees:
+`parked`/`park_reason` on `sleep`, the `<root>/<workspace>/<checkpoint>/{manifest.json,tree/}`
+layout on the volume, a `workspace.parked` event, `park_restored` and the
+restored bytes on `wake` -- with a clean `git status` and an untouched tracked
+tree in every outcome -- and the `parks`/`park_mounted` counters `doctor` and
+`gc` report while a stranded park waits for its disk to come back. They are
+skipped along with the release harness when `SHADE_BIN` is absent.
+
+Every daemon a harness starts is an isolated one, run with the hidden, explicit
 `--harness-lifecycle` timing override and a zero-second orphan grace. This
 exercises the production GC predicates and filesystem cleanup without editing
 SQLite or waiting ten minutes; an ordinary daemon still uses the fixed
 120-second lease TTL and 600-second grace. Cleanup assertions are never
 skipped. Set `SHADE_HARNESS_KEEP_ROOT=1` only while debugging a failure.
-Ordinary `bun test packages` skips the real test when `SHADE_BIN` is absent.
+Ordinary `bun test packages` skips every case that needs a real binary when
+`SHADE_BIN` is absent.
 Both executables emit one compact JSON record and no decorative output.

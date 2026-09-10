@@ -36,11 +36,13 @@ cargo build --release
 ./target/release/shade install
 ```
 
-`shade install` copies the same binary to `~/Library/Application Support/Shade/bin/shade`, writes a private LaunchAgent plist for the `com.shade.daemon` label, and bootstraps it in your GUI launchd domain. The one binary serves both the CLI and the daemon.
+`shade install` copies the same binary to `~/Library/Application Support/Shade/bin/shade`, writes a private LaunchAgent plist for the `com.shade.daemon` label, and bootstraps it in your GUI launchd domain. The one binary serves both the CLI and the daemon. A LaunchAgent inherits no environment, so the plist carries the choices made at install time: the Shade root and socket, a PATH snapshot, any configured park volume, and `SHADE_AUTO_SLEEP_DAYS=3` unless the installing shell set that variable itself. An installed daemon therefore sleeps a workspace nothing has touched for three days; export `SHADE_AUTO_SLEEP_DAYS` before installing to choose another span, or export it empty to turn the sweep off.
 
 Running it again upgrades in place. launchd acknowledges a `bootout` before the old job is actually gone and refuses a `bootstrap` that arrives inside that window, so the installer waits for launchd to report the service removed, retries the bootstrap, and only reports success once the socket answers `doctor`. The result carries `restarted`, and a bootstrap that is still refused fails with `LAUNCHAGENT_BOOTSTRAP_FAILED`, launchd's own reason in the diagnostic and the exact `launchctl bootstrap` command in `next`. A command that finds no daemon behind its socket answers `DAEMON_NOT_RUNNING` with the same two ways to start it.
 
-Every command prints exactly one minified JSON value on stdout. `shade --help` and `shade --version` print JSON too. `events --follow` prints JSONL. There is no prompt, color, table or human presentation mode.
+Every command prints exactly one minified JSON value on stdout. `shade --help` and `shade --version` print JSON too. `events --follow` prints JSONL. There is no prompt and no color.
+
+Two commands can also answer a person instead of a script. `shade status --human` and `shade doctor --human` -- `SHADE_HUMAN=1` is the same switch -- render a padded table or a `key value` block instead of JSON, with ages as `3m`, `2h`, `5d` and sizes as `1.2 GiB`. `status --human` with no `--session` lists every workspace by short id, repository, state, session, age, size, parked size and path; with one it prints that session's lifecycle. A failure in this mode is a single line on stderr naming the code and the way out, and the exit status is non-zero. Nothing about the default output changes: without `--human`, every command still prints the same JSON it always did, so scripts and both SDKs are unaffected.
 
 ```zsh
 open_key='open:task-42'
@@ -65,6 +67,8 @@ shade sleep
 shade wake --session task-42
 shade release
 ```
+
+`sleep` normally throws the gitignored build output away -- `target/`, `dist/`, `.next/` -- because the checkpoint records what Git tracks and the vault records the private files, and nothing records the rest. Set `SHADE_PARK_ROOT` to an absolute path on another volume and it is copied there instead, and `wake` copies it back into the successor before handing it over -- spending the park in the process, unless `SHADE_PARK_KEEP_AFTER_WAKE=1` keeps it. `SHADE_PARK_MIN_BYTES` (default 256 MiB) is the floor below which the cross-volume copy costs more than the boot disk gets back. The tier is free to fail: an unconfigured, unmounted or full volume, or a park that describes some other tree, leaves `sleep` and `wake` doing exactly what they did without it, and says why in `park_reason`. `sleep` reports `parked`, `parked_bytes`, `park_path` and `park_reason`; `wake` reports `park_restored`, `park_restored_bytes` and `park_reason`; `doctor` reports `park_root`, `park_mounted`, `parks`, `park_bytes` and `parks_orphaned`. Nothing private is ever parked, `gc` collects a park once its suspension ends, and it only ever deletes from a volume that is actually mounted.
 
 The full command set is `open`, `attach`, `sleep`, `wake`, `status`, `context`, `heartbeat`, `checkpoint`, `fork`, `sync`, `restore`, `deps refresh`, `publish`, `resolve`, `release` and `events`, plus the administrative `warm`, `review resolve`, `doctor`, `gc` and `install`.
 
@@ -114,7 +118,7 @@ Version 0.1.0, release candidate. Honest limitations:
 - The daemon is single-user and runs as your login user. It is **not** a same-UID process sandbox. A linked worktree exposes a writable Git object database, so the secret clean filter is an accidental-commit guardrail, not a boundary against a malicious local process. See [docs/SECURITY.md](docs/SECURITY.md) for the precise threat model.
 - The SQLite schema is version 1 and stays there. A database written by a different schema version is rejected rather than converted.
 - V1 rejects submodules, Git LFS, custom Git filters, tracked private `.env` files, tracked dependency output, missing dependency locks, source builds and executable package-manager configuration. Each of those rejections names the offending path in `next`, so you know what to untrack. Committed templates are not private files: a basename ending in `.example`, `.sample`, `.template`, `.dist` or `.defaults` -- `apps/web/.env.example` and the like -- is ordinary tracked content, while `.env`, `.env.local` and `.env.production` are still refused. What a commit already contains is not re-judged: a credential inside a tracked test fixture, document or CI file does not block the open, it is counted and its paths recorded for `shade doctor`. Shade never installs a runtime or toolchain.
-- Sleep preserves tracked content, untracked files and gitignored private files, but not gitignored build output: `node_modules`, `.venv` and anything like them are excluded from the checkpoint and rebuilt on wake from the shared dependency fingerprint. A wake also changes the workspace id and cwd, so a host that cached either must read them from the wake result.
+- Sleep preserves tracked content, untracked files and gitignored private files, but not gitignored build output: `node_modules`, `.venv` and anything like them are excluded from the checkpoint and rebuilt on wake from the shared dependency fingerprint. A wake also changes the workspace id and cwd, so a host that cached either must read them from the wake result. Point `SHADE_PARK_ROOT` at a directory on another volume and `sleep` copies that build output there instead of discarding it, and `wake` copies it back; see the paragraph above.
 
 See [docs/STATUS.md](docs/STATUS.md) for the current acceptance evidence.
 

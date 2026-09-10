@@ -68,6 +68,51 @@ pub struct WorkspaceRecord {
     pub dependency_state: String,
 }
 
+/// One row of the workspace inventory: what a listing needs, and nothing that
+/// costs a tree walk to answer.
+///
+/// `private_bytes` is deliberately left unset here. The honest number is
+/// `WorkspaceFilesystem::usage`, which walks every file under the workspace --
+/// far too expensive for a command a person runs to see what exists. The field
+/// is part of the shape so a tier that already stores its own byte count can
+/// fill it without changing any caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub id: WorkspaceId,
+    /// The repository identity, not its id: a listing is read by a person.
+    pub repository: String,
+    pub state: String,
+    pub session_id: Option<SessionId>,
+    pub cwd: PathBuf,
+    pub base_ref: String,
+    pub head_oid: ObjectId,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
+    /// Bytes this workspace's suspension holds on the park volume, from the
+    /// park record rather than from the disk: the volume may not be plugged
+    /// in, and a listing may not go looking. `None` means no park was
+    /// recorded for the checkpoint this workspace would wake from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_bytes: Option<u64>,
+}
+
+/// One park: the private build output of `workspace_id` as it stood at
+/// `checkpoint_id`, sitting on the external volume.
+///
+/// Deliberately keyed on ids rather than joined to them. The park outlives the
+/// rows it names -- a collected workspace leaves its park behind on a volume
+/// that may not even be plugged in -- and a foreign key would either block the
+/// deletion or take the only record of those bytes with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkRecord {
+    pub workspace_id: WorkspaceId,
+    pub checkpoint_id: CheckpointId,
+    pub park_path: PathBuf,
+    pub bytes: u64,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
@@ -217,6 +262,7 @@ impl Database {
         // otherwise still see the rows an older binary wrote as `orphaned`,
         // which is the one state the collector treats as collectible.
         normalize_dormant_state_rows(&transaction)?;
+        transaction.execute_batch(ADDITIVE_SCHEMA)?;
         transaction.commit()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -237,17 +283,9 @@ impl Database {
 
     /// Explicit offline lookup. Never creates a database or runs reconciliation.
     pub fn read_diagnostic(path: &Path, id: &str) -> Result<Option<Diagnostic>, DbError> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(connection) = open_read_only(path)? else {
+            return Ok(None);
         };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(std::io::Error::other("state database is not a regular file").into());
-        }
-        let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(std::time::Duration::from_secs(10))?;
         read_diagnostic(&connection, id)
     }
 
@@ -664,6 +702,20 @@ impl Database {
         )?;
         let rows = statement.query_map([], workspace_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every workspace that still exists, most recently touched first.
+    pub fn workspace_summaries(&self) -> Result<Vec<WorkspaceSummary>, DbError> {
+        workspace_summaries(&*self.connection()?)
+    }
+
+    /// Explicit offline listing. Never creates a database and never writes to
+    /// one, so it is safe to run beside a live daemon that owns the same file.
+    pub fn read_workspace_summaries(path: &Path) -> Result<Vec<WorkspaceSummary>, DbError> {
+        let Some(connection) = open_read_only(path)? else {
+            return Ok(Vec::new());
+        };
+        workspace_summaries(&connection)
     }
 
     pub fn workspace_for_cwd(&self, cwd: &Path) -> Result<Option<WorkspaceRecord>, DbError> {
@@ -2819,6 +2871,86 @@ impl Database {
         Ok(())
     }
 
+    /// Record a park and announce it in the same transaction.
+    ///
+    /// One park per (workspace, checkpoint): a second sleep of the same
+    /// workspace produces a new checkpoint, and a re-park of the same
+    /// checkpoint replaces bytes that describe an older tree.
+    pub fn record_park(&self, park: &ParkRecord) -> Result<(), DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO parks (workspace_id, checkpoint_id, park_path, bytes, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(workspace_id, checkpoint_id) DO UPDATE SET \
+               park_path=excluded.park_path, bytes=excluded.bytes, \
+               created_at_ms=excluded.created_at_ms",
+            params![
+                park.workspace_id.0,
+                park.checkpoint_id.0,
+                park.park_path.to_string_lossy(),
+                saturating_i64(park.bytes),
+                park.created_at_ms,
+            ],
+        )?;
+        append_event(
+            &transaction,
+            "workspace.parked",
+            &park.workspace_id.0,
+            &json!({
+                "workspace_id": park.workspace_id,
+                "checkpoint_id": park.checkpoint_id,
+                "park_path": park.park_path.to_string_lossy(),
+                "bytes": park.bytes,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn park(
+        &self,
+        workspace_id: &WorkspaceId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<Option<ParkRecord>, DbError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT workspace_id, checkpoint_id, park_path, bytes, created_at_ms \
+                 FROM parks WHERE workspace_id=?1 AND checkpoint_id=?2",
+                params![workspace_id.0, checkpoint_id.0],
+                park_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every park the daemon believes it owns, oldest first.
+    pub fn parks(&self) -> Result<Vec<ParkRecord>, DbError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT workspace_id, checkpoint_id, park_path, bytes, created_at_ms FROM parks \
+             ORDER BY created_at_ms ASC, workspace_id, checkpoint_id",
+        )?;
+        let rows = statement.query_map([], park_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Forget a park. Removing the bytes it names is the caller's job, and
+    /// only the caller knows whether the volume is there to remove them from.
+    pub fn delete_park(
+        &self,
+        workspace_id: &WorkspaceId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<(), DbError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM parks WHERE workspace_id=?1 AND checkpoint_id=?2",
+            params![workspace_id.0, checkpoint_id.0],
+        )?;
+        Ok(())
+    }
+
     pub fn doctor(&self) -> Result<Value, DbError> {
         let connection = self.connection()?;
         let integrity: String =
@@ -2902,6 +3034,25 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        let (parks, park_bytes): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM parks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // A park is garbage the moment it stops describing a live suspension:
+        // the workspace went, or a later sleep gave it a different suspension
+        // checkpoint. `IS NOT` rather than `!=` so a workspace with no sleep
+        // checkpoint at all counts instead of comparing against NULL and
+        // silently answering neither yes nor no.
+        let parks_orphaned: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM parks p WHERE p.checkpoint_id IS NOT ( \
+               SELECT c.id FROM checkpoints c JOIN workspaces w ON w.id=c.workspace_id \
+               WHERE c.workspace_id=p.workspace_id AND c.state='ready' AND c.reason='sleep' \
+                 AND w.state NOT IN ('released','deleted','deleting') \
+               ORDER BY c.created_at_ms DESC, c.rowid DESC LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(json!({
             "state": integrity,
             "sessions": active_sessions,
@@ -2915,8 +3066,99 @@ impl Database {
             "workspaces_failed_awaiting_review": failed_awaiting_review,
             "suspended_without_checkpoint": suspended_without_checkpoint,
             "tracked_secret_matches": tracked_secret_matches,
+            "parks": parks,
+            "park_bytes": park_bytes,
+            "parks_orphaned": parks_orphaned,
         }))
     }
+}
+
+/// Open the state database without creating it and without writing to it.
+/// `Ok(None)` means there is no state to read yet.
+fn open_read_only(path: &Path) -> Result<Option<Connection>, DbError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("state database is not a regular file").into());
+    }
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(10))?;
+    Ok(Some(connection))
+}
+
+fn workspace_summaries(connection: &Connection) -> Result<Vec<WorkspaceSummary>, DbError> {
+    // The park a workspace would wake into is the one taken at its suspension
+    // checkpoint -- the newest ready `sleep` checkpoint, the same rule `wake`
+    // and `doctor` use -- so any older park is garbage the collector owns and
+    // not a number to print beside a live workspace.
+    let (parked_column, parked_join) = if table_present(connection, "parks")? {
+        (
+            ", p.bytes",
+            " LEFT JOIN parks p ON p.workspace_id=w.id AND p.checkpoint_id=( \
+               SELECT c.id FROM checkpoints c WHERE c.workspace_id=w.id \
+                 AND c.state='ready' AND c.reason='sleep' \
+               ORDER BY c.created_at_ms DESC, c.rowid DESC LIMIT 1)",
+        )
+    } else {
+        (", NULL", "")
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT w.id, r.identity, w.state, w.session_id, w.path, w.base_ref, w.head_oid, \
+         w.updated_at_ms{parked_column} FROM workspaces w \
+         JOIN repositories r ON r.id=w.repository_id{parked_join} \
+         WHERE w.state NOT IN ('deleted','deleting') ORDER BY w.updated_at_ms DESC, w.id"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok(WorkspaceSummary {
+            id: WorkspaceId(row.get(0)?),
+            repository: row.get(1)?,
+            state: row.get(2)?,
+            session_id: row.get::<_, Option<String>>(3)?.map(SessionId),
+            cwd: PathBuf::from(row.get::<_, String>(4)?),
+            base_ref: row.get(5)?,
+            head_oid: ObjectId(row.get(6)?),
+            updated_at_ms: row.get(7)?,
+            private_bytes: None,
+            parked_bytes: row
+                .get::<_, Option<i64>>(8)?
+                .map(|bytes| u64::try_from(bytes).unwrap_or(0)),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Whether a table exists in the database this connection has open.
+///
+/// Asked only of the tables in [`ADDITIVE_SCHEMA`], and only on the read-only
+/// paths: a writer applies that schema on the way in, but an offline reader
+/// takes the file as it finds it, and a database written before the table
+/// existed must still list.
+fn table_present(connection: &Connection, name: &str) -> Result<bool, DbError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn park_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParkRecord> {
+    Ok(ParkRecord {
+        workspace_id: WorkspaceId(row.get(0)?),
+        checkpoint_id: CheckpointId(row.get(1)?),
+        park_path: PathBuf::from(row.get::<_, String>(2)?),
+        bytes: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+        created_at_ms: row.get(4)?,
+    })
+}
+
+/// SQLite integers are signed. A byte count that does not fit is a corrupt
+/// measurement rather than a reason to fail a sleep, so it is clamped.
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn insert_diagnostic(connection: &Connection, diagnostic: &Diagnostic) -> Result<(), DbError> {
@@ -2957,6 +3199,24 @@ fn normalize_dormant_state_rows(transaction: &Transaction<'_>) -> Result<usize, 
     )?;
     Ok(sessions + workspaces)
 }
+
+/// Tables added after the first release.
+///
+/// Kept out of [`create_schema`] and applied on every open, so a database
+/// written by an earlier binary gains them without a `user_version` bump. That
+/// is the same compatibility bargain [`normalize_dormant_state_rows`] takes:
+/// the addition is invisible to an older binary, which simply never writes to
+/// a table it does not know about.
+const ADDITIVE_SCHEMA: &str = r#"
+    CREATE TABLE IF NOT EXISTS parks (
+      workspace_id TEXT NOT NULL,
+      checkpoint_id TEXT NOT NULL,
+      park_path TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(workspace_id, checkpoint_id)
+    ) STRICT;
+"#;
 
 fn create_schema(connection: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     connection.execute_batch(
@@ -3536,6 +3796,77 @@ mod tests {
         };
         database.create_session_and_lease(&session, 120).unwrap();
         (database, session)
+    }
+
+    fn sleep_checkpoint(database: &Database, workspace: &WorkspaceId, id: &str) -> CheckpointId {
+        let record = CheckpointRecord {
+            id: CheckpointId(id.into()),
+            workspace_id: workspace.clone(),
+            head_oid: ObjectId("opaque-head".into()),
+            index_oid: ObjectId("opaque-index".into()),
+            worktree_oid: ObjectId("opaque-worktree".into()),
+            reason: "sleep".into(),
+            state: "ready".into(),
+        };
+        database.create_checkpoint(&record).unwrap();
+        record.id
+    }
+
+    fn parked_bytes(database: &Database, workspace: &WorkspaceId) -> Option<u64> {
+        database
+            .workspace_summaries()
+            .unwrap()
+            .into_iter()
+            .find(|summary| &summary.id == workspace)
+            .expect("the fixture workspace is listed")
+            .parked_bytes
+    }
+
+    /// The listing reports the park of the checkpoint the workspace would
+    /// actually wake from. A park a later sleep superseded is the collector's
+    /// business, and printing its bytes beside a live workspace would promise
+    /// disk that no wake will ever ask for.
+    #[test]
+    fn a_workspace_summary_carries_only_the_park_of_its_suspension_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let (database, session) = session_fixture(&path, directory.path());
+        let workspace = session.workspace_id.clone();
+        assert_eq!(parked_bytes(&database, &workspace), None);
+
+        let first = sleep_checkpoint(&database, &workspace, "ckpt_first");
+        let mut park = ParkRecord {
+            workspace_id: workspace.clone(),
+            checkpoint_id: first,
+            park_path: directory.path().join("park/first"),
+            bytes: 4_096,
+            created_at_ms: now_ms(),
+        };
+        database.record_park(&park).unwrap();
+        assert_eq!(parked_bytes(&database, &workspace), Some(4_096));
+
+        // A second sleep moves the suspension to a checkpoint the older park
+        // does not describe.
+        let second = sleep_checkpoint(&database, &workspace, "ckpt_second");
+        assert_eq!(parked_bytes(&database, &workspace), None);
+
+        park.checkpoint_id = second;
+        park.park_path = directory.path().join("park/second");
+        park.bytes = 8_192;
+        database.record_park(&park).unwrap();
+        assert_eq!(parked_bytes(&database, &workspace), Some(8_192));
+
+        // `parks` is additive schema, so an offline listing may be pointed at
+        // a database written before the table existed. That is an empty
+        // column, never a failed listing.
+        database
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TABLE parks")
+            .unwrap();
+        let offline = Database::read_workspace_summaries(&path).unwrap();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].parked_bytes, None);
     }
 
     fn unreleased_leases(path: &Path, session: &SessionId) -> i64 {
