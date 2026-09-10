@@ -8,6 +8,15 @@ pub const DEFAULT_ORPHAN_GRACE_SECS: i64 = 600;
 /// reversible, but it still changes a workspace id out from under a host, so
 /// nothing does it on its own by default.
 pub const DEFAULT_AUTO_SLEEP_AFTER_SECS: Option<i64> = None;
+/// The span `shade install` writes into the LaunchAgent when the installing
+/// shell named none of its own.
+///
+/// The in-code default above stays `None`, because a library caller owns its
+/// own lifecycle and a test that never asked for a sweep must not get one. An
+/// installed daemon is the other case: it outlives every shell that talks to
+/// it, nothing else will ever reclaim the trees its hosts abandoned, and three
+/// days is longer than any agent turn and shorter than any disk fills.
+pub const DEFAULT_INSTALLED_AUTO_SLEEP_DAYS: i64 = 3;
 /// Suspension retention is off by default too: a suspension is the state that
 /// exists to keep work indefinitely at almost no cost.
 pub const DEFAULT_SUSPENDED_RETENTION_SECS: Option<i64> = None;

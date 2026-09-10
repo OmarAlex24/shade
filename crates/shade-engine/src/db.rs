@@ -89,6 +89,12 @@ pub struct WorkspaceSummary {
     pub updated_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_bytes: Option<u64>,
+    /// Bytes this workspace's suspension holds on the park volume, from the
+    /// park record rather than from the disk: the volume may not be plugged
+    /// in, and a listing may not go looking. `None` means no park was
+    /// recorded for the checkpoint this workspace would wake from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_bytes: Option<u64>,
 }
 
 /// One park: the private build output of `workspace_id` as it stood at
@@ -3084,11 +3090,27 @@ fn open_read_only(path: &Path) -> Result<Option<Connection>, DbError> {
 }
 
 fn workspace_summaries(connection: &Connection) -> Result<Vec<WorkspaceSummary>, DbError> {
-    let mut statement = connection.prepare(
+    // The park a workspace would wake into is the one taken at its suspension
+    // checkpoint -- the newest ready `sleep` checkpoint, the same rule `wake`
+    // and `doctor` use -- so any older park is garbage the collector owns and
+    // not a number to print beside a live workspace.
+    let (parked_column, parked_join) = if table_present(connection, "parks")? {
+        (
+            ", p.bytes",
+            " LEFT JOIN parks p ON p.workspace_id=w.id AND p.checkpoint_id=( \
+               SELECT c.id FROM checkpoints c WHERE c.workspace_id=w.id \
+                 AND c.state='ready' AND c.reason='sleep' \
+               ORDER BY c.created_at_ms DESC, c.rowid DESC LIMIT 1)",
+        )
+    } else {
+        (", NULL", "")
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT w.id, r.identity, w.state, w.session_id, w.path, w.base_ref, w.head_oid, \
-         w.updated_at_ms FROM workspaces w JOIN repositories r ON r.id=w.repository_id \
-         WHERE w.state NOT IN ('deleted','deleting') ORDER BY w.updated_at_ms DESC, w.id",
-    )?;
+         w.updated_at_ms{parked_column} FROM workspaces w \
+         JOIN repositories r ON r.id=w.repository_id{parked_join} \
+         WHERE w.state NOT IN ('deleted','deleting') ORDER BY w.updated_at_ms DESC, w.id"
+    ))?;
     let rows = statement.query_map([], |row| {
         Ok(WorkspaceSummary {
             id: WorkspaceId(row.get(0)?),
@@ -3100,9 +3122,27 @@ fn workspace_summaries(connection: &Connection) -> Result<Vec<WorkspaceSummary>,
             head_oid: ObjectId(row.get(6)?),
             updated_at_ms: row.get(7)?,
             private_bytes: None,
+            parked_bytes: row
+                .get::<_, Option<i64>>(8)?
+                .map(|bytes| u64::try_from(bytes).unwrap_or(0)),
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Whether a table exists in the database this connection has open.
+///
+/// Asked only of the tables in [`ADDITIVE_SCHEMA`], and only on the read-only
+/// paths: a writer applies that schema on the way in, but an offline reader
+/// takes the file as it finds it, and a database written before the table
+/// existed must still list.
+fn table_present(connection: &Connection, name: &str) -> Result<bool, DbError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 fn park_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParkRecord> {
@@ -3756,6 +3796,77 @@ mod tests {
         };
         database.create_session_and_lease(&session, 120).unwrap();
         (database, session)
+    }
+
+    fn sleep_checkpoint(database: &Database, workspace: &WorkspaceId, id: &str) -> CheckpointId {
+        let record = CheckpointRecord {
+            id: CheckpointId(id.into()),
+            workspace_id: workspace.clone(),
+            head_oid: ObjectId("opaque-head".into()),
+            index_oid: ObjectId("opaque-index".into()),
+            worktree_oid: ObjectId("opaque-worktree".into()),
+            reason: "sleep".into(),
+            state: "ready".into(),
+        };
+        database.create_checkpoint(&record).unwrap();
+        record.id
+    }
+
+    fn parked_bytes(database: &Database, workspace: &WorkspaceId) -> Option<u64> {
+        database
+            .workspace_summaries()
+            .unwrap()
+            .into_iter()
+            .find(|summary| &summary.id == workspace)
+            .expect("the fixture workspace is listed")
+            .parked_bytes
+    }
+
+    /// The listing reports the park of the checkpoint the workspace would
+    /// actually wake from. A park a later sleep superseded is the collector's
+    /// business, and printing its bytes beside a live workspace would promise
+    /// disk that no wake will ever ask for.
+    #[test]
+    fn a_workspace_summary_carries_only_the_park_of_its_suspension_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let (database, session) = session_fixture(&path, directory.path());
+        let workspace = session.workspace_id.clone();
+        assert_eq!(parked_bytes(&database, &workspace), None);
+
+        let first = sleep_checkpoint(&database, &workspace, "ckpt_first");
+        let mut park = ParkRecord {
+            workspace_id: workspace.clone(),
+            checkpoint_id: first,
+            park_path: directory.path().join("park/first"),
+            bytes: 4_096,
+            created_at_ms: now_ms(),
+        };
+        database.record_park(&park).unwrap();
+        assert_eq!(parked_bytes(&database, &workspace), Some(4_096));
+
+        // A second sleep moves the suspension to a checkpoint the older park
+        // does not describe.
+        let second = sleep_checkpoint(&database, &workspace, "ckpt_second");
+        assert_eq!(parked_bytes(&database, &workspace), None);
+
+        park.checkpoint_id = second;
+        park.park_path = directory.path().join("park/second");
+        park.bytes = 8_192;
+        database.record_park(&park).unwrap();
+        assert_eq!(parked_bytes(&database, &workspace), Some(8_192));
+
+        // `parks` is additive schema, so an offline listing may be pointed at
+        // a database written before the table existed. That is an empty
+        // column, never a failed listing.
+        database
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TABLE parks")
+            .unwrap();
+        let offline = Database::read_workspace_summaries(&path).unwrap();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].parked_bytes, None);
     }
 
     fn unreleased_leases(path: &Path, session: &SessionId) -> i64 {

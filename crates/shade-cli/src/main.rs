@@ -6,12 +6,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde_json::{Value, json};
 use shade_client::{ClientError, ShadeClient};
 use shade_engine::Engine;
-use shade_engine::config::EngineConfig;
+use shade_engine::config::{DEFAULT_INSTALLED_AUTO_SLEEP_DAYS, EngineConfig};
 use shade_protocol::{
     CheckpointId, EventEnvelope, Intent, OpenSession, OperationId, Outcome, PROTOCOL_VERSION,
     Query, QueryRequest, RepositoryId, RepositoryLocator, ResponseBody, ReviewAction, ReviewId,
     SessionId, ShadeError, WireRequest, WireResponse, WorkspaceSelector,
 };
+use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -911,6 +912,7 @@ fn workspace_inventory(config: &EngineConfig) -> anyhow::Result<human::StatusRep
                     .join(".git")
                     .is_file()
                     .then(|| home_relative(&summary.cwd)),
+                parked_bytes: summary.parked_bytes,
             })
             .collect(),
     })
@@ -1719,7 +1721,12 @@ async fn install(config: &EngineConfig, args: &InstallArgs) -> anyhow::Result<se
     atomic_copy(&std::env::current_exe()?, &bin, 0o755)?;
     std::fs::create_dir_all(&agents)?;
     let plist = agents.join(format!("{label}.plist"));
-    let content = launch_agent_plist(&label, &bin, config)?;
+    let content = launch_agent_plist(
+        &label,
+        &bin,
+        config,
+        std::env::var_os("SHADE_AUTO_SLEEP_DAYS").as_deref(),
+    )?;
     atomic_write(&plist, content.as_bytes(), 0o600)?;
     let restarted = replace && stop_service(&service).await;
     if let Err(detail) = bootstrap_service(&domain, &plist).await {
@@ -1922,11 +1929,17 @@ async fn wait_for_installed_daemon(config: &EngineConfig) -> anyhow::Result<()> 
     }
 }
 
-fn launch_agent_plist(label: &str, binary: &Path, config: &EngineConfig) -> anyhow::Result<String> {
+fn launch_agent_plist(
+    label: &str,
+    binary: &Path,
+    config: &EngineConfig,
+    auto_sleep_days: Option<&OsStr>,
+) -> anyhow::Result<String> {
     let binary = path_string(binary)?;
     let root = path_string(&config.root)?;
     let socket = path_string(&config.socket)?;
     let search_path = installed_search_path()?;
+    let auto_sleep = auto_sleep_environment(auto_sleep_days)?;
     let park = park_environment(config)?;
     // SDK calls await this service over a Unix socket, which cannot raise an
     // Adaptive job's priority through an XPC transaction. Background throttling
@@ -1941,7 +1954,7 @@ fn launch_agent_plist(label: &str, binary: &Path, config: &EngineConfig) -> anyh
 </array>
 <key>EnvironmentVariables</key><dict>
 <key>SHADE_ROOT</key><string>{}</string>
-<key>PATH</key><string>{}</string>{}
+<key>PATH</key><string>{}</string>{}{}
 </dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>ProcessType</key><string>Interactive</string>
@@ -1954,7 +1967,32 @@ fn launch_agent_plist(label: &str, binary: &Path, config: &EngineConfig) -> anyh
         xml_escape(&socket),
         xml_escape(&root),
         xml_escape(&search_path),
+        auto_sleep,
         park,
+    ))
+}
+
+/// The auto-sleep span the installed daemon runs with, as a plist entry.
+///
+/// A LaunchAgent inherits no environment, so this is not a choice the daemon
+/// can be told about later: whatever is written here is what it lives with
+/// until the next `shade install`. An installing shell that named a span keeps
+/// it verbatim -- including an empty one, which the engine reads as no sweep
+/// at all -- and one that named nothing gets
+/// [`DEFAULT_INSTALLED_AUTO_SLEEP_DAYS`], because an unattended daemon is
+/// exactly the case where nothing else will ever reclaim an abandoned tree.
+fn auto_sleep_environment(raw: Option<&OsStr>) -> anyhow::Result<String> {
+    let days = match raw {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("SHADE_AUTO_SLEEP_DAYS is not valid UTF-8"))?
+            .trim()
+            .to_owned(),
+        None => DEFAULT_INSTALLED_AUTO_SLEEP_DAYS.to_string(),
+    };
+    Ok(format!(
+        "\n<key>SHADE_AUTO_SLEEP_DAYS</key><string>{}</string>",
+        xml_escape(&days)
     ))
 }
 
@@ -2513,9 +2551,13 @@ trailing"#;
     fn launch_agent_is_single_binary_and_escapes_paths() {
         let temp = tempfile::tempdir().unwrap();
         let config = EngineConfig::at(temp.path().join("data&root"));
-        let plist =
-            launch_agent_plist("com.shade.daemon", &temp.path().join("shade<bin>"), &config)
-                .unwrap();
+        let plist = launch_agent_plist(
+            "com.shade.daemon",
+            &temp.path().join("shade<bin>"),
+            &config,
+            None,
+        )
+        .unwrap();
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<string>--socket</string>"));
         assert!(plist.contains("<key>SHADE_ROOT</key>"));
@@ -2523,6 +2565,36 @@ trailing"#;
         assert!(plist.contains("shade&lt;bin&gt;"));
         assert!(plist.contains("<key>Umask</key><integer>63</integer>"));
         assert!(!plist.contains("SHADE_PARK_ROOT"));
+        // The installing shell said nothing about auto-sleep, so the installed
+        // daemon gets the span an unattended daemon needs.
+        assert!(plist.contains(&format!(
+            "<key>SHADE_AUTO_SLEEP_DAYS</key><string>{DEFAULT_INSTALLED_AUTO_SLEEP_DAYS}</string>"
+        )));
+    }
+
+    #[test]
+    fn an_installing_shell_keeps_the_auto_sleep_span_it_chose() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = EngineConfig::at(temp.path().join("root"));
+        let binary = temp.path().join("shade");
+        let chosen = launch_agent_plist(
+            "com.shade.daemon",
+            &binary,
+            &config,
+            Some(OsStr::new(" 14 ")),
+        )
+        .unwrap();
+        assert!(chosen.contains("<key>SHADE_AUTO_SLEEP_DAYS</key><string>14</string>"));
+
+        // An empty value is a choice too: the engine reads it as no sweep, and
+        // an installer that overwrote it with the default would turn a
+        // deliberate opt-out into a timer that moves work.
+        let off =
+            launch_agent_plist("com.shade.daemon", &binary, &config, Some(OsStr::new(""))).unwrap();
+        assert!(off.contains("<key>SHADE_AUTO_SLEEP_DAYS</key><string></string>"));
+        assert!(!off.contains(&format!(
+            "<string>{DEFAULT_INSTALLED_AUTO_SLEEP_DAYS}</string>"
+        )));
     }
 
     #[test]
@@ -2531,8 +2603,13 @@ trailing"#;
         let mut config = EngineConfig::at(temp.path().join("root"));
         config.park_root = Some(PathBuf::from("/Volumes/dev&disk/shade-park"));
         config.park_min_bytes = 1_048_576;
-        let plist =
-            launch_agent_plist("com.shade.daemon", &temp.path().join("shade"), &config).unwrap();
+        let plist = launch_agent_plist(
+            "com.shade.daemon",
+            &temp.path().join("shade"),
+            &config,
+            None,
+        )
+        .unwrap();
         assert!(plist.contains(
             "<key>SHADE_PARK_ROOT</key><string>/Volumes/dev&amp;disk/shade-park</string>"
         ));

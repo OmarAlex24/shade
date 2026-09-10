@@ -417,7 +417,7 @@ pub struct WakeResult {
     /// How many bytes came back. Zero unless `park_restored`.
     #[serde(default)]
     pub park_restored_bytes: u64,
-    /// Why the park was not restored: `unmounted`, `absent`,
+    /// Why the park was not restored: `unconfigured`, `unmounted`, `absent`,
     /// `manifest_mismatch` or `park_failed`. Absent when there was no park to
     /// restore or when it was restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -108,6 +108,49 @@ reused here: adoption requires a live lease on the predecessor, and a suspension
 has none, so the predecessor is released and the successor bound in one
 transaction that also writes the operation journal.
 
+Suspension has one optional tier under it. `sleep` throws away everything Git
+ignores along with the tree, and on a working repository that is most of the
+disk it just freed. Point `SHADE_PARK_ROOT` at an absolute path on another
+volume and those bytes are copied there instead, into
+`<park_root>/<workspace>/<checkpoint>/` as a `manifest.json` beside a `tree/`,
+published with one rename so a park directory is either absent or complete.
+What is parked is the private gitignored set, minus two things that must never
+reach that volume: the dependency layers, which every receipt names and which
+`wake` refills from the shared fingerprint anyway, and everything the secret
+policy claims, which the sleep vault already holds. That filter is applied
+twice, once over the inventory and again for every file as it is copied.
+`sleep` parks only when a root is configured, the volume is a writable
+directory at that moment, and the tree is at least `SHADE_PARK_MIN_BYTES`
+(256 MiB by default), below which a cross-volume copy costs more time than the
+boot disk gets back. Every copy is a real byte copy: a park root is a different
+volume by definition, `clonefileat` cannot span one, and there is deliberately
+no clone path here to fall back to.
+
+`wake` copies the park back into the successor before handing it over, and only
+when the manifest names this exact workspace, checkpoint, HEAD, worktree and
+layout version. A park that describes anything else, or that is not there at
+all, restores nothing and the successor regenerates its own build output; a
+path the base now tracks or the vault now owns is skipped for the same reason,
+because those are the copies Git and Shade can reproduce. The park is spent by
+the wake that used it and is removed with its record, unless
+`SHADE_PARK_KEEP_AFTER_WAKE=1` keeps it for a person who wants to look. `gc`
+reconciles records against the volume: a park is garbage once it stops
+describing a live suspension -- its workspace was released or deleted, or a
+later sleep gave it a different suspension checkpoint -- and is then removed
+with its record; a record whose directory is gone from a mounted volume is
+dropped; a directory no record claims is removed as an orphan. Nothing is ever
+removed from a volume that is not mounted, because an unplugged disk is not
+evidence that a park is gone, so those are counted as retained and reconsidered
+on a later pass.
+
+The tier is a cache and nothing depends on it. A park holds only output a build
+can produce again -- the checkpoint holds what Git tracks, the vault holds the
+private files -- so the park volume may be wiped, filled or unplugged between
+any two commands without changing what `sleep`, `wake`, `release` or GC mean.
+Every failure is a sentence rather than an error: no root, no volume, no space,
+or a park that describes another tree leaves the operation doing exactly what it
+did before the tier existed and says which in `park_reason`.
+
 `release` is the only door to deletion, so a workspace with no tree left must
 still be able to walk through it. When the `.git` pointer is gone -- a
 suspension, a workspace reconciliation marked `failed`, or a tree something
@@ -120,18 +163,26 @@ is not recoverable afterwards. `checkpoint_id` comes back `null`, which on its
 own does not distinguish this from a clean release with nothing to checkpoint,
 so the release also emits `workspace.released_without_tree` naming the reason.
 
-Two optional sweeps, both off by default, automate the ends of the lifecycle.
-`SHADE_AUTO_SLEEP_DAYS` sleeps a workspace that has been dormant that long, and
-`SHADE_SUSPENDED_RETENTION_DAYS` releases a suspension that old. Both run
-through the ordinary verbs, so every gate a manual `sleep` or `release` applies
-still applies, and releasing is still not deleting: GC keeps all of its own
-gates and its grace period afterwards.
+Two sweeps automate the ends of the lifecycle. `SHADE_AUTO_SLEEP_DAYS` sleeps a
+workspace that has been dormant that long, and `SHADE_SUSPENDED_RETENTION_DAYS`
+releases a suspension that old. Both are off in the engine's own defaults, which
+is what a library caller and every test gets, but a daemon nobody attends is the
+one case where nothing else will ever reclaim an abandoned tree: `shade install`
+therefore writes `SHADE_AUTO_SLEEP_DAYS=3` into the LaunchAgent when the
+installing shell named no span of its own, and restates the shell's own value
+when it did -- including an empty one, which is how an operator asks for no
+sweep at all. Both run through the ordinary verbs, so every gate a manual
+`sleep` or `release` applies still applies, and releasing is still not deleting:
+GC keeps all of its own gates and its grace period afterwards.
 
 Sessions and workspaces recorded as `orphaned` by an earlier version are
 normalized to `dormant` at startup, which is a value change and not a schema
 change: neither column carries a CHECK constraint and `user_version` stays at 1.
 Suspension adds no schema change either -- `suspended` and `suspending` are two
-more values in the same two columns.
+more values in the same two columns. The parked tier adds one table, `parks`,
+created on every open instead of behind a `user_version` bump: an older binary
+never writes to a table it does not know about, and a database it wrote gains
+the table the first time a newer binary opens it.
 
 ## Failure model
 

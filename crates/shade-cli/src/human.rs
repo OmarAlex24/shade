@@ -17,13 +17,14 @@ const GAP: &str = "  ";
 /// table stays readable; the full id is one `--session` away, and always in
 /// the JSON.
 const SESSION_WIDTH: usize = 28;
-const STATUS_HEADERS: [&str; 7] = [
+const STATUS_HEADERS: [&str; 8] = [
     "WORKSPACE",
     "REPO",
     "STATE",
     "SESSION",
     "AGE",
     "SIZE",
+    "PARKED",
     "PATH",
 ];
 
@@ -42,9 +43,10 @@ pub struct WorkspaceRow {
     pub bytes: Option<u64>,
     /// Absent when the workspace holds no materialized tree.
     pub path: Option<String>,
-    // parked tier fields land here: `parked_bytes: Option<u64>` and
-    // `park_path: Option<String>` feed the SIZE and PATH columns for a parked
-    // workspace without changing this row's shape for anyone else.
+    /// Disk this workspace's suspension holds on the park volume. `None`
+    /// prints as `-`: either nothing was parked, or the park that was taken
+    /// no longer describes the checkpoint this workspace would wake from.
+    pub parked_bytes: Option<u64>,
 }
 
 /// Everything `status --human` prints, with the clock it measures ages
@@ -53,8 +55,6 @@ pub struct WorkspaceRow {
 pub struct StatusReport {
     pub rows: Vec<WorkspaceRow>,
     pub now_ms: i64,
-    // parked tier fields land here: a park summary belongs under the table,
-    // not inside a row.
 }
 
 impl StatusReport {
@@ -76,6 +76,7 @@ impl StatusReport {
                     row.updated_at_ms
                         .map_or_else(dash, |updated| age(self.now_ms, updated)),
                     row.bytes.map_or_else(dash, bytes),
+                    row.parked_bytes.map_or_else(dash, bytes),
                     row.path.clone().unwrap_or_else(dash),
                 ]
             })
@@ -92,8 +93,6 @@ pub struct Report {
     pub fields: Vec<(String, String)>,
     pub blocks: Vec<(String, String)>,
     pub warnings: Vec<String>,
-    // parked tier fields land here: park counts are ordinary `fields`, and a
-    // park that cannot be read is an ordinary `warning`.
 }
 
 /// What a person reads first. Everything else follows in the order the daemon
@@ -217,6 +216,21 @@ fn doctor_warnings(value: &Value) -> Vec<String> {
         warnings.push(format!(
             "{unwakeable} suspended workspace(s) have no sleep checkpoint and cannot be woken"
         ));
+    }
+    // Not a failure and not a misconfiguration: an external volume is
+    // unplugged far more often than it is wrong. It is worth one line because
+    // every sleep until it comes back discards the build output it would have
+    // kept, and every wake rebuilds what is sitting on the disk in the drawer.
+    if value.get("park_root").is_some_and(|root| !root.is_null())
+        && !value
+            .get("park_mounted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        warnings.push(
+            "park root configured but not mounted: sleep discards build output until it is back"
+                .to_owned(),
+        );
     }
     warnings
 }
@@ -448,11 +462,15 @@ mod tests {
                     updated_at_ms: Some(now - 2 * 60 * MINUTE),
                     bytes: Some(1_288_490_188),
                     path: Some("~/work/ws".into()),
+                    parked_bytes: None,
                 },
+                // The row the parked tier exists for: no tree, no size, and
+                // its build output waiting on another volume.
                 WorkspaceRow {
                     workspace: "ws_01M1YHFZ79H1F2FV26T0YGMCWK".into(),
                     repository: "file:///private/tmp/ignorefix".into(),
                     state: "suspended".into(),
+                    parked_bytes: Some(3 * 1024 * 1024 * 1024),
                     ..WorkspaceRow::default()
                 },
             ],
@@ -461,17 +479,17 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(
             lines[0],
-            "WORKSPACE   REPO                      STATE      SESSION  AGE  SIZE     PATH"
+            "WORKSPACE   REPO                      STATE      SESSION  AGE  SIZE     PARKED   PATH"
         );
         assert_eq!(
             lines[1],
-            "ws_…HX6PZA  OmarAlex24/zumith-studio  ready      task-42  2h   1.2 GiB  ~/work/ws"
+            "ws_…HX6PZA  OmarAlex24/zumith-studio  ready      task-42  2h   1.2 GiB  -        ~/work/ws"
         );
         // Every column starts at the same offset as the row above it, and the
         // unknowns of a workspace with no tree are dashes, not blanks.
         assert_eq!(
             lines[2],
-            "ws_…YGMCWK  ignorefix                 suspended  -        -    -        -"
+            "ws_…YGMCWK  ignorefix                 suspended  -        -    -        3.0 GiB  -"
         );
     }
 
@@ -533,6 +551,46 @@ mod tests {
             doctor(&broken).warnings,
             ["state database integrity check reports `malformed index`"]
         );
+    }
+
+    #[test]
+    fn an_unconfigured_park_root_is_a_dash_and_an_unplugged_one_is_a_warning() {
+        let off = serde_json::json!({
+            "state": "ok",
+            "park_root": Value::Null,
+            "park_mounted": false,
+            "parks": 0,
+            "park_bytes": 0,
+        });
+        let report = doctor(&off);
+        assert!(
+            report
+                .fields
+                .contains(&("park_root".to_owned(), "-".to_owned()))
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "a tier nobody turned on has nothing to say"
+        );
+
+        let unplugged = serde_json::json!({
+            "state": "ok",
+            "park_root": "/Volumes/dev-disk/shade-park",
+            "park_mounted": false,
+            "parks": 2,
+            "park_bytes": 8_589_934_592_i64,
+        });
+        assert_eq!(
+            doctor(&unplugged).warnings,
+            ["park root configured but not mounted: sleep discards build output until it is back"]
+        );
+
+        let mounted = serde_json::json!({
+            "state": "ok",
+            "park_root": "/Volumes/dev-disk/shade-park",
+            "park_mounted": true,
+        });
+        assert!(doctor(&mounted).warnings.is_empty());
     }
 
     #[test]

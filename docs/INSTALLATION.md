@@ -52,8 +52,15 @@ way. Any other command that reaches an absent or refused socket answers
 recorded diagnostic per attempt.
 
 The plist supplies the selected Shade root and socket, a restrictive umask,
-KeepAlive, and a canonical snapshot of existing host PATH directories. Shade
-does not install package managers or runtimes. Reinstall after changing the
+KeepAlive, and a canonical snapshot of existing host PATH directories. A
+LaunchAgent inherits no environment, so anything the installing shell chose has
+to be restated there or the daemon comes up without it: a configured
+`SHADE_PARK_ROOT` and its `SHADE_PARK_MIN_BYTES` are written when one was set,
+and `SHADE_AUTO_SLEEP_DAYS` is written either way -- the shell's own value when
+it named one, including an empty value meaning no sweep, and `3` when it named
+none. That default exists only for an installed daemon, which outlives every
+shell that talks to it; the engine's own default is still no sweep at all.
+Shade does not install package managers or runtimes. Reinstall after changing the
 directories used to discover tools. The providers still bind each preparation
 to the actual tool and interpreter identities they resolve.
 
