@@ -378,6 +378,28 @@ impl EngineError {
         }
     }
 
+    /// A parked-tier failure.
+    ///
+    /// The park volume is external and removable, so this is a condition of
+    /// the moment rather than of the workspace: nothing about the workspace
+    /// changed and the same call is worth making again once the volume is
+    /// back. The detail goes to a diagnostic; the caller is told where to look.
+    pub fn park(error: impl std::fmt::Display) -> Self {
+        let diagnostic = crate::diagnostics::new(
+            shade_protocol::DiagnosticOrigin::Daemon,
+            crate::park::PARK_FAILED,
+            error,
+        );
+        Self {
+            code: crate::park::PARK_FAILED.into(),
+            retry: "safe".into(),
+            operation: None,
+            next: Some("check that SHADE_PARK_ROOT is mounted and writable".into()),
+            diagnostics_id: None,
+            diagnostic: Some(Box::new(diagnostic)),
+        }
+    }
+
     /// Sanitized detail for a startup failure that occurred before the engine
     /// could persist its own diagnostic. No uncommitted reference is exposed.
     pub fn diagnostic_message(&self) -> Option<&str> {

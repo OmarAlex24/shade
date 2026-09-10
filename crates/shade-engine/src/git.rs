@@ -24,6 +24,27 @@ use url::Url;
 /// records that the endpoint is scp syntax rather than `ssh://`, whose path is
 /// absolute where scp's is relative to the remote user's home directory.
 const SCP_IDENTITY_SCHEME: &str = "ssh+scp://";
+/// Environment no Git the daemon starts may inherit. Every one of these
+/// redirects the object store, the index or the work tree, so a single
+/// inherited variable silently retargets a command at the caller's repository.
+/// Shared with the parked tier, which shells out to Git for its own inventory.
+pub(crate) const INHERITED_GIT_ENVIRONMENT: [&str; 8] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_QUARANTINE_PATH",
+    "GIT_WORK_TREE",
+    "GIT_CONFIG_COUNT",
+];
+/// Environment every Git the daemon starts is given: no terminal prompt, no
+/// interactive credential manager, and a stable locale for parsed output.
+pub(crate) const PINNED_GIT_ENVIRONMENT: [(&str, &str); 3] = [
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GCM_INTERACTIVE", "Never"),
+    ("LC_ALL", "C"),
+];
 const PRIVATE_REFS: &str = "refs/shade";
 const QUARANTINE_REF: &str = "refs/shade/quarantine/fetched-head";
 /// Bases taken from the local repository are anchored here so their objects
@@ -388,21 +409,12 @@ impl GitStore {
     ) -> Command {
         let mut command = Command::new(&self.binary);
         command.args(args);
-        for variable in [
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-            "GIT_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_QUARANTINE_PATH",
-            "GIT_WORK_TREE",
-            "GIT_CONFIG_COUNT",
-        ] {
+        for variable in INHERITED_GIT_ENVIRONMENT {
             command.env_remove(variable);
         }
-        command.env("GIT_TERMINAL_PROMPT", "0");
-        command.env("GCM_INTERACTIVE", "Never");
-        command.env("LC_ALL", "C");
+        for (variable, value) in PINNED_GIT_ENVIRONMENT {
+            command.env(variable, value);
+        }
         command.envs(environment.iter().cloned());
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -1249,7 +1261,7 @@ fn parse_oid(bytes: &[u8]) -> anyhow::Result<Oid> {
     Oid::new(String::from_utf8(trim_ascii_newline(bytes).to_vec())?)
 }
 
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
 }
 

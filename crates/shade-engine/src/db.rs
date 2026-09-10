@@ -68,6 +68,29 @@ pub struct WorkspaceRecord {
     pub dependency_state: String,
 }
 
+/// One row of the workspace inventory: what a listing needs, and nothing that
+/// costs a tree walk to answer.
+///
+/// `private_bytes` is deliberately left unset here. The honest number is
+/// `WorkspaceFilesystem::usage`, which walks every file under the workspace --
+/// far too expensive for a command a person runs to see what exists. The field
+/// is part of the shape so a tier that already stores its own byte count can
+/// fill it without changing any caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub id: WorkspaceId,
+    /// The repository identity, not its id: a listing is read by a person.
+    pub repository: String,
+    pub state: String,
+    pub session_id: Option<SessionId>,
+    pub cwd: PathBuf,
+    pub base_ref: String,
+    pub head_oid: ObjectId,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
@@ -237,17 +260,9 @@ impl Database {
 
     /// Explicit offline lookup. Never creates a database or runs reconciliation.
     pub fn read_diagnostic(path: &Path, id: &str) -> Result<Option<Diagnostic>, DbError> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(connection) = open_read_only(path)? else {
+            return Ok(None);
         };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(std::io::Error::other("state database is not a regular file").into());
-        }
-        let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(std::time::Duration::from_secs(10))?;
         read_diagnostic(&connection, id)
     }
 
@@ -664,6 +679,20 @@ impl Database {
         )?;
         let rows = statement.query_map([], workspace_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every workspace that still exists, most recently touched first.
+    pub fn workspace_summaries(&self) -> Result<Vec<WorkspaceSummary>, DbError> {
+        workspace_summaries(&*self.connection()?)
+    }
+
+    /// Explicit offline listing. Never creates a database and never writes to
+    /// one, so it is safe to run beside a live daemon that owns the same file.
+    pub fn read_workspace_summaries(path: &Path) -> Result<Vec<WorkspaceSummary>, DbError> {
+        let Some(connection) = open_read_only(path)? else {
+            return Ok(Vec::new());
+        };
+        workspace_summaries(&connection)
     }
 
     pub fn workspace_for_cwd(&self, cwd: &Path) -> Result<Option<WorkspaceRecord>, DbError> {
@@ -2917,6 +2946,44 @@ impl Database {
             "tracked_secret_matches": tracked_secret_matches,
         }))
     }
+}
+
+/// Open the state database without creating it and without writing to it.
+/// `Ok(None)` means there is no state to read yet.
+fn open_read_only(path: &Path) -> Result<Option<Connection>, DbError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("state database is not a regular file").into());
+    }
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(10))?;
+    Ok(Some(connection))
+}
+
+fn workspace_summaries(connection: &Connection) -> Result<Vec<WorkspaceSummary>, DbError> {
+    let mut statement = connection.prepare(
+        "SELECT w.id, r.identity, w.state, w.session_id, w.path, w.base_ref, w.head_oid, \
+         w.updated_at_ms FROM workspaces w JOIN repositories r ON r.id=w.repository_id \
+         WHERE w.state NOT IN ('deleted','deleting') ORDER BY w.updated_at_ms DESC, w.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(WorkspaceSummary {
+            id: WorkspaceId(row.get(0)?),
+            repository: row.get(1)?,
+            state: row.get(2)?,
+            session_id: row.get::<_, Option<String>>(3)?.map(SessionId),
+            cwd: PathBuf::from(row.get::<_, String>(4)?),
+            base_ref: row.get(5)?,
+            head_oid: ObjectId(row.get(6)?),
+            updated_at_ms: row.get(7)?,
+            private_bytes: None,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn insert_diagnostic(connection: &Connection, diagnostic: &Diagnostic) -> Result<(), DbError> {

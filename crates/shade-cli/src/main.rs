@@ -1,3 +1,4 @@
+mod human;
 mod keepalive;
 
 use anyhow::Context;
@@ -28,6 +29,11 @@ struct Cli {
     socket: Option<PathBuf>,
     #[arg(long, global = true)]
     idempotency_key: Option<String>,
+    /// Render `status` and `doctor` as text for a person; `SHADE_HUMAN=1` is
+    /// the same switch. Every other command, and every command without it,
+    /// still prints one JSON value.
+    #[arg(long, global = true)]
+    human: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -52,9 +58,12 @@ enum Command {
         keepalive: KeepaliveArgs,
     },
     /// The lifecycle of one session, answerable without a live lease.
+    ///
+    /// The session is required for JSON, which answers about one session or
+    /// not at all. `--human` without one lists every workspace instead.
     Status {
         #[arg(long, env = "SHADE_SESSION")]
-        session: String,
+        session: Option<String>,
     },
     Context(SelectorArgs),
     Heartbeat {
@@ -344,7 +353,7 @@ fn main() {
         }
         return;
     }
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => match error.kind() {
             ErrorKind::DisplayHelp => {
@@ -358,12 +367,15 @@ fn main() {
                 return;
             }
             _ => {
-                emit(&local_error(
-                    "CLI_ARGUMENT_INVALID",
-                    "never",
-                    "inspect `shade --help` and correct the arguments",
-                    None,
-                ));
+                emit_failure(
+                    human_requested(),
+                    &local_error(
+                        "CLI_ARGUMENT_INVALID",
+                        "never",
+                        "inspect `shade --help` and correct the arguments",
+                        None,
+                    ),
+                );
                 std::process::exit(64);
             }
         },
@@ -376,7 +388,12 @@ fn main() {
     } else {
         tokio::runtime::Builder::new_current_thread()
     };
+    // Read by hand rather than by clap: clap parses an environment value for
+    // a flag as a literal `true` or `false`, and `SHADE_HUMAN=1` is what a
+    // person actually exports.
+    cli.human = cli.human || human_environment();
     let diagnostic_config = EngineConfig::discover().ok();
+    let human = cli.human;
     let result = match runtime.enable_all().build() {
         Ok(runtime) => runtime.block_on(run(cli)),
         Err(error) => Err(error.into()),
@@ -387,24 +404,27 @@ fn main() {
             idempotency_key,
         }) = error.downcast_ref::<ClientError>()
         {
-            emit(&local_timeout(
-                operation.clone(),
-                idempotency_key.as_deref(),
-            ));
+            emit_failure(
+                human,
+                &local_timeout(operation.clone(), idempotency_key.as_deref()),
+            );
             std::process::exit(75);
         }
         if let Some(ClientError::Domain(error)) = error.downcast_ref::<ClientError>() {
-            emit(&WireResponse {
-                v: PROTOCOL_VERSION,
-                request_id: "cli".into(),
-                body: ResponseBody::Error {
-                    error: error.clone(),
+            emit_failure(
+                human,
+                &WireResponse {
+                    v: PROTOCOL_VERSION,
+                    request_id: "cli".into(),
+                    body: ResponseBody::Error {
+                        error: error.clone(),
+                    },
                 },
-            });
+            );
             std::process::exit(1);
         }
         if daemon_unreachable(&error) {
-            emit(&daemon_not_running());
+            emit_failure(human, &daemon_not_running());
             std::process::exit(1);
         }
         let diagnostics_id = diagnostic_config.and_then(|config| {
@@ -420,12 +440,15 @@ fn main() {
                 .ok()
                 .map(|diagnostic| diagnostic.id)
         });
-        emit(&local_error(
-            "CLI_FAILED",
-            "safe",
-            "run `shade doctor`, then retry with the same idempotency key",
-            diagnostics_id,
-        ));
+        emit_failure(
+            human,
+            &local_error(
+                "CLI_FAILED",
+                "safe",
+                "run `shade doctor`, then retry with the same idempotency key",
+                diagnostics_id,
+            ),
+        );
         std::process::exit(1);
     }
 }
@@ -442,6 +465,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         emit(&local_completed(install(&config, args).await?));
         return Ok(());
     }
+    let human = cli.human;
     let config = EngineConfig::discover()?;
     let socket = cli.socket.unwrap_or_else(|| config.socket.clone());
     let client = ShadeClient::cli(socket.clone());
@@ -512,14 +536,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await?;
             emit(&keepalive::annotate(&config, &socket, &options.options(), response).await);
         }
-        Command::Status { session } => {
-            let response = client
-                .query(Query::Session {
-                    session_id: SessionId(session.clone()),
-                })
-                .await?;
-            emit(&with_local_keepalive(&config, &session, response));
-        }
+        Command::Status { session } => match (human, session) {
+            // Unchanged for scripts: a JSON status answers about one named
+            // session, and no session is still an argument error.
+            (false, None) => {
+                emit(&local_error(
+                    "CLI_ARGUMENT_INVALID",
+                    "never",
+                    "inspect `shade --help` and correct the arguments",
+                    None,
+                ));
+                std::process::exit(64);
+            }
+            (_, Some(session)) => {
+                let response = client
+                    .query(Query::Session {
+                        session_id: SessionId(session.clone()),
+                    })
+                    .await?;
+                let response = with_local_keepalive(&config, &session, response);
+                if human {
+                    render_human(&response, human::Report::from_value);
+                } else {
+                    emit(&response);
+                }
+            }
+            (true, None) => print!("{}", workspace_inventory(&config)?.render()),
+        },
         Command::Context(selector) => emit(&client.context(selector.selector()?).await?),
         Command::Heartbeat { session, lease } => emit(
             &client
@@ -729,10 +772,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             keepalive::stop_for_review(&config, &response).await;
             emit(&response);
         }
-        Command::Doctor { diagnostics: None } => emit(&client.query(Query::Doctor).await?),
+        Command::Doctor { diagnostics: None } => {
+            let response = client.query(Query::Doctor).await?;
+            if human {
+                render_human(&response, human::doctor);
+            } else {
+                emit(&response);
+            }
+        }
         Command::Doctor {
             diagnostics: Some(id),
-        } => emit(&read_diagnostic(&client, &config, id).await?),
+        } => {
+            let response = read_diagnostic(&client, &config, id).await?;
+            if human {
+                render_human(&response, human::Report::from_value);
+            } else {
+                emit(&response);
+            }
+        }
         Command::Gc => emit(
             &client
                 .execute_wait_idempotent(Intent::GarbageCollect, idempotency_key)
@@ -767,6 +824,96 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Install(_) | Command::Daemon(_) => unreachable!(),
     }
     Ok(())
+}
+
+/// `--human` before `Cli` exists. The parse already failed, so clap cannot
+/// say whether a person asked for text; the raw arguments and the environment
+/// still can.
+fn human_requested() -> bool {
+    std::env::args_os().any(|argument| argument == "--human") || human_environment()
+}
+
+/// `SHADE_HUMAN` is set, and set to something that means yes.
+fn human_environment() -> bool {
+    std::env::var_os("SHADE_HUMAN").is_some_and(|value| {
+        !matches!(
+            value.to_str(),
+            None | Some("") | Some("0") | Some("false") | Some("no") | Some("off")
+        )
+    })
+}
+
+/// One JSON value, or one line on stderr. A failure never prints both, and in
+/// `--human` mode it never prints JSON a person did not ask for.
+fn emit_failure(human: bool, response: &WireResponse) {
+    match &response.body {
+        ResponseBody::Error { error } if human => eprintln!(
+            "{}",
+            human::error_line(
+                &error.code,
+                error.next.as_deref(),
+                error.diagnostics_id.as_deref(),
+            )
+        ),
+        _ => emit(response),
+    }
+}
+
+/// One completed query becomes one block of text. An error never becomes half
+/// a table: it leaves by the same single stderr line every other failure uses.
+fn render_human(response: &WireResponse, report: impl FnOnce(&Value) -> human::Report) {
+    match &response.body {
+        ResponseBody::Ok {
+            outcome: Outcome::Completed(value),
+        } => print!("{}", report(value).render()),
+        ResponseBody::Error { .. } => {
+            emit_failure(true, response);
+            std::process::exit(1);
+        }
+        // A query settles or it fails; it never returns an operation to wait on.
+        ResponseBody::Ok { .. } => {
+            eprintln!(
+                "{}",
+                human::error_line(
+                    "QUERY_OUTCOME_UNEXPECTED",
+                    Some("a query answered with a non-terminal outcome"),
+                    None,
+                )
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `status --human` with no session lists every workspace.
+///
+/// Protocol v1 exposes no enumeration query, so the inventory is read straight
+/// from the state database -- read-only, and never creating it: the same
+/// offline door `doctor --diagnostics` already uses when the socket cannot
+/// answer. The daemon writes that file under WAL, so a reader beside it sees
+/// the last committed state and blocks nothing.
+fn workspace_inventory(config: &EngineConfig) -> anyhow::Result<human::StatusReport> {
+    let summaries = shade_engine::db::Database::read_workspace_summaries(&config.database_path())?;
+    Ok(human::StatusReport {
+        now_ms: shade_engine::db::now_ms(),
+        rows: summaries
+            .into_iter()
+            .map(|summary| human::WorkspaceRow {
+                workspace: summary.id.0,
+                repository: summary.repository,
+                state: summary.state,
+                session: summary.session_id.map(|session| session.0),
+                updated_at_ms: Some(summary.updated_at_ms),
+                bytes: summary.private_bytes,
+                // A suspended workspace keeps its path and not its tree.
+                path: summary
+                    .cwd
+                    .join(".git")
+                    .is_file()
+                    .then(|| home_relative(&summary.cwd)),
+            })
+            .collect(),
+    })
 }
 
 async fn read_diagnostic(
@@ -1780,6 +1927,7 @@ fn launch_agent_plist(label: &str, binary: &Path, config: &EngineConfig) -> anyh
     let root = path_string(&config.root)?;
     let socket = path_string(&config.socket)?;
     let search_path = installed_search_path()?;
+    let park = park_environment(config)?;
     // SDK calls await this service over a Unix socket, which cannot raise an
     // Adaptive job's priority through an XPC transaction. Background throttling
     // otherwise turns even tiny Git imports into client timeouts.
@@ -1793,7 +1941,7 @@ fn launch_agent_plist(label: &str, binary: &Path, config: &EngineConfig) -> anyh
 </array>
 <key>EnvironmentVariables</key><dict>
 <key>SHADE_ROOT</key><string>{}</string>
-<key>PATH</key><string>{}</string>
+<key>PATH</key><string>{}</string>{}
 </dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>ProcessType</key><string>Interactive</string>
@@ -1806,6 +1954,24 @@ fn launch_agent_plist(label: &str, binary: &Path, config: &EngineConfig) -> anyh
         xml_escape(&socket),
         xml_escape(&root),
         xml_escape(&search_path),
+        park,
+    ))
+}
+
+/// The parked tier's environment, as plist entries, or nothing at all.
+///
+/// A LaunchAgent inherits no environment, so anything `EngineConfig::discover`
+/// read from the installing shell has to be restated here or the daemon comes
+/// up without it. The park root is the switch for the whole tier, so its
+/// threshold is only worth carrying when a root came with it.
+fn park_environment(config: &EngineConfig) -> anyhow::Result<String> {
+    let Some(park_root) = config.park_root() else {
+        return Ok(String::new());
+    };
+    Ok(format!(
+        "\n<key>SHADE_PARK_ROOT</key><string>{}</string>\n<key>SHADE_PARK_MIN_BYTES</key><string>{}</string>",
+        xml_escape(&path_string(park_root)?),
+        config.park_min_bytes(),
     ))
 }
 
@@ -2356,6 +2522,21 @@ trailing"#;
         assert!(plist.contains("data&amp;root"));
         assert!(plist.contains("shade&lt;bin&gt;"));
         assert!(plist.contains("<key>Umask</key><integer>63</integer>"));
+        assert!(!plist.contains("SHADE_PARK_ROOT"));
+    }
+
+    #[test]
+    fn launch_agent_carries_the_park_volume_when_one_is_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig::at(temp.path().join("root"));
+        config.park_root = Some(PathBuf::from("/Volumes/dev&disk/shade-park"));
+        config.park_min_bytes = 1_048_576;
+        let plist =
+            launch_agent_plist("com.shade.daemon", &temp.path().join("shade"), &config).unwrap();
+        assert!(plist.contains(
+            "<key>SHADE_PARK_ROOT</key><string>/Volumes/dev&amp;disk/shade-park</string>"
+        ));
+        assert!(plist.contains("<key>SHADE_PARK_MIN_BYTES</key><string>1048576</string>"));
     }
 
     #[test]

@@ -40,7 +40,9 @@ cargo build --release
 
 Running it again upgrades in place. launchd acknowledges a `bootout` before the old job is actually gone and refuses a `bootstrap` that arrives inside that window, so the installer waits for launchd to report the service removed, retries the bootstrap, and only reports success once the socket answers `doctor`. The result carries `restarted`, and a bootstrap that is still refused fails with `LAUNCHAGENT_BOOTSTRAP_FAILED`, launchd's own reason in the diagnostic and the exact `launchctl bootstrap` command in `next`. A command that finds no daemon behind its socket answers `DAEMON_NOT_RUNNING` with the same two ways to start it.
 
-Every command prints exactly one minified JSON value on stdout. `shade --help` and `shade --version` print JSON too. `events --follow` prints JSONL. There is no prompt, color, table or human presentation mode.
+Every command prints exactly one minified JSON value on stdout. `shade --help` and `shade --version` print JSON too. `events --follow` prints JSONL. There is no prompt and no color.
+
+Two commands can also answer a person instead of a script. `shade status --human` and `shade doctor --human` -- `SHADE_HUMAN=1` is the same switch -- render a padded table or a `key value` block instead of JSON, with ages as `3m`, `2h`, `5d` and sizes as `1.2 GiB`. `status --human` with no `--session` lists every workspace by short id, repository, state, session, age, size and path; with one it prints that session's lifecycle. A failure in this mode is a single line on stderr naming the code and the way out, and the exit status is non-zero. Nothing about the default output changes: without `--human`, every command still prints the same JSON it always did, so scripts and both SDKs are unaffected.
 
 ```zsh
 open_key='open:task-42'
