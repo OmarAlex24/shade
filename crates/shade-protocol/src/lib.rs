@@ -358,6 +358,20 @@ pub struct SleepResult {
     pub cwd: String,
     /// What to do next, in one line: leave the deleted directory, then wake.
     pub next: String,
+    /// Whether the private build output was copied to the park volume instead
+    /// of being discarded with the tree.
+    #[serde(default)]
+    pub parked: bool,
+    /// How many bytes the park holds. Zero unless `parked`.
+    #[serde(default)]
+    pub parked_bytes: u64,
+    /// Where the park landed, for an operator who has to find it by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_path: Option<String>,
+    /// Why nothing was parked: `unconfigured`, `unmounted`, `below_min_bytes`,
+    /// `park_failed` or `not_recorded`. Absent when the output was parked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_reason: Option<String>,
 }
 
 /// Reported by the CLI only. The daemon and the SDKs never populate it: SDK
@@ -386,6 +400,32 @@ pub struct OpenedSession {
     pub compact_context: CompactContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive: Option<KeepaliveStatus>,
+}
+
+/// The result of `session_wake`: everything `open` returns, plus what the
+/// parked tier could give back.
+///
+/// The session fields are flattened, so a v1 caller that reads a wake as an
+/// [`OpenedSession`] still parses every field it knows and ignores the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeResult {
+    #[serde(flatten)]
+    pub session: OpenedSession,
+    /// Whether the parked build output was copied back into the successor.
+    #[serde(default)]
+    pub park_restored: bool,
+    /// How many bytes came back. Zero unless `park_restored`.
+    #[serde(default)]
+    pub park_restored_bytes: u64,
+    /// Why the park was not restored: `unmounted`, `absent`,
+    /// `manifest_mismatch` or `park_failed`. Absent when there was no park to
+    /// restore or when it was restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_reason: Option<String>,
+    /// Said only when a park existed and did not come back, because that is
+    /// the one case where the successor is not what the caller expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +570,69 @@ mod tests {
         });
         let decoded: CompactContext = serde_json::from_value(elided).unwrap();
         assert_eq!(decoded.lifecycle, "active");
+    }
+
+    fn opened() -> OpenedSession {
+        OpenedSession {
+            session: SessionId("session-1".into()),
+            workspace: WorkspaceId("ws_1".into()),
+            lease: LeaseId("lease_1".into()),
+            cwd: "/tmp/ws".into(),
+            env: BTreeMap::new(),
+            compact_context: context("active"),
+            keepalive: None,
+        }
+    }
+
+    #[test]
+    fn a_wake_result_reads_back_as_a_plain_opened_session() {
+        let wake = WakeResult {
+            session: opened(),
+            park_restored: false,
+            park_restored_bytes: 0,
+            park_reason: Some("unmounted".into()),
+            next: Some(
+                "build output not restored (unmounted); it will regenerate on the next build"
+                    .into(),
+            ),
+        };
+        let encoded = serde_json::to_value(&wake).unwrap();
+        // Flattened, so a v1 reader that only knows `OpenedSession` still sees
+        // every field it was written against.
+        let v1: OpenedSession = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(v1.workspace.0, "ws_1");
+        assert_eq!(encoded["park_reason"], "unmounted");
+        let decoded: WakeResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.session.lease.0, "lease_1");
+        assert!(!decoded.park_restored);
+        assert_eq!(decoded.park_restored_bytes, 0);
+    }
+
+    #[test]
+    fn a_v1_sleep_result_without_park_fields_still_parses() {
+        let v1 = serde_json::json!({
+            "session": "session-1",
+            "workspace": "ws_1",
+            "checkpoint_id": "ckpt_1",
+            "suspended": true,
+            "reclaimed_bytes": 4096,
+            "cwd": "/tmp/ws",
+            "next": "cd elsewhere",
+        });
+        let decoded: SleepResult = serde_json::from_value(v1).unwrap();
+        assert!(!decoded.parked);
+        assert_eq!(decoded.parked_bytes, 0);
+        assert_eq!(decoded.park_path, None);
+        assert_eq!(decoded.park_reason, None);
+    }
+
+    #[test]
+    fn a_v1_wake_result_without_park_fields_still_parses() {
+        let mut v1 = serde_json::to_value(opened()).unwrap();
+        v1.as_object_mut().unwrap().remove("keepalive");
+        let decoded: WakeResult = serde_json::from_value(v1).unwrap();
+        assert!(!decoded.park_restored);
+        assert_eq!(decoded.next, None);
     }
 
     #[test]

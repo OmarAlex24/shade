@@ -637,6 +637,14 @@ pub struct SleepResult {
     pub checkpoint_id: CheckpointId,
     pub suspended: bool,
     pub reclaimed_bytes: u64,
+    /// Whether the private build output went to the park volume instead of
+    /// away with the tree. Absent from a daemon older than the parked tier.
+    #[serde(default)]
+    pub parked: bool,
+    #[serde(default)]
+    pub parked_bytes: u64,
+    #[serde(default)]
+    pub park_reason: Option<String>,
 }
 
 #[derive(Clone)]

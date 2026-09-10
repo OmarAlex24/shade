@@ -41,6 +41,7 @@ struct Fixture {
     source: PathBuf,
     socket: PathBuf,
     faults: PathBuf,
+    park: PathBuf,
     binary: PathBuf,
     lease_ttl_secs: u64,
 }
@@ -71,11 +72,16 @@ impl Fixture {
         git(&source, &["commit", "-m", "fixture"]);
         let faults = temp.path().join("faults");
         std::fs::create_dir(&faults).unwrap();
+        // A mounted park volume, so the sleep and wake cases reach the parked
+        // tier's boundaries instead of skipping them as unconfigured.
+        let park = temp.path().join("park");
+        std::fs::create_dir(&park).unwrap();
         Self {
             root: temp.path().join("state"),
             socket: temp.path().join("s.sock"),
             source,
             faults,
+            park,
             binary: binary.to_path_buf(),
             lease_ttl_secs: 120,
             _temp: temp,
@@ -105,6 +111,8 @@ impl Fixture {
                 .env("SHADE_OPERATION_WAIT_MS", "0")
                 .env("SHADE_FAULT_POINT", point.name())
                 .env("SHADE_FAULT_DIR", &self.faults)
+                .env("SHADE_PARK_ROOT", &self.park)
+                .env("SHADE_PARK_MIN_BYTES", "0")
                 // Git's disposable indexes must also be inside the isolated case.
                 .env("TMPDIR", self._temp.path())
                 .stdin(Stdio::null())
@@ -667,10 +675,11 @@ fn scenario(point: Point) -> Scenario {
         | Point::PublishResolutionReady => Scenario::PublishConflict,
         Point::ReleaseLeaseReleased | Point::ReleaseRecorded => Scenario::Release,
         Point::SleepCheckpointed
+        | Point::SleepParked
         | Point::SleepSecretsVaulted
         | Point::SleepRegistrationRemoved
         | Point::SleepRecorded => Scenario::Sleep,
-        Point::WakeMaterialized | Point::WakeActivated => Scenario::Wake,
+        Point::WakeMaterialized | Point::WakeParkRestored | Point::WakeActivated => Scenario::Wake,
         Point::ScriptDecisionWritten | Point::ScriptDecisionCompleted => Scenario::ScriptApprove,
         Point::DependencyStaged
         | Point::DependencyFilled
@@ -1019,6 +1028,13 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
                 git(&cwd, &["add", "tracked.txt"]);
                 std::fs::write(cwd.join("tracked.txt"), "working\n").unwrap();
                 std::fs::write(cwd.join("untracked.txt"), "untracked\n").unwrap();
+                if matches!(case, Scenario::Sleep | Scenario::Wake) {
+                    // Only these two cases: an ignore rule changes what every
+                    // other scenario's checkpoint and publish already assert.
+                    std::fs::write(cwd.join(".gitignore"), "ignored/\n").unwrap();
+                    std::fs::create_dir_all(cwd.join("ignored")).unwrap();
+                    std::fs::write(cwd.join("ignored/out.bin"), "build output\n").unwrap();
+                }
                 if !matches!(
                     case,
                     Scenario::Gc | Scenario::DependencyGc | Scenario::Sleep | Scenario::Wake
@@ -1390,7 +1406,10 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
                 .into_iter()
                 .next()
                 .unwrap();
-            if matches!(point, Point::SleepCheckpointed | Point::SleepSecretsVaulted) {
+            if matches!(
+                point,
+                Point::SleepCheckpointed | Point::SleepParked | Point::SleepSecretsVaulted
+            ) {
                 // The tree is still registered and still owned, so the honest
                 // place to leave the workspace is where it was.
                 assert_eq!(
@@ -1451,7 +1470,7 @@ fn real_sigkill_at_every_registered_boundary_recovers_consistently() {
         }
         if matches!(case, Scenario::Wake) {
             let db = fixture.database();
-            if point == Point::WakeMaterialized {
+            if matches!(point, Point::WakeMaterialized | Point::WakeParkRestored) {
                 // The suspension the successor was built from is untouched,
                 // and the half-built successor is an ordinary incomplete
                 // workspace that reconciliation already removed.

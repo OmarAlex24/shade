@@ -43,6 +43,11 @@ pub struct EngineConfig {
     /// Do not park build output smaller than this. See
     /// [`DEFAULT_PARK_MIN_BYTES`].
     pub park_min_bytes: u64,
+    /// Keep a park after the wake that restored it. Off by default: the park
+    /// belongs to a checkpoint that stops being a suspension checkpoint the
+    /// moment the successor is activated, so keeping it is a debugging
+    /// affordance rather than a tier the collector understands.
+    pub park_keep_after_wake: bool,
 }
 
 impl EngineConfig {
@@ -59,6 +64,7 @@ impl EngineConfig {
         config.suspended_retention_secs = lifecycle_days("SHADE_SUSPENDED_RETENTION_DAYS")?;
         config.park_root = park_root("SHADE_PARK_ROOT")?;
         config.park_min_bytes = park_min_bytes("SHADE_PARK_MIN_BYTES")?;
+        config.park_keep_after_wake = flag("SHADE_PARK_KEEP_AFTER_WAKE");
         Ok(config)
     }
 
@@ -74,6 +80,7 @@ impl EngineConfig {
             suspended_retention_secs: DEFAULT_SUSPENDED_RETENTION_SECS,
             park_root: None,
             park_min_bytes: DEFAULT_PARK_MIN_BYTES,
+            park_keep_after_wake: false,
         }
     }
 
@@ -158,6 +165,11 @@ impl EngineConfig {
         self.park_min_bytes
     }
 
+    /// Should a restored park survive the wake that used it?
+    pub fn park_keep_after_wake(&self) -> bool {
+        self.park_keep_after_wake
+    }
+
     /// Is the park volume there and writable right now?
     ///
     /// An external disk is unplugged far more often than it is misconfigured,
@@ -168,6 +180,14 @@ impl EngineConfig {
     pub fn park_root_mounted(&self) -> bool {
         self.park_root.as_deref().is_some_and(writable_directory)
     }
+}
+
+/// A boolean switch, on only for the exact string `1`.
+///
+/// Anything else -- unset, empty, `true`, `yes` -- leaves it off, because a
+/// switch that guesses is worse than one that has to be spelled.
+fn flag(variable: &str) -> bool {
+    std::env::var_os(variable).is_some_and(|value| value == "1")
 }
 
 /// Whether the process may create entries inside an existing directory.
@@ -340,6 +360,9 @@ mod tests {
             None
         );
         assert!(!EngineConfig::at("/tmp/shade-config-park-test").park_root_mounted());
+        // A park is spent by the wake that restores it unless an operator says
+        // otherwise, so the switch that keeps one is off by default.
+        assert!(!EngineConfig::at("/tmp/shade-config-park-test").park_keep_after_wake());
         assert_eq!(parse_park_root(variable, None).unwrap(), None);
         assert_eq!(
             parse_park_root(variable, Some(OsStr::new("   "))).unwrap(),

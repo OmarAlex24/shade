@@ -91,6 +91,22 @@ pub struct WorkspaceSummary {
     pub private_bytes: Option<u64>,
 }
 
+/// One park: the private build output of `workspace_id` as it stood at
+/// `checkpoint_id`, sitting on the external volume.
+///
+/// Deliberately keyed on ids rather than joined to them. The park outlives the
+/// rows it names -- a collected workspace leaves its park behind on a volume
+/// that may not even be plugged in -- and a foreign key would either block the
+/// deletion or take the only record of those bytes with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkRecord {
+    pub workspace_id: WorkspaceId,
+    pub checkpoint_id: CheckpointId,
+    pub park_path: PathBuf,
+    pub bytes: u64,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
@@ -240,6 +256,7 @@ impl Database {
         // otherwise still see the rows an older binary wrote as `orphaned`,
         // which is the one state the collector treats as collectible.
         normalize_dormant_state_rows(&transaction)?;
+        transaction.execute_batch(ADDITIVE_SCHEMA)?;
         transaction.commit()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -2848,6 +2865,86 @@ impl Database {
         Ok(())
     }
 
+    /// Record a park and announce it in the same transaction.
+    ///
+    /// One park per (workspace, checkpoint): a second sleep of the same
+    /// workspace produces a new checkpoint, and a re-park of the same
+    /// checkpoint replaces bytes that describe an older tree.
+    pub fn record_park(&self, park: &ParkRecord) -> Result<(), DbError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO parks (workspace_id, checkpoint_id, park_path, bytes, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(workspace_id, checkpoint_id) DO UPDATE SET \
+               park_path=excluded.park_path, bytes=excluded.bytes, \
+               created_at_ms=excluded.created_at_ms",
+            params![
+                park.workspace_id.0,
+                park.checkpoint_id.0,
+                park.park_path.to_string_lossy(),
+                saturating_i64(park.bytes),
+                park.created_at_ms,
+            ],
+        )?;
+        append_event(
+            &transaction,
+            "workspace.parked",
+            &park.workspace_id.0,
+            &json!({
+                "workspace_id": park.workspace_id,
+                "checkpoint_id": park.checkpoint_id,
+                "park_path": park.park_path.to_string_lossy(),
+                "bytes": park.bytes,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn park(
+        &self,
+        workspace_id: &WorkspaceId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<Option<ParkRecord>, DbError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT workspace_id, checkpoint_id, park_path, bytes, created_at_ms \
+                 FROM parks WHERE workspace_id=?1 AND checkpoint_id=?2",
+                params![workspace_id.0, checkpoint_id.0],
+                park_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every park the daemon believes it owns, oldest first.
+    pub fn parks(&self) -> Result<Vec<ParkRecord>, DbError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT workspace_id, checkpoint_id, park_path, bytes, created_at_ms FROM parks \
+             ORDER BY created_at_ms ASC, workspace_id, checkpoint_id",
+        )?;
+        let rows = statement.query_map([], park_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Forget a park. Removing the bytes it names is the caller's job, and
+    /// only the caller knows whether the volume is there to remove them from.
+    pub fn delete_park(
+        &self,
+        workspace_id: &WorkspaceId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<(), DbError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM parks WHERE workspace_id=?1 AND checkpoint_id=?2",
+            params![workspace_id.0, checkpoint_id.0],
+        )?;
+        Ok(())
+    }
+
     pub fn doctor(&self) -> Result<Value, DbError> {
         let connection = self.connection()?;
         let integrity: String =
@@ -2931,6 +3028,25 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        let (parks, park_bytes): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM parks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // A park is garbage the moment it stops describing a live suspension:
+        // the workspace went, or a later sleep gave it a different suspension
+        // checkpoint. `IS NOT` rather than `!=` so a workspace with no sleep
+        // checkpoint at all counts instead of comparing against NULL and
+        // silently answering neither yes nor no.
+        let parks_orphaned: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM parks p WHERE p.checkpoint_id IS NOT ( \
+               SELECT c.id FROM checkpoints c JOIN workspaces w ON w.id=c.workspace_id \
+               WHERE c.workspace_id=p.workspace_id AND c.state='ready' AND c.reason='sleep' \
+                 AND w.state NOT IN ('released','deleted','deleting') \
+               ORDER BY c.created_at_ms DESC, c.rowid DESC LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(json!({
             "state": integrity,
             "sessions": active_sessions,
@@ -2944,6 +3060,9 @@ impl Database {
             "workspaces_failed_awaiting_review": failed_awaiting_review,
             "suspended_without_checkpoint": suspended_without_checkpoint,
             "tracked_secret_matches": tracked_secret_matches,
+            "parks": parks,
+            "park_bytes": park_bytes,
+            "parks_orphaned": parks_orphaned,
         }))
     }
 }
@@ -2986,6 +3105,22 @@ fn workspace_summaries(connection: &Connection) -> Result<Vec<WorkspaceSummary>,
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+fn park_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParkRecord> {
+    Ok(ParkRecord {
+        workspace_id: WorkspaceId(row.get(0)?),
+        checkpoint_id: CheckpointId(row.get(1)?),
+        park_path: PathBuf::from(row.get::<_, String>(2)?),
+        bytes: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+        created_at_ms: row.get(4)?,
+    })
+}
+
+/// SQLite integers are signed. A byte count that does not fit is a corrupt
+/// measurement rather than a reason to fail a sleep, so it is clamped.
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 fn insert_diagnostic(connection: &Connection, diagnostic: &Diagnostic) -> Result<(), DbError> {
     connection.execute(
         "INSERT INTO diagnostics (id, record_json) VALUES (?1, ?2)",
@@ -3024,6 +3159,24 @@ fn normalize_dormant_state_rows(transaction: &Transaction<'_>) -> Result<usize, 
     )?;
     Ok(sessions + workspaces)
 }
+
+/// Tables added after the first release.
+///
+/// Kept out of [`create_schema`] and applied on every open, so a database
+/// written by an earlier binary gains them without a `user_version` bump. That
+/// is the same compatibility bargain [`normalize_dormant_state_rows`] takes:
+/// the addition is invisible to an older binary, which simply never writes to
+/// a table it does not know about.
+const ADDITIVE_SCHEMA: &str = r#"
+    CREATE TABLE IF NOT EXISTS parks (
+      workspace_id TEXT NOT NULL,
+      checkpoint_id TEXT NOT NULL,
+      park_path TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(workspace_id, checkpoint_id)
+    ) STRICT;
+"#;
 
 fn create_schema(connection: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     connection.execute_batch(
